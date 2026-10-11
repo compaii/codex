@@ -63,6 +63,43 @@ use tokio::time::Instant;
 mod dual_write;
 
 #[tokio::test]
+async fn disabled_startup_processing_preserves_an_external_projection() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let home = Arc::new(TempDir::new()?);
+    let root = home.path().join("memories");
+    tokio::fs::create_dir_all(root.join("rollout_summaries")).await?;
+    let summary = root.join("memory_summary.md");
+    let original = root.join("rollout_summaries/externally-managed.md");
+    tokio::fs::write(&summary, "A retained external experience").await?;
+    tokio::fs::write(&original, "Its exact attributed original").await?;
+    let mut memories = startup_test_memories_config();
+    memories.startup_processing = false;
+    memories.generate_memories = true;
+    memories.use_memories = true;
+    let test = build_test_codex_with_memories_config(&server, Arc::clone(&home), memories).await?;
+    let requests_before = server.received_requests().await.unwrap().len();
+    trigger_memories_startup(&test).await;
+    // Give any incorrectly spawned startup task a chance to alter its workspace.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        tokio::fs::read_to_string(&summary).await?,
+        "A retained external experience"
+    );
+    assert_eq!(
+        tokio::fs::read_to_string(&original).await?,
+        "Its exact attributed original"
+    );
+    assert!(!root.join("extensions").exists());
+    assert!(!root.join(".git").exists());
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        requests_before
+    );
+    shutdown_test_codex(&test).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn memories_startup_creates_memory_root() -> anyhow::Result<()> {
     let server = start_mock_server().await;
     let home = Arc::new(TempDir::new()?);

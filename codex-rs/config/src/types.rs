@@ -320,6 +320,10 @@ pub use codex_protocol::MemoryVersion;
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct MemoriesToml {
+    /// Run startup extraction, consolidation and retention processing. Disable
+    /// when consuming an externally managed projection. Does not disable memory
+    /// reads, explicit notes or reset; source eligibility is controlled separately.
+    pub startup_processing: Option<bool>,
     /// Selects the memory pipeline; v1 remains the default.
     pub version: Option<MemoryVersion>,
     /// Generate both versions while the selected version supplies context.
@@ -357,6 +361,7 @@ pub struct MemoriesToml {
 /// Effective memories settings after defaults are applied.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MemoriesConfig {
+    pub startup_processing: bool,
     pub version: MemoryVersion,
     pub dual_write: bool,
     pub disable_on_external_context: bool,
@@ -376,6 +381,7 @@ pub struct MemoriesConfig {
 impl Default for MemoriesConfig {
     fn default() -> Self {
         Self {
+            startup_processing: true,
             version: MemoryVersion::V1,
             dual_write: false,
             disable_on_external_context: false,
@@ -398,6 +404,9 @@ impl From<MemoriesToml> for MemoriesConfig {
     fn from(toml: MemoriesToml) -> Self {
         let defaults = Self::default();
         Self {
+            startup_processing: toml
+                .startup_processing
+                .unwrap_or(defaults.startup_processing),
             version: toml.version.unwrap_or(defaults.version),
             dual_write: toml.dual_write.unwrap_or(defaults.dual_write),
             disable_on_external_context: toml

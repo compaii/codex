@@ -19,8 +19,9 @@ use tracing::warn;
 
 /// Starts the asynchronous startup memory pipeline for an eligible root session.
 ///
-/// The pipeline is skipped for ephemeral sessions, disabled feature flags, and
-/// subagent sessions.
+/// The pipeline is skipped for ephemeral sessions, disabled startup processing
+/// or feature flags, and subagent sessions. Source generation eligibility and
+/// memory use are separate controls.
 pub fn start_memories_startup_task(
     thread_manager: Arc<ThreadManager>,
     auth_manager: Arc<AuthManager>,
@@ -31,6 +32,7 @@ pub fn start_memories_startup_task(
     source: &SessionSource,
 ) {
     if config.ephemeral
+        || !config.memories.startup_processing
         || !config.features.enabled(Feature::MemoryTool)
         || source.is_non_root_agent()
     {

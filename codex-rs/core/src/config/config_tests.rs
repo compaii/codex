@@ -321,6 +321,7 @@ persistence = "none"
 
     let memories = r#"
 [memories]
+startup_processing = false
 disable_on_external_context = true
 generate_memories = false
 use_memories = false
@@ -338,6 +339,7 @@ consolidation_model = "gpt-5.2"
         toml::from_str::<ConfigToml>(memories).expect("TOML deserialization should succeed");
     assert_eq!(
         Some(MemoriesToml {
+            startup_processing: Some(false),
             dual_write: None,
             version: None,
             disable_on_external_context: Some(true),
@@ -366,6 +368,7 @@ consolidation_model = "gpt-5.2"
     assert_eq!(
         config.memories,
         MemoriesConfig {
+            startup_processing: false,
             dual_write: false,
             version: codex_protocol::MemoryVersion::V1,
             disable_on_external_context: true,
