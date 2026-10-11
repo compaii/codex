@@ -118,6 +118,20 @@ fn deserialize_skill_config_with_path_selector() {
 }
 
 #[test]
+fn startup_processing_can_stop_without_changing_source_eligibility_or_reads() {
+    let parsed: MemoriesToml =
+        toml::from_str("startup_processing = false").expect("parse startup setting");
+    assert_eq!(
+        MemoriesConfig::from(parsed),
+        MemoriesConfig {
+            startup_processing: false,
+            ..Default::default()
+        }
+    );
+    assert!(MemoriesConfig::default().startup_processing);
+}
+
+#[test]
 fn memories_config_clamps_count_limits_to_nonzero_values() {
     let config = MemoriesConfig::from(MemoriesToml {
         max_raw_memories_for_consolidation: Some(0),

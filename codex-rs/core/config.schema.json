@@ -2629,6 +2629,10 @@
           "format": "int64",
           "type": "integer"
         },
+        "startup_processing": {
+          "description": "Run startup extraction, consolidation and retention processing. Disable when consuming an externally managed projection. Does not disable memory reads, explicit notes or reset; source eligibility is controlled separately.",
+          "type": "boolean"
+        },
         "use_memories": {
           "description": "When `false`, skip injecting memory usage instructions into developer prompts.",
           "type": "boolean"
