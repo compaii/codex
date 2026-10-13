@@ -118,6 +118,19 @@ fn deserialize_skill_config_with_path_selector() {
 }
 
 #[test]
+fn extraction_only_is_opt_in_and_preserves_other_memory_controls() {
+    let parsed: MemoriesToml = toml::from_str("extraction_only = true").expect("setting");
+    assert_eq!(
+        MemoriesConfig::from(parsed),
+        MemoriesConfig {
+            extraction_only: true,
+            ..Default::default()
+        }
+    );
+    assert!(!MemoriesConfig::default().extraction_only);
+}
+
+#[test]
 fn startup_processing_can_stop_without_changing_source_eligibility_or_reads() {
     let parsed: MemoriesToml =
         toml::from_str("startup_processing = false").expect("parse startup setting");

@@ -100,6 +100,22 @@ async fn disabled_startup_processing_preserves_an_external_projection() -> anyho
 }
 
 #[tokio::test]
+async fn extraction_only_does_not_create_native_memory_workspace() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let home = Arc::new(TempDir::new()?);
+    let mut memories = startup_test_memories_config();
+    memories.extraction_only = true;
+    memories.use_memories = false;
+    let test = build_test_codex_with_memories_config(&server, Arc::clone(&home), memories).await?;
+    trigger_memories_startup(&test).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!home.path().join("memories").exists());
+    assert!(!home.path().join("memories_v2").exists());
+    shutdown_test_codex(&test).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn memories_startup_creates_memory_root() -> anyhow::Result<()> {
     let server = start_mock_server().await;
     let home = Arc::new(TempDir::new()?);

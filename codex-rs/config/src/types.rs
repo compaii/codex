@@ -324,6 +324,9 @@ pub struct MemoriesToml {
     /// when consuming an externally managed projection. Does not disable memory
     /// reads, explicit notes or reset; source eligibility is controlled separately.
     pub startup_processing: Option<bool>,
+    /// Commit immutable extraction candidates for an external consumer; skip native
+    /// retention, file projection and consolidation. Disabled by default.
+    pub extraction_only: Option<bool>,
     /// Selects the memory pipeline; v1 remains the default.
     pub version: Option<MemoryVersion>,
     /// Generate both versions while the selected version supplies context.
@@ -362,6 +365,7 @@ pub struct MemoriesToml {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MemoriesConfig {
     pub startup_processing: bool,
+    pub extraction_only: bool,
     pub version: MemoryVersion,
     pub dual_write: bool,
     pub disable_on_external_context: bool,
@@ -382,6 +386,7 @@ impl Default for MemoriesConfig {
     fn default() -> Self {
         Self {
             startup_processing: true,
+            extraction_only: false,
             version: MemoryVersion::V1,
             dual_write: false,
             disable_on_external_context: false,
@@ -407,6 +412,7 @@ impl From<MemoriesToml> for MemoriesConfig {
             startup_processing: toml
                 .startup_processing
                 .unwrap_or(defaults.startup_processing),
+            extraction_only: toml.extraction_only.unwrap_or(defaults.extraction_only),
             version: toml.version.unwrap_or(defaults.version),
             dual_write: toml.dual_write.unwrap_or(defaults.dual_write),
             disable_on_external_context: toml

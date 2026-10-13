@@ -201,7 +201,7 @@ mod job {
         stage_one_context: &StageOneRequestContext,
     ) -> JobResult {
         let claimed_thread = claim.thread;
-        let (stage_one_output, token_usage) = match sample(
+        let (stage_one_output, token_usage, candidate) = match sample(
             context,
             config,
             &claimed_thread.rollout_path,
@@ -226,6 +226,47 @@ mod job {
                 };
             }
         };
+
+        if let Some(candidate) = candidate {
+            let result = if let Some(db) = context.memory_store().await {
+                db.commit_stage1_candidate(
+                    claimed_thread.id,
+                    &claim.ownership_token,
+                    claimed_thread.updated_at.timestamp(),
+                    &candidate,
+                )
+                .await
+            } else {
+                Err(anyhow::anyhow!("candidate store unavailable"))
+            };
+            let outcome = match result {
+                Ok(true)
+                    if stage_one_output
+                        .raw_memory
+                        .as_ref()
+                        .is_some_and(String::is_empty)
+                        || stage_one_output.rollout_summary.is_empty() =>
+                {
+                    JobOutcome::SucceededNoOutput
+                }
+                Ok(true) => JobOutcome::SucceededWithOutput,
+                Ok(false) => JobOutcome::Failed,
+                Err(error) => {
+                    result::failed(
+                        context,
+                        claimed_thread.id,
+                        &claim.ownership_token,
+                        &error.to_string(),
+                    )
+                    .await;
+                    JobOutcome::Failed
+                }
+            };
+            return JobResult {
+                outcome,
+                token_usage,
+            };
+        }
 
         if stage_one_output
             .raw_memory
@@ -263,8 +304,24 @@ mod job {
         rollout_cwd: &Path,
         rollout_git_branch: Option<&str>,
         stage_one_context: &StageOneRequestContext,
-    ) -> anyhow::Result<(StageOneOutput, Option<TokenUsage>)> {
-        let (rollout_items, _, _) = RolloutRecorder::load_rollout_items(rollout_path).await?;
+    ) -> anyhow::Result<(StageOneOutput, Option<TokenUsage>, Option<String>)> {
+        let source_before = if config.memories.extraction_only {
+            Some(tokio::fs::read_to_string(rollout_path).await?)
+        } else {
+            None
+        };
+        let (rollout_items, _, parse_errors) =
+            RolloutRecorder::load_rollout_items(rollout_path).await?;
+        if let Some(source) = source_before.as_ref() {
+            anyhow::ensure!(
+                parse_errors == 0,
+                "source contains unreadable rollout items; candidate not committed"
+            );
+            anyhow::ensure!(
+                source == &tokio::fs::read_to_string(rollout_path).await?,
+                "rollout changed while loading extraction evidence"
+            );
+        }
         let rollout_contents = match config.memories.version {
             MemoryVersion::V1 => serialize_filtered_rollout_response_items(&rollout_items)?,
             MemoryVersion::V2 => crate::rollout_input::serialize_tiered_input(
@@ -318,7 +375,35 @@ mod job {
 
         let output = StageOneOutput::parse(&result, config.memories.version)?;
 
-        Ok((output, token_usage))
+        let candidate = if let Some(source) = source_before {
+            anyhow::ensure!(
+                source == tokio::fs::read_to_string(rollout_path).await?,
+                "rollout changed during extraction; candidate not committed"
+            );
+            Some(serde_json::to_string(&serde_json::json!({
+                "schema": "codex.extraction-candidate/v1",
+                "producer_version": env!("CARGO_PKG_VERSION"),
+                "memory_version": config.memories.version,
+                "model": stage_one_context.model_info.slug,
+                "reasoning_effort": "low",
+                "source_path": rollout_path,
+                "source_rollout": source,
+                "source_item_count": rollout_items.len(),
+                "source_parse_errors": parse_errors,
+                "input_messages": prompt.input,
+                "base_instructions": prompt.base_instructions.text,
+                "output_schema": prompt.output_schema,
+                "generated_output": result,
+                "parsed_output": {"raw_memory": output.raw_memory,
+                    "rollout_summary": output.rollout_summary, "rollout_slug": output.rollout_slug},
+                "token_usage": token_usage,
+                "disposition": if output.raw_memory.as_ref().is_some_and(String::is_empty)
+                    || output.rollout_summary.is_empty() { "no_output" } else { "candidate" }
+            }))?)
+        } else {
+            None
+        };
+        Ok((output, token_usage, candidate))
     }
 
     mod result {
