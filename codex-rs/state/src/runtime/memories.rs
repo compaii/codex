@@ -42,7 +42,8 @@ impl MemoryStore {
         self.pool.close().await;
     }
 
-    /// Deletes all persisted memory state in one transaction.
+    /// Deletes native derived memory state in one transaction.
+    /// Extraction-only delivery evidence remains in its separate archive.
     ///
     /// This removes every `stage1_outputs` row and all `jobs` rows for the
     /// stage-1 (`memory_stage1`) and phase-2 (`memory_consolidate_global`)
@@ -851,6 +852,82 @@ WHERE kind = ? AND job_key = ?
         }
 
         Ok(Stage1JobClaimOutcome::SkippedRunning)
+    }
+
+    /// Commit an extraction-only candidate and its owned job atomically. No native
+    /// memory output, deletion or consolidation is implied. The 256 MiB lifetime
+    /// cap provides explicit backpressure rather than pruning unreceived evidence.
+    pub async fn commit_stage1_candidate(
+        &self,
+        thread_id: ThreadId,
+        ownership_token: &str,
+        source_updated_at: i64,
+        envelope_json: &str,
+    ) -> anyhow::Result<bool> {
+        self.commit_candidate_with_capacity(
+            thread_id,
+            ownership_token,
+            source_updated_at,
+            envelope_json,
+            256 * 1024 * 1024,
+        )
+        .await
+    }
+
+    async fn commit_candidate_with_capacity(
+        &self,
+        thread_id: ThreadId,
+        ownership_token: &str,
+        source_updated_at: i64,
+        envelope_json: &str,
+        max_bytes: i64,
+    ) -> anyhow::Result<bool> {
+        let envelope: serde_json::Value = serde_json::from_str(envelope_json)?;
+        anyhow::ensure!(
+            envelope["schema"] == "codex.extraction-candidate/v1",
+            "unsupported extraction candidate schema"
+        );
+        let mut tx = self.pool.begin().await?;
+        let changed = sqlx::query(
+            "UPDATE jobs SET status='done', finished_at=?, lease_until=NULL, last_error=NULL, \
+             last_success_watermark=input_watermark \
+             WHERE kind='memory_stage1' AND job_key=? AND status='running' \
+             AND ownership_token=? AND input_watermark=? \
+             AND COALESCE(last_success_watermark, -1) < input_watermark",
+        )
+        .bind(Utc::now().timestamp())
+        .bind(thread_id.to_string())
+        .bind(ownership_token)
+        .bind(source_updated_at)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if changed == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let bytes: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(length(CAST(envelope_json AS BLOB))),0) FROM memory_extraction_events",
+        ).fetch_one(&mut *tx).await?;
+        anyhow::ensure!(
+            bytes.saturating_add(envelope_json.len() as i64) <= max_bytes,
+            "extraction candidate archive full; preserve/export before explicit owner archiving"
+        );
+        sqlx::query("INSERT OR IGNORE INTO memory_extraction_stream VALUES(1,?)")
+            .bind(Uuid::new_v4().to_string())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO memory_extraction_events(event_id,thread_id,source_updated_at,envelope_json,created_at) VALUES(?,?,?,?,?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(thread_id.to_string())
+        .bind(source_updated_at)
+        .bind(envelope_json)
+        .bind(Utc::now().timestamp())
+        .execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Marks a claimed stage-1 job successful and upserts generated output.
@@ -5065,6 +5142,132 @@ VALUES (?, ?, ?, ?, ?)
         assert_eq!(remaining_count, 1);
 
         let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn extraction_candidate_commit_is_atomic_and_replay_safe() {
+        let home = unique_temp_dir();
+        let runtime = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(home.as_path().abs()),
+            "test-provider".to_string(),
+        )
+        .await
+        .expect("runtime");
+        let thread = ThreadId::new();
+        runtime
+            .upsert_thread(&test_thread_metadata(&home, thread, home.join("work")))
+            .await
+            .expect("thread");
+        let claim = runtime
+            .try_claim_stage1_job(thread, ThreadId::new(), 100, 3600, 8)
+            .await
+            .expect("claim");
+        let Stage1JobClaimOutcome::Claimed { ownership_token } = claim else {
+            panic!("claim")
+        };
+        let candidate = r#"{"schema":"codex.extraction-candidate/v1","disposition":"candidate","source_rollout":"original"}"#;
+        let store = &runtime.memories;
+        assert!(
+            store
+                .commit_candidate_with_capacity(thread, &ownership_token, 100, candidate, 0)
+                .await
+                .is_err()
+        );
+        assert!(
+            !store
+                .commit_stage1_candidate(thread, "wrong-owner", 100, candidate)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .commit_stage1_candidate(thread, &ownership_token, 99, candidate)
+                .await
+                .unwrap()
+        );
+        sqlx::query("CREATE TRIGGER fixture_abort BEFORE INSERT ON memory_extraction_events BEGIN SELECT RAISE(ABORT,'fixture crash'); END")
+            .execute(memory_pool(&runtime)).await.unwrap();
+        assert!(
+            store
+                .commit_stage1_candidate(thread, &ownership_token, 100, candidate)
+                .await
+                .is_err()
+        );
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM jobs WHERE kind='memory_stage1'")
+                .fetch_one(memory_pool(&runtime))
+                .await
+                .unwrap();
+        assert_eq!(status, "running");
+        sqlx::query("DROP TRIGGER fixture_abort")
+            .execute(memory_pool(&runtime))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .commit_stage1_candidate(thread, &ownership_token, 100, candidate)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .commit_stage1_candidate(thread, &ownership_token, 100, candidate)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            runtime
+                .try_claim_stage1_job(thread, ThreadId::new(), 100, 3600, 8)
+                .await
+                .unwrap(),
+            Stage1JobClaimOutcome::SkippedUpToDate
+        );
+        let claim = runtime
+            .try_claim_stage1_job(thread, ThreadId::new(), 101, 3600, 8)
+            .await
+            .unwrap();
+        let Stage1JobClaimOutcome::Claimed { ownership_token } = claim else {
+            panic!("new claim")
+        };
+        let correction = r#"{"schema":"codex.extraction-candidate/v1","disposition":"no_output","source_rollout":"later"}"#;
+        assert!(
+            store
+                .commit_stage1_candidate(thread, &ownership_token, 101, correction)
+                .await
+                .unwrap()
+        );
+        let originals: Vec<String> = sqlx::query_scalar(
+            "SELECT envelope_json FROM memory_extraction_events ORDER BY sequence",
+        )
+        .fetch_all(memory_pool(&runtime))
+        .await
+        .unwrap();
+        assert_eq!(
+            originals,
+            vec![candidate.to_string(), correction.to_string()]
+        );
+        let outputs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stage1_outputs")
+            .fetch_one(memory_pool(&runtime))
+            .await
+            .unwrap();
+        let consolidations: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind='memory_consolidate_global'")
+                .fetch_one(memory_pool(&runtime))
+                .await
+                .unwrap();
+        assert_eq!(outputs, 0);
+        assert_eq!(consolidations, 0);
+        // Native retention does not discard extraction-only evidence.
+        store
+            .prune_stage1_outputs_for_retention(0, 200)
+            .await
+            .unwrap();
+        let retained: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM memory_extraction_events")
+            .fetch_one(memory_pool(&runtime))
+            .await
+            .unwrap();
+        assert_eq!(retained, 2);
+        let _ = tokio::fs::remove_dir_all(home).await;
     }
 
     #[tokio::test]

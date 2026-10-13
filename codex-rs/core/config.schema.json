@@ -2589,6 +2589,10 @@
           "description": "Model used for thread summarisation.",
           "type": "string"
         },
+        "extraction_only": {
+          "description": "Commit immutable extraction candidates for an external consumer; skip native retention, file projection and consolidation. Disabled by default.",
+          "type": "boolean"
+        },
         "generate_memories": {
           "description": "When `false`, newly created threads are stored with `memory_mode = \"disabled\"` in the state DB.",
           "type": "boolean"

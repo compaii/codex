@@ -63,6 +63,12 @@ pub fn start_memories_startup_task(
                 warn!("state db unavailable for memories startup pipeline; skipping");
                 return;
             }
+            if config.memories.extraction_only {
+                if guard::rate_limits_ok(&auth_manager, &config).await {
+                    phase1::run(context, config).await;
+                }
+                return;
+            }
             let root = config
                 .codex_home
                 .join(config.memories.version.directory_name());
