@@ -23,9 +23,11 @@ The `codex.extraction-candidate/v1` JSON envelope preserves original UTF-8 rollo
 text, model input and instructions/schema, exact generated output, parsed output,
 version/model/effort and available token usage. Source filtering and output
 truncation remain inspectable. Unsupported compressed sources, parse errors or
-concurrent source changes fail rather than silently committing incomplete source
-evidence. Full originals remain private to the explicitly authorized local
-profile; they are not ordinary recalled memory.
+source changes while loading fail rather than silently committing mismatched
+source evidence. Once input is prepared, it is a frozen revision: later source loss does
+not discard the model result or its preserved input. Full originals remain
+private to the explicitly authorized local profile; they are not ordinary recalled
+memory.
 
 Native retention/reset does not delete these candidate tables. The archive has
 a 256 MiB envelope-byte cap; reaching it fails the job without completing its

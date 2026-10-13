@@ -322,6 +322,7 @@ mod job {
                 "rollout changed while loading extraction evidence"
             );
         }
+        let source_snapshot_at_ms = chrono::Utc::now().timestamp_millis();
         let rollout_contents = match config.memories.version {
             MemoryVersion::V1 => serialize_filtered_rollout_response_items(&rollout_items)?,
             MemoryVersion::V2 => crate::rollout_input::serialize_tiered_input(
@@ -376,10 +377,8 @@ mod job {
         let output = StageOneOutput::parse(&result, config.memories.version)?;
 
         let candidate = if let Some(source) = source_before {
-            anyhow::ensure!(
-                source == tokio::fs::read_to_string(rollout_path).await?,
-                "rollout changed during extraction; candidate not committed"
-            );
+            // The prepared input is a frozen source revision. Preserve its result
+            // even if the original is edited or lost while the model is running.
             Some(serde_json::to_string(&serde_json::json!({
                 "schema": "codex.extraction-candidate/v1",
                 "producer_version": env!("CARGO_PKG_VERSION"),
@@ -388,6 +387,7 @@ mod job {
                 "reasoning_effort": "low",
                 "source_path": rollout_path,
                 "source_rollout": source,
+                "source_snapshot_at_ms": source_snapshot_at_ms,
                 "source_item_count": rollout_items.len(),
                 "source_parse_errors": parse_errors,
                 "input_messages": prompt.input,
