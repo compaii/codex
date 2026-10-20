@@ -79,7 +79,8 @@ jobs:
           sha256sum target/dev-small/codex
           git rev-parse HEAD > target/dev-small/interaction-source.txt
       - name: Same-CLI Python SDK contract and mock-server journeys
-        run: CODEX_EXEC_PATH="$PWD/target/dev-small/codex" uv run --project ../sdk/python --frozen --only-group test pytest ../sdk/python/tests
+        working-directory: sdk/python
+        run: CODEX_EXEC_PATH="$GITHUB_WORKSPACE/codex-rs/target/dev-small/codex" uv run --frozen --only-group test pytest
       - name: Retain schemas, test inventory and executable for receiving qualification
         if: ${{ !cancelled() && steps.native-build.outcome == 'success' }}
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
