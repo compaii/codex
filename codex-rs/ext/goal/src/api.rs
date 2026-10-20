@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -64,6 +65,7 @@ pub struct GoalSetOutcome {
     previous_goal: Option<PreviousGoalSnapshot>,
     /// Present for the conditional contract, captured in the mutation transaction.
     pub revision: Option<String>,
+    pub activation: Option<crate::runtime::GoalActivationDisposition>,
 }
 
 impl GoalSetOutcome {
@@ -92,6 +94,11 @@ pub struct GoalService {
 }
 
 impl GoalService {
+    pub fn activation_runtime_available(&self, thread_id: ThreadId) -> bool {
+        self.runtime_for_thread(thread_id)
+            .is_some_and(|runtime| runtime.tools_available())
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -152,7 +159,7 @@ impl GoalService {
         request: GoalSetRequest<'_>,
         record_user_instruction: impl Future<Output = Result<(), GoalServiceError>> + Send,
     ) -> Result<GoalSetOutcome, GoalServiceError> {
-        self.set_thread_goal_inner(state_db, request, None, record_user_instruction)
+        self.set_thread_goal_inner(state_db, request, None, None, record_user_instruction)
             .await
     }
 
@@ -169,6 +176,27 @@ impl GoalService {
             state_db,
             request,
             Some(expected_revision),
+            None,
+            record_user_instruction,
+        )
+        .await
+    }
+
+    /// Mutate and admit context under one native goal-state permit. Automatic
+    /// continuation cannot start between commitment and context admission.
+    pub async fn activate_thread_goal_conditionally(
+        &self,
+        state_db: &codex_state::StateRuntime,
+        request: GoalSetRequest<'_>,
+        expected_revision: &str,
+        context: BTreeMap<String, codex_protocol::protocol::AdditionalContextEntry>,
+        record_user_instruction: impl Future<Output = Result<(), GoalServiceError>> + Send,
+    ) -> Result<GoalSetOutcome, GoalServiceError> {
+        self.set_thread_goal_inner(
+            state_db,
+            request,
+            Some(expected_revision),
+            Some(context),
             record_user_instruction,
         )
         .await
@@ -197,6 +225,9 @@ impl GoalService {
         state_db: &codex_state::StateRuntime,
         request: GoalSetRequest<'_>,
         expected_revision: Option<&str>,
+        activation_context: Option<
+            BTreeMap<String, codex_protocol::protocol::AdditionalContextEntry>,
+        >,
         record_user_instruction: impl Future<Output = Result<(), GoalServiceError>> + Send,
     ) -> Result<GoalSetOutcome, GoalServiceError> {
         let GoalSetRequest {
@@ -285,9 +316,34 @@ impl GoalService {
             if objective.is_some() {
                 fill_empty_thread_preview_if_possible(state_db, thread_id, &goal).await;
             }
+            let previous_goal = outcome.before.as_ref().map(PreviousGoalSnapshot::from);
+            let activation = if let Some(context) = activation_context {
+                Some(match runtime.as_ref() {
+                    Some(runtime) => match runtime
+                        .activate_with_context(
+                            goal.clone(),
+                            previous_goal.clone(),
+                            &outcome.snapshot.revision,
+                            context,
+                        )
+                        .await
+                    {
+                        Ok(activation) => activation,
+                        Err(reason) => {
+                            crate::runtime::GoalActivationDisposition::Uncertain { reason }
+                        }
+                    },
+                    None => crate::runtime::GoalActivationDisposition::NotStarted {
+                        reason: "Selected runtime unavailable after goal commitment".into(),
+                    },
+                })
+            } else {
+                None
+            };
             return Ok(GoalSetOutcome {
                 goal: protocol_goal_from_state(goal.clone()),
-                previous_goal: outcome.before.as_ref().map(PreviousGoalSnapshot::from),
+                previous_goal,
+                activation,
                 state_goal: goal,
                 revision: Some(outcome.snapshot.revision),
             });
@@ -376,6 +432,7 @@ impl GoalService {
             state_goal: goal,
             previous_goal,
             revision: None,
+            activation: None,
         })
     }
 

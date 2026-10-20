@@ -1,15 +1,18 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use codex_core::StartIfIdleSubmission;
+use codex_core::SteerSubmission;
 use codex_core::ThreadManager;
 use codex_core::TurnInput;
 use codex_core::TurnInputRequest;
 use codex_core::TurnStartOptions;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::AdditionalContextEntry;
 use codex_protocol::protocol::ThreadGoal;
 
 use crate::accounting::BudgetLimitedGoalDisposition;
@@ -23,6 +26,14 @@ use crate::steering::objective_updated_steering_item;
 use crate::tool::protocol_goal_from_state;
 use tokio::sync::Semaphore;
 use tokio::sync::SemaphorePermit;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoalActivationDisposition {
+    Started { turn_id: String },
+    Steered { turn_id: String },
+    NotStarted { reason: String },
+    Uncertain { reason: String },
+}
 
 #[derive(Clone)]
 pub struct GoalRuntimeHandle {
@@ -197,15 +208,11 @@ impl GoalRuntimeHandle {
         Ok(())
     }
 
-    pub async fn apply_external_goal_set(
+    fn record_external_goal_set(
         &self,
-        goal: codex_state::ThreadGoal,
+        goal: &codex_state::ThreadGoal,
         previous_goal: Option<PreviousGoalSnapshot>,
-    ) -> Result<(), String> {
-        if !self.is_enabled() {
-            return Ok(());
-        }
-
+    ) -> bool {
         self.inner.accounting_state.reset_empty_responses();
         let replaced_existing_goal = previous_goal
             .as_ref()
@@ -214,7 +221,7 @@ impl GoalRuntimeHandle {
             self.inner.metrics.record_created();
             self.inner
                 .analytics
-                .created(&goal, GoalEventAttribution::NoTurn);
+                .created(goal, GoalEventAttribution::NoTurn);
         }
         let previous_status = previous_goal
             .as_ref()
@@ -224,10 +231,10 @@ impl GoalRuntimeHandle {
             .record_resumed_if_status_changed(previous_status, goal.status);
         self.inner
             .metrics
-            .record_terminal_if_status_changed(previous_status, &goal);
+            .record_terminal_if_status_changed(previous_status, goal);
         self.inner
             .analytics
-            .status_changed(&goal, previous_status, GoalEventAttribution::NoTurn);
+            .status_changed(goal, previous_status, GoalEventAttribution::NoTurn);
         let objective_changed = previous_goal.as_ref().is_some_and(|previous_goal| {
             !replaced_existing_goal && previous_goal.objective != goal.objective
         });
@@ -243,11 +250,6 @@ impl GoalRuntimeHandle {
                         .accounting_state
                         .mark_idle_goal_active(goal.goal_id.clone());
                 }
-                if objective_changed {
-                    let item = objective_updated_steering_item(&protocol_goal_from_state(goal));
-                    self.inject_active_turn_steering(item).await;
-                }
-                self.continue_if_idle().await?;
             }
             codex_state::ThreadGoalStatus::BudgetLimited => {
                 if self.inner.accounting_state.current_turn_id().is_none() {
@@ -261,7 +263,133 @@ impl GoalRuntimeHandle {
                 self.inner.accounting_state.clear_active_goal();
             }
         }
+        objective_changed
+    }
+
+    pub async fn apply_external_goal_set(
+        &self,
+        goal: codex_state::ThreadGoal,
+        previous_goal: Option<PreviousGoalSnapshot>,
+    ) -> Result<(), String> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
+        let objective_changed = self.record_external_goal_set(&goal, previous_goal);
+        if goal.status == codex_state::ThreadGoalStatus::Active {
+            if objective_changed {
+                self.inject_active_turn_steering(objective_updated_steering_item(
+                    &protocol_goal_from_state(goal),
+                ))
+                .await;
+            }
+            self.continue_if_idle().await?;
+        }
         Ok(())
+    }
+
+    /// Accept context together with this exact goal generation before useful work
+    /// starts. A superseding mutation can win after CAS; it never gets this context.
+    /// Caller holds the same goal-state permit used by the conditional write.
+    pub(crate) async fn activate_with_context(
+        &self,
+        goal: codex_state::ThreadGoal,
+        previous_goal: Option<PreviousGoalSnapshot>,
+        revision: &str,
+        context: BTreeMap<String, AdditionalContextEntry>,
+    ) -> Result<GoalActivationDisposition, String> {
+        let snapshot = self
+            .inner
+            .state_dbs
+            .thread_goals()
+            .snapshot_thread_goal(self.thread_id())
+            .await
+            .map_err(|e| e.to_string())?;
+        if snapshot.revision != revision
+            || snapshot
+                .goal
+                .as_ref()
+                .is_none_or(|current| current.goal_id != goal.goal_id)
+        {
+            return Ok(GoalActivationDisposition::NotStarted {
+                reason:
+                    "Goal changed after metadata commitment; activation context was not submitted"
+                        .into(),
+            });
+        }
+        self.record_external_goal_set(&goal, previous_goal);
+        if !self.tools_available() || goal.status != codex_state::ThreadGoalStatus::Active {
+            return Ok(GoalActivationDisposition::NotStarted {
+                reason: "Selected goal is not active or its runtime is unavailable".into(),
+            });
+        }
+        let Some(manager) = self.inner.thread_manager.upgrade() else {
+            return Err("Thread manager unavailable after goal commitment".into());
+        };
+        let thread = manager
+            .get_thread(self.thread_id())
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(current) = self.inner.accounting_state.current_turn_id() {
+            let request = TurnInputRequest::new(TurnInput::ResponseItem(
+                objective_updated_steering_item(&protocol_goal_from_state(goal.clone())),
+            ))
+            .with_additional_context(context.clone());
+            match thread
+                .steer_turn(request, current)
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                SteerSubmission::Steered { turn_id } => {
+                    return Ok(GoalActivationDisposition::Steered { turn_id });
+                }
+                SteerSubmission::NotSubmitted { .. } => (),
+            }
+        }
+        if self
+            .inner
+            .state_dbs
+            .thread_goals()
+            .has_thread_goal_continuation_deferral(self.thread_id())
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(GoalActivationDisposition::NotStarted {
+                reason: "Native goal continuation remains explicitly deferred".into(),
+            });
+        }
+        let options = thread
+            .thread_extension_data()
+            .get::<TurnStartOptions>()
+            .map(|v| v.as_ref().clone())
+            .unwrap_or_default();
+        let input = continuation_steering_item(
+            &protocol_goal_from_state(goal),
+            thread.config().await.update_plan_enabled,
+        );
+        match thread
+            .start_turn_if_idle(
+                TurnInputRequest::new(TurnInput::ResponseItem(input))
+                    .on_start(TurnStartOptions {
+                        turn_trigger: Some("goal".into()),
+                        ..options
+                    })
+                    .with_additional_context(context),
+            )
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            StartIfIdleSubmission::Started { turn_id, .. } => {
+                self.inner
+                    .accounting_state
+                    .mark_goal_continuation(turn_id.clone());
+                Ok(GoalActivationDisposition::Started { turn_id })
+            }
+            StartIfIdleSubmission::NotSubmitted { reason } => {
+                Ok(GoalActivationDisposition::NotStarted {
+                    reason: format!("Native activation not submitted: {reason:?}"),
+                })
+            }
+        }
     }
 
     pub async fn apply_external_goal_clear(
@@ -402,7 +530,7 @@ impl GoalRuntimeHandle {
         };
         self.inner
             .metrics
-            .record_terminal_if_status_changed(previous_status, &goal);
+            .record_terminal_if_status_changed(previous_status, goal);
         self.inner.analytics.status_changed(
             &goal,
             previous_status,
@@ -593,7 +721,7 @@ impl GoalRuntimeHandle {
                 let goal_id = goal.goal_id.clone();
                 self.inner
                     .metrics
-                    .record_terminal_if_status_changed(previous_status, &goal);
+                    .record_terminal_if_status_changed(previous_status, goal);
                 self.inner
                     .analytics
                     .usage_accounted(&goal, GoalEventAttribution::Turn(turn_id));
@@ -655,7 +783,7 @@ impl GoalRuntimeHandle {
                 let goal_id = goal.goal_id.clone();
                 self.inner
                     .metrics
-                    .record_terminal_if_status_changed(previous_status, &goal);
+                    .record_terminal_if_status_changed(previous_status, goal);
                 self.inner
                     .analytics
                     .usage_accounted(&goal, GoalEventAttribution::NoTurn);

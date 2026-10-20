@@ -96,7 +96,7 @@ pub(crate) struct TurnRequestProcessor {
     turn_cost_worker: Option<crate::turn_cost_worker::TurnCostWorkerHandle>,
 }
 
-fn map_additional_context(
+pub(super) fn map_additional_context(
     additional_context: Option<HashMap<String, AdditionalContextEntry>>,
 ) -> BTreeMap<String, CoreAdditionalContextEntry> {
     additional_context
