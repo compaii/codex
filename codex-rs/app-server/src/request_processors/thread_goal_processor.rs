@@ -372,30 +372,22 @@ impl ThreadGoalRequestProcessor {
         if activating {
             // Metadata has committed. Activation failure accompanies its receipt;
             // it cannot be disguised as an unsent or rejected goal mutation.
-            let activation = match outcome.activation.as_ref() {
-                Some(codex_goal_extension::GoalActivationDisposition::Uncertain { reason }) => {
-                    ThreadGoalActivationDisposition::Uncertain {
-                        reason: reason.clone(),
-                    }
+            // Publish the committed definition before useful work can complete and
+            // publish a newer state. The outcome still owns the mutation permit.
+            self.emit_thread_goal_updated_ordered(thread_id, goal.clone(), listener_command_tx)
+                .await;
+            let activation = match outcome.activate_with_context(&self.goal_service).await {
+                Ok(codex_goal_extension::GoalActivationDisposition::Started { turn_id }) => {
+                    ThreadGoalActivationDisposition::Started { turn_id }
                 }
-                Some(codex_goal_extension::GoalActivationDisposition::Started { turn_id }) => {
-                    ThreadGoalActivationDisposition::Started {
-                        turn_id: turn_id.clone(),
-                    }
+                Ok(codex_goal_extension::GoalActivationDisposition::Steered { turn_id }) => {
+                    ThreadGoalActivationDisposition::Steered { turn_id }
                 }
-                Some(codex_goal_extension::GoalActivationDisposition::Steered { turn_id }) => {
-                    ThreadGoalActivationDisposition::Steered {
-                        turn_id: turn_id.clone(),
-                    }
+                Ok(codex_goal_extension::GoalActivationDisposition::NotStarted { reason }) => {
+                    ThreadGoalActivationDisposition::NotStarted { reason }
                 }
-                Some(codex_goal_extension::GoalActivationDisposition::NotStarted { reason }) => {
-                    ThreadGoalActivationDisposition::NotStarted {
-                        reason: reason.clone(),
-                    }
-                }
-                None => ThreadGoalActivationDisposition::NotStarted {
-                    reason: "Native activation outcome unavailable after commitment".into(),
-                },
+                Ok(codex_goal_extension::GoalActivationDisposition::Uncertain { reason })
+                | Err(reason) => ThreadGoalActivationDisposition::Uncertain { reason },
             };
             self.outgoing
                 .send_response(
@@ -408,8 +400,6 @@ impl ThreadGoalRequestProcessor {
                         activation,
                     },
                 )
-                .await;
-            self.emit_thread_goal_updated_ordered(thread_id, goal, listener_command_tx)
                 .await;
             return Ok(());
         }

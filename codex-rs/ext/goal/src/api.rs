@@ -65,7 +65,9 @@ pub struct GoalSetOutcome {
     previous_goal: Option<PreviousGoalSnapshot>,
     /// Present for the conditional contract, captured in the mutation transaction.
     pub revision: Option<String>,
-    pub activation: Option<crate::runtime::GoalActivationDisposition>,
+    activation_context: Option<BTreeMap<String, codex_protocol::protocol::AdditionalContextEntry>>,
+    // Retain the original permit through rollout publication and work admission.
+    activation_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 }
 
 impl GoalSetOutcome {
@@ -75,6 +77,30 @@ impl GoalSetOutcome {
             turn_id: None,
             goal: self.goal.clone(),
         }))
+    }
+
+    pub async fn activate_with_context(
+        &self,
+        service: &GoalService,
+    ) -> Result<crate::runtime::GoalActivationDisposition, String> {
+        if self.activation_permit.is_none() {
+            return Err("Native activation permit unavailable".into());
+        }
+        let runtime = service
+            .runtime_for_thread(self.goal.thread_id)
+            .ok_or("Selected runtime unavailable after commitment")?;
+        runtime
+            .activate_with_context(
+                self.state_goal.clone(),
+                self.previous_goal.clone(),
+                self.revision
+                    .as_deref()
+                    .ok_or("Conditional activation revision unavailable")?,
+                self.activation_context
+                    .clone()
+                    .ok_or("Activation context unavailable")?,
+            )
+            .await
     }
 
     pub async fn apply_runtime_effects(&self, goal_service: &GoalService) {
@@ -260,7 +286,22 @@ impl GoalService {
         let runtime = self.runtime_for_thread(thread_id);
         // Hold this through the prepare/write window so idle continuation cannot
         // launch from goal state that this external mutation is about to change.
-        let _goal_state_permit = match runtime.as_ref() {
+        let activation_permit = if activation_context.is_some() {
+            let runtime = runtime.as_ref().ok_or_else(|| {
+                GoalServiceError::InvalidRequest(
+                    "Selected loaded runtime unavailable before activation".into(),
+                )
+            })?;
+            Some(Arc::new(
+                runtime
+                    .owned_goal_state_permit()
+                    .await
+                    .map_err(GoalServiceError::Internal)?,
+            ))
+        } else {
+            None
+        };
+        let _goal_state_permit = match runtime.as_ref().filter(|_| activation_permit.is_none()) {
             Some(runtime) => Some(
                 runtime
                     .goal_state_permit()
@@ -317,33 +358,11 @@ impl GoalService {
                 fill_empty_thread_preview_if_possible(state_db, thread_id, &goal).await;
             }
             let previous_goal = outcome.before.as_ref().map(PreviousGoalSnapshot::from);
-            let activation = if let Some(context) = activation_context {
-                Some(match runtime.as_ref() {
-                    Some(runtime) => match runtime
-                        .activate_with_context(
-                            goal.clone(),
-                            previous_goal.clone(),
-                            &outcome.snapshot.revision,
-                            context,
-                        )
-                        .await
-                    {
-                        Ok(activation) => activation,
-                        Err(reason) => {
-                            crate::runtime::GoalActivationDisposition::Uncertain { reason }
-                        }
-                    },
-                    None => crate::runtime::GoalActivationDisposition::NotStarted {
-                        reason: "Selected runtime unavailable after goal commitment".into(),
-                    },
-                })
-            } else {
-                None
-            };
             return Ok(GoalSetOutcome {
                 goal: protocol_goal_from_state(goal.clone()),
                 previous_goal,
-                activation,
+                activation_context,
+                activation_permit,
                 state_goal: goal,
                 revision: Some(outcome.snapshot.revision),
             });
@@ -432,7 +451,8 @@ impl GoalService {
             state_goal: goal,
             previous_goal,
             revision: None,
-            activation: None,
+            activation_context: None,
+            activation_permit: None,
         })
     }
 
