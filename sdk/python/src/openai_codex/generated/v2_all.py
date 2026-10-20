@@ -5344,6 +5344,14 @@ class ThreadGoalClearedNotification(BaseModel):
     thread_id: Annotated[str, Field(alias="threadId")]
 
 
+class ThreadGoalConditionalClearResponse(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    cleared: bool
+    revision: str
+
+
 class ThreadGoalGetParams(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -5354,6 +5362,13 @@ class ThreadGoalGetParams(BaseModel):
 class ThreadGoalMutationOrigin(Enum):
     user = "user"
     automatic = "automatic"
+
+
+class ThreadGoalSnapshotParams(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    thread_id: Annotated[str, Field(alias="threadId")]
 
 
 class ThreadGoalStatus(Enum):
@@ -7019,6 +7034,17 @@ class ThreadNameSetRequest(BaseModel):
     id: RequestId
     method: Annotated[Literal["thread/name/set"], Field(title="Thread/name/setRequestMethod")]
     params: ThreadSetNameParams
+
+
+class ThreadGoalSnapshotRequest(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    id: RequestId
+    method: Annotated[
+        Literal["thread/goal/snapshot"], Field(title="Thread/goal/snapshotRequestMethod")
+    ]
+    params: ThreadGoalSnapshotParams
 
 
 class ThreadGoalGetRequest(BaseModel):
@@ -10001,6 +10027,35 @@ class ThreadGoalClearParams(BaseModel):
     thread_id: Annotated[str, Field(alias="threadId")]
 
 
+class ThreadGoalConditionalClearParams(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    expected_revision: Annotated[str, Field(alias="expectedRevision")]
+    origin: ThreadGoalMutationOrigin | None = None
+    thread_id: Annotated[str, Field(alias="threadId")]
+
+
+class ThreadGoalConditionalSetParams(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    expected_revision: Annotated[str, Field(alias="expectedRevision")]
+    objective: str | None = None
+    origin: ThreadGoalMutationOrigin | None = None
+    status: ThreadGoalStatus | None = None
+    thread_id: Annotated[str, Field(alias="threadId")]
+    token_budget: Annotated[int | None, Field(alias="tokenBudget")] = None
+
+
+class ThreadGoalConditionalSetResponse(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    goal: ThreadGoal
+    revision: str
+
+
 class ThreadGoalGetResponse(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -10027,6 +10082,14 @@ class ThreadGoalSetResponse(BaseModel):
         populate_by_name=True,
     )
     goal: ThreadGoal
+
+
+class ThreadGoalSnapshotResponse(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    goal: ThreadGoal | None = None
+    revision: str
 
 
 class ThreadGoalUpdatedNotification(BaseModel):
@@ -10729,6 +10792,30 @@ class ThreadForkRequest(BaseModel):
     id: RequestId
     method: Annotated[Literal["thread/fork"], Field(title="Thread/forkRequestMethod")]
     params: ThreadForkParams
+
+
+class ThreadGoalConditionalSetRequest(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    id: RequestId
+    method: Annotated[
+        Literal["thread/goal/conditionalSet"],
+        Field(title="Thread/goal/conditionalSetRequestMethod"),
+    ]
+    params: ThreadGoalConditionalSetParams
+
+
+class ThreadGoalConditionalClearRequest(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    id: RequestId
+    method: Annotated[
+        Literal["thread/goal/conditionalClear"],
+        Field(title="Thread/goal/conditionalClearRequestMethod"),
+    ]
+    params: ThreadGoalConditionalClearParams
 
 
 class ThreadGoalSetRequest(BaseModel):
@@ -12792,6 +12879,9 @@ class ClientRequest(
         | ThreadDeleteRequest
         | ThreadUnsubscribeRequest
         | ThreadNameSetRequest
+        | ThreadGoalSnapshotRequest
+        | ThreadGoalConditionalSetRequest
+        | ThreadGoalConditionalClearRequest
         | ThreadGoalSetRequest
         | ThreadGoalGetRequest
         | ThreadGoalClearRequest
@@ -12903,6 +12993,9 @@ class ClientRequest(
         | ThreadDeleteRequest
         | ThreadUnsubscribeRequest
         | ThreadNameSetRequest
+        | ThreadGoalSnapshotRequest
+        | ThreadGoalConditionalSetRequest
+        | ThreadGoalConditionalClearRequest
         | ThreadGoalSetRequest
         | ThreadGoalGetRequest
         | ThreadGoalClearRequest

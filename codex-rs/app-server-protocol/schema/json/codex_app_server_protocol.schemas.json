@@ -403,6 +403,78 @@
             },
             "method": {
               "enum": [
+                "thread/goal/snapshot"
+              ],
+              "title": "Thread/goal/snapshotRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadGoalSnapshotParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/goal/snapshotRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "thread/goal/conditionalSet"
+              ],
+              "title": "Thread/goal/conditionalSetRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadGoalConditionalSetParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/goal/conditionalSetRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "thread/goal/conditionalClear"
+              ],
+              "title": "Thread/goal/conditionalClearRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadGoalConditionalClearParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/goal/conditionalClearRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
                 "thread/goal/set"
               ],
               "title": "Thread/goal/setRequestMethod",
@@ -21930,6 +22002,117 @@
         "title": "ThreadGoalClearedNotification",
         "type": "object"
       },
+      "ThreadGoalConditionalClearParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "expectedRevision": {
+            "type": "string"
+          },
+          "origin": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ThreadGoalMutationOrigin"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "expectedRevision",
+          "threadId"
+        ],
+        "title": "ThreadGoalConditionalClearParams",
+        "type": "object"
+      },
+      "ThreadGoalConditionalClearResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "cleared": {
+            "type": "boolean"
+          },
+          "revision": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "cleared",
+          "revision"
+        ],
+        "title": "ThreadGoalConditionalClearResponse",
+        "type": "object"
+      },
+      "ThreadGoalConditionalSetParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "expectedRevision": {
+            "type": "string"
+          },
+          "objective": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "origin": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ThreadGoalMutationOrigin"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ThreadGoalStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "threadId": {
+            "type": "string"
+          },
+          "tokenBudget": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "expectedRevision",
+          "threadId"
+        ],
+        "title": "ThreadGoalConditionalSetParams",
+        "type": "object"
+      },
+      "ThreadGoalConditionalSetResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "goal": {
+            "$ref": "#/definitions/v2/ThreadGoal"
+          },
+          "revision": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "goal",
+          "revision"
+        ],
+        "title": "ThreadGoalConditionalSetResponse",
+        "type": "object"
+      },
       "ThreadGoalGetParams": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
@@ -22026,6 +22209,43 @@
           "goal"
         ],
         "title": "ThreadGoalSetResponse",
+        "type": "object"
+      },
+      "ThreadGoalSnapshotParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "threadId"
+        ],
+        "title": "ThreadGoalSnapshotParams",
+        "type": "object"
+      },
+      "ThreadGoalSnapshotResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "A consistent goal/definition snapshot. Revision survives clear/recreate and excludes ordinary usage accounting; it is not an authorization credential.",
+        "properties": {
+          "goal": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ThreadGoal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "revision": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "revision"
+        ],
+        "title": "ThreadGoalSnapshotResponse",
         "type": "object"
       },
       "ThreadGoalStatus": {

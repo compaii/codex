@@ -168,6 +168,15 @@ impl GoalRuntimeHandle {
         // Invalidate the old turn before the persisted objective/status changes.
         self.inner.accounting_state.reset_empty_responses();
 
+        self.flush_external_goal_progress().await
+    }
+
+    /// Accounting is legitimate even when a conditional control later becomes
+    /// stale. Reset continuation/breaker state only after a matched mutation.
+    pub(crate) async fn flush_external_goal_progress(&self) -> Result<(), String> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
         if let Some(turn_id) = self.inner.accounting_state.current_turn_id() {
             self.account_active_goal_progress(
                 turn_id.as_str(),

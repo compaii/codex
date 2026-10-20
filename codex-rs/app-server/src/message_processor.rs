@@ -1350,6 +1350,21 @@ impl MessageProcessor {
                     .thread_set_name(request_id.clone(), params)
                     .await
             }
+            ClientRequest::ThreadGoalSnapshot { params, .. } => {
+                self.thread_goal_processor
+                    .thread_goal_snapshot(params)
+                    .await
+            }
+            ClientRequest::ThreadGoalConditionalSet { params, .. } => {
+                self.thread_goal_processor
+                    .thread_goal_conditional_set(request_id.clone(), params)
+                    .await
+            }
+            ClientRequest::ThreadGoalConditionalClear { params, .. } => {
+                self.thread_goal_processor
+                    .thread_goal_conditional_clear(request_id.clone(), params)
+                    .await
+            }
             ClientRequest::ThreadGoalSet { params, .. } => {
                 self.thread_goal_processor
                     .thread_goal_set(request_id.clone(), params)

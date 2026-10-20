@@ -41,11 +41,53 @@ def just_formatter_group(*, check: bool) -> FormatterGroup:
 
 
 def rust_formatter_group(*, check: bool) -> FormatterGroup:
-    args = ["cargo", "fmt", "--", "--config", "imports_granularity=Item"]
+    workspace = REPO_ROOT / "codex-rs"
+    encoded = subprocess.check_output(
+        [
+            "git",
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            "*.rs",
+        ],
+        cwd=REPO_ROOT,
+    ).split(b"\0")
+    paths = sorted(
+        {
+            os.path.relpath(REPO_ROOT / os.fsdecode(path), workspace)
+            for path in encoded
+            if path and (REPO_ROOT / os.fsdecode(path)).is_file()
+        }
+    )
+    prefix = [
+        "rustfmt",
+        "--edition",
+        "2024",
+        "--config-path",
+        str(workspace / "rustfmt.toml"),
+        "--config",
+        "imports_granularity=Item,skip_children=true",
+    ]
     if check:
-        args.append("--check")
-    command = Command(tuple(args), REPO_ROOT / "codex-rs")
-    return FormatterGroup("Rust", (command,))
+        prefix.append("--check")
+    # Include Rust outside Cargo, retaining safe command lengths on Windows.
+    commands: list[Command] = []
+    batch: list[str] = []
+    size = sum(len(os.fsencode(arg)) + 3 for arg in prefix)
+    for path in paths:
+        cost = len(os.fsencode(path)) + 3
+        if batch and size + cost > 24_000:
+            commands.append(Command(tuple(prefix + batch), workspace))
+            batch = []
+            size = sum(len(os.fsencode(arg)) + 3 for arg in prefix)
+        batch.append(path)
+        size += cost
+    if batch:
+        commands.append(Command(tuple(prefix + batch), workspace))
+    return FormatterGroup("Rust", tuple(commands))
 
 
 def buildifier_formatter_group(*, check: bool) -> FormatterGroup:

@@ -24,6 +24,23 @@ pub struct GoalUpdate {
     pub expected_goal_id: Option<String>,
 }
 
+/// A definition revision excludes accounting but survives clear/recreate and ABA.
+#[derive(Debug, Clone)]
+pub struct GoalSnapshot {
+    pub goal: Option<crate::ThreadGoal>,
+    pub revision: String,
+}
+
+pub enum ConditionalGoalMutation {
+    Set(GoalUpdate),
+    Clear,
+}
+
+pub struct ConditionalGoalOutcome {
+    pub before: Option<crate::ThreadGoal>,
+    pub snapshot: GoalSnapshot,
+}
+
 pub enum GoalAccountingOutcome {
     Unchanged(Option<crate::ThreadGoal>),
     Updated(crate::ThreadGoal),
@@ -63,6 +80,93 @@ WHERE thread_id = ?
         .await?;
 
         row.map(|row| thread_goal_from_row(&row)).transpose()
+    }
+
+    /// Read goal and revision in one SQLite snapshot, including an absent goal.
+    pub async fn snapshot_thread_goal(&self, thread_id: ThreadId) -> anyhow::Result<GoalSnapshot> {
+        let mut tx = self.pool.begin().await?;
+        let snapshot = snapshot_in(&mut tx, thread_id).await?;
+        tx.commit().await?;
+        Ok(snapshot)
+    }
+
+    /// Compare and mutate under the database writer lock, including legacy/model
+    /// writers. A stale selection never records user intent or changes goal state.
+    /// `record_instruction` must not write this goals database; rollout/state
+    /// persistence uses its independent database and runs before the mutation.
+    pub async fn mutate_thread_goal_conditionally<E: Into<anyhow::Error>>(
+        &self,
+        thread_id: ThreadId,
+        expected_revision: &str,
+        mutation: ConditionalGoalMutation,
+        record_instruction: impl Future<Output = Result<(), E>> + Send,
+    ) -> anyhow::Result<Option<ConditionalGoalOutcome>> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let before = snapshot_in(&mut tx, thread_id).await?;
+        if before.revision != expected_revision {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        // Validate before publishing an instruction to the separate history.
+        if let ConditionalGoalMutation::Set(update) = &mutation {
+            if before.goal.is_none() && update.objective.is_none() {
+                anyhow::bail!("cannot update goal: no goal exists");
+            }
+            if update
+                .expected_goal_id
+                .as_ref()
+                .is_some_and(|id| before.goal.as_ref().is_none_or(|goal| &goal.goal_id != id))
+            {
+                tx.rollback().await?;
+                return Ok(None);
+            }
+        }
+        record_instruction.await.map_err(Into::into)?;
+        match mutation {
+            ConditionalGoalMutation::Clear => {
+                sqlx::query("DELETE FROM thread_goals WHERE thread_id = ?")
+                    .bind(thread_id.to_string())
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            ConditionalGoalMutation::Set(update) => {
+                let now_ms = datetime_to_epoch_millis(Utc::now());
+                if let Some(goal) = &before.goal {
+                    let objective = update.objective.as_deref().unwrap_or(&goal.objective);
+                    let budget = update.token_budget.unwrap_or(goal.token_budget);
+                    let requested_status = update.status.unwrap_or(goal.status);
+                    let status = if goal.status == crate::ThreadGoalStatus::BudgetLimited
+                        && matches!(
+                            requested_status,
+                            crate::ThreadGoalStatus::Paused | crate::ThreadGoalStatus::Blocked
+                        ) {
+                        crate::ThreadGoalStatus::BudgetLimited
+                    } else {
+                        status_after_budget_limit(requested_status, goal.tokens_used, budget)
+                    };
+                    sqlx::query("UPDATE thread_goals SET objective=?, status=?, token_budget=?, updated_at_ms=? WHERE thread_id=?")
+                        .bind(objective).bind(status.as_str()).bind(budget).bind(now_ms).bind(thread_id.to_string())
+                        .execute(&mut *tx).await?;
+                } else {
+                    let status = status_after_budget_limit(
+                        update.status.unwrap_or(crate::ThreadGoalStatus::Active),
+                        0,
+                        update.token_budget.flatten(),
+                    );
+                    sqlx::query("INSERT INTO thread_goals(thread_id,goal_id,objective,status,token_budget,tokens_used,time_used_seconds,created_at_ms,updated_at_ms) VALUES(?,?,?,?,?,0,0,?,?)")
+                        .bind(thread_id.to_string()).bind(Uuid::new_v4().to_string())
+                        .bind(update.objective.as_deref().ok_or_else(|| anyhow::anyhow!("new objective required"))?)
+                        .bind(status.as_str()).bind(update.token_budget.flatten()).bind(now_ms).bind(now_ms)
+                        .execute(&mut *tx).await?;
+                }
+            }
+        }
+        let snapshot = snapshot_in(&mut tx, thread_id).await?;
+        tx.commit().await?;
+        Ok(Some(ConditionalGoalOutcome {
+            before: before.goal,
+            snapshot,
+        }))
     }
 
     pub async fn replace_thread_goal_snapshot(
@@ -611,6 +715,29 @@ RETURNING
     }
 }
 
+async fn snapshot_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    thread_id: ThreadId,
+) -> anyhow::Result<GoalSnapshot> {
+    let identity: String =
+        sqlx::query_scalar("SELECT identity FROM thread_goal_revision_identity WHERE id=1")
+            .fetch_one(&mut **tx)
+            .await?;
+    let revision: i64 =
+        sqlx::query_scalar("SELECT revision FROM thread_goal_revisions WHERE thread_id=?")
+            .bind(thread_id.to_string())
+            .fetch_optional(&mut **tx)
+            .await?
+            .unwrap_or(0);
+    let goal = sqlx::query("SELECT thread_id,goal_id,objective,status,token_budget,tokens_used,time_used_seconds,created_at_ms,updated_at_ms FROM thread_goals WHERE thread_id=?")
+        .bind(thread_id.to_string()).fetch_optional(&mut **tx).await?
+        .map(|row| thread_goal_from_row(&row)).transpose()?;
+    Ok(GoalSnapshot {
+        goal,
+        revision: format!("goal-v1:{identity}:{thread_id}:{revision}"),
+    })
+}
+
 fn thread_goal_from_row(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<crate::ThreadGoal> {
     ThreadGoalRow::try_from_row(row).and_then(crate::ThreadGoal::try_from)
 }
@@ -657,6 +784,301 @@ mod tests {
             .upsert_thread(&metadata)
             .await
             .expect("test thread should be upserted");
+    }
+
+    fn conditional_status(status: crate::ThreadGoalStatus) -> ConditionalGoalMutation {
+        ConditionalGoalMutation::Set(GoalUpdate {
+            objective: None,
+            status: Some(status),
+            token_budget: None,
+            expected_goal_id: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn conditional_goal_revision_preserves_accounting_and_creation() {
+        let runtime = test_runtime().await;
+        let id = test_thread_id();
+        upsert_test_thread(&runtime, id).await;
+        let store = runtime.thread_goals();
+        let original = store
+            .replace_thread_goal(id, "original", crate::ThreadGoalStatus::Paused, Some(100))
+            .await
+            .unwrap();
+        let snapshot = store.snapshot_thread_goal(id).await.unwrap();
+        store
+            .account_thread_goal_usage(
+                id,
+                3,
+                7,
+                GoalAccountingMode::ActiveOrStopped,
+                Some(&original.goal_id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.snapshot_thread_goal(id).await.unwrap().revision,
+            snapshot.revision
+        );
+        let changed = store
+            .mutate_thread_goal_conditionally(
+                id,
+                &snapshot.revision,
+                conditional_status(crate::ThreadGoalStatus::Active),
+                async { Ok::<(), anyhow::Error>(()) },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let goal = changed.snapshot.goal.unwrap();
+        assert_eq!(goal.tokens_used, 7);
+        assert_eq!(goal.time_used_seconds, 3);
+        assert_eq!(goal.created_at, original.created_at);
+        assert_eq!(goal.goal_id, original.goal_id);
+        assert_ne!(changed.snapshot.revision, snapshot.revision);
+    }
+
+    #[tokio::test]
+    async fn conditional_goal_rejects_replaced_and_aba_definitions_before_recording() {
+        let runtime = test_runtime().await;
+        let id = test_thread_id();
+        upsert_test_thread(&runtime, id).await;
+        let store = runtime.thread_goals();
+        store
+            .replace_thread_goal(id, "same", crate::ThreadGoalStatus::Paused, Some(100))
+            .await
+            .unwrap();
+        let original = store.snapshot_thread_goal(id).await.unwrap();
+        store
+            .update_thread_goal(
+                id,
+                GoalUpdate {
+                    objective: None,
+                    status: Some(crate::ThreadGoalStatus::Active),
+                    token_budget: None,
+                    expected_goal_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .update_thread_goal(
+                id,
+                GoalUpdate {
+                    objective: None,
+                    status: Some(crate::ThreadGoalStatus::Paused),
+                    token_budget: None,
+                    expected_goal_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        let called = std::sync::atomic::AtomicBool::new(false);
+        let result = store
+            .mutate_thread_goal_conditionally(
+                id,
+                &original.revision,
+                ConditionalGoalMutation::Clear,
+                async {
+                    called.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok::<(), anyhow::Error>(())
+                },
+            )
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            store.get_thread_goal(id).await.unwrap().unwrap().objective,
+            "same"
+        );
+        let selected = store.snapshot_thread_goal(id).await.unwrap();
+        store.delete_thread_goal(id).await.unwrap();
+        store
+            .replace_thread_goal(id, "same", crate::ThreadGoalStatus::Paused, Some(100))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .mutate_thread_goal_conditionally(
+                    id,
+                    &selected.revision,
+                    conditional_status(crate::ThreadGoalStatus::Complete),
+                    async { Ok::<(), anyhow::Error>(()) }
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.get_thread_goal(id).await.unwrap().unwrap().status,
+            crate::ThreadGoalStatus::Paused
+        );
+        assert!(
+            store
+                .mutate_thread_goal_conditionally(
+                    id,
+                    &selected.revision,
+                    ConditionalGoalMutation::Clear,
+                    async { Ok::<(), anyhow::Error>(()) }
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_goal_absence_tombstone_survives_create_clear_and_restart() {
+        let runtime = test_runtime().await;
+        let id = test_thread_id();
+        upsert_test_thread(&runtime, id).await;
+        let store = runtime.thread_goals();
+        let absent = store.snapshot_thread_goal(id).await.unwrap();
+        store
+            .replace_thread_goal(id, "temporary", crate::ThreadGoalStatus::Paused, None)
+            .await
+            .unwrap();
+        store.delete_thread_goal(id).await.unwrap();
+        let now = store.snapshot_thread_goal(id).await.unwrap();
+        assert!(now.goal.is_none());
+        assert_ne!(now.revision, absent.revision);
+        let update = ConditionalGoalMutation::Set(GoalUpdate {
+            objective: Some("new".into()),
+            status: Some(crate::ThreadGoalStatus::Paused),
+            token_budget: None,
+            expected_goal_id: None,
+        });
+        assert!(
+            store
+                .mutate_thread_goal_conditionally(id, &absent.revision, update, async {
+                    Ok::<(), anyhow::Error>(())
+                })
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let reopened = StateRuntime::init(
+            crate::SqliteConfig::new_for_testing(runtime.sqlite().home().abs()),
+            "test-provider".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reopened
+                .thread_goals()
+                .snapshot_thread_goal(id)
+                .await
+                .unwrap()
+                .revision,
+            now.revision
+        );
+        let cleared = store
+            .mutate_thread_goal_conditionally(
+                id,
+                &now.revision,
+                ConditionalGoalMutation::Clear,
+                async { Ok::<(), anyhow::Error>(()) },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(cleared.before.is_none());
+        assert_eq!(cleared.snapshot.revision, now.revision);
+    }
+
+    #[tokio::test]
+    async fn conditional_goal_same_snapshot_has_one_winner() {
+        let runtime = test_runtime().await;
+        let id = test_thread_id();
+        upsert_test_thread(&runtime, id).await;
+        let store = runtime.thread_goals();
+        store
+            .replace_thread_goal(id, "original", crate::ThreadGoalStatus::Paused, None)
+            .await
+            .unwrap();
+        let snapshot = store.snapshot_thread_goal(id).await.unwrap();
+        let (a, b) = tokio::join!(
+            store.mutate_thread_goal_conditionally(
+                id,
+                &snapshot.revision,
+                conditional_status(crate::ThreadGoalStatus::Active),
+                async { Ok::<(), anyhow::Error>(()) }
+            ),
+            store.mutate_thread_goal_conditionally(
+                id,
+                &snapshot.revision,
+                ConditionalGoalMutation::Clear,
+                async { Ok::<(), anyhow::Error>(()) }
+            )
+        );
+        assert_eq!(
+            usize::from(a.unwrap().is_some()) + usize::from(b.unwrap().is_some()),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_goal_recording_failure_leaves_goal_and_revision_unchanged() {
+        let runtime = test_runtime().await;
+        let id = test_thread_id();
+        upsert_test_thread(&runtime, id).await;
+        let store = runtime.thread_goals();
+        store
+            .replace_thread_goal(id, "original", crate::ThreadGoalStatus::Paused, None)
+            .await
+            .unwrap();
+        let snapshot = store.snapshot_thread_goal(id).await.unwrap();
+        assert!(
+            store
+                .mutate_thread_goal_conditionally(
+                    id,
+                    &snapshot.revision,
+                    ConditionalGoalMutation::Clear,
+                    async { Err::<(), _>(anyhow::anyhow!("history unavailable")) }
+                )
+                .await
+                .is_err()
+        );
+        let after = store.snapshot_thread_goal(id).await.unwrap();
+        assert_eq!(after.goal, snapshot.goal);
+        assert_eq!(after.revision, snapshot.revision);
+    }
+
+    #[tokio::test]
+    async fn conditional_goal_preserves_exhausted_budget() {
+        let runtime = test_runtime().await;
+        let id = test_thread_id();
+        upsert_test_thread(&runtime, id).await;
+        let store = runtime.thread_goals();
+        let original = store
+            .replace_thread_goal(id, "limited", crate::ThreadGoalStatus::Paused, Some(10))
+            .await
+            .unwrap();
+        store
+            .account_thread_goal_usage(
+                id,
+                4,
+                10,
+                GoalAccountingMode::ActiveOrStopped,
+                Some(&original.goal_id),
+            )
+            .await
+            .unwrap();
+        let snapshot = store.snapshot_thread_goal(id).await.unwrap();
+        let after = store
+            .mutate_thread_goal_conditionally(
+                id,
+                &snapshot.revision,
+                conditional_status(crate::ThreadGoalStatus::Active),
+                async { Ok::<(), anyhow::Error>(()) },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let goal = after.snapshot.goal.unwrap();
+        assert_eq!(goal.status, crate::ThreadGoalStatus::BudgetLimited);
+        assert_eq!(goal.tokens_used, 10);
     }
 
     #[tokio::test]

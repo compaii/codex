@@ -129,3 +129,103 @@ async fn user_goal_updates_survive_resume_and_clear(unloaded: bool) -> Result<()
     app.shutdown_gracefully().await?;
     Ok(())
 }
+
+#[test_case(false; "conditional loaded")]
+#[test_case(true; "conditional unloaded")]
+#[tokio::test]
+async fn conditional_goal_controls_reject_stale_selection_without_recording(
+    unloaded: bool,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri())
+        .with_provider_config("supports_websockets = false")
+        .enable_feature(Feature::Goals)
+        .write(home.path())?;
+    let mut app = TestAppServer::builder()
+        .with_codex_home(home.path())
+        .without_managed_config()
+        .build_initialized_with_timeout(TIMEOUT)
+        .await?;
+    let thread_id = if unloaded {
+        create_fake_rollout(
+            home.path(),
+            "2025-01-05T12-00-00",
+            "2025-01-05T12:00:00Z",
+            "",
+            Some("mock_provider"),
+            None,
+        )?
+    } else {
+        app.start_thread(ThreadStartParams::default())
+            .await?
+            .thread
+            .id
+    };
+    let id = app
+        .send_raw_request("thread/goal/snapshot", Some(json!({"threadId":thread_id})))
+        .await?;
+    let initial: codex_app_server_protocol::ThreadGoalSnapshotResponse =
+        app.read_response(id).await?;
+    assert!(initial.goal.is_none());
+    let id = app.send_raw_request("thread/goal/conditionalSet",Some(json!({
+        "threadId":thread_id,"expectedRevision":initial.revision,"objective":"selected original","status":"paused","origin":"user"
+    }))).await?;
+    let selected: codex_app_server_protocol::ThreadGoalConditionalSetResponse =
+        app.read_response(id).await?;
+    let id = app.send_raw_request("thread/goal/set",Some(json!({"threadId":thread_id,"objective":"later human definition","status":"paused","origin":"user"}))).await?;
+    let _: ThreadGoalSetResponse = app.read_response(id).await?;
+    for (method, extra) in [
+        (
+            "thread/goal/conditionalSet",
+            json!({"objective":"stale-mutation-must-not-be-recorded","status":"complete"}),
+        ),
+        ("thread/goal/conditionalClear", json!({})),
+    ] {
+        let mut params =
+            json!({"threadId":thread_id,"expectedRevision":selected.revision,"origin":"user"});
+        params
+            .as_object_mut()
+            .expect("object")
+            .extend(extra.as_object().expect("object").clone());
+        let id = app.send_raw_request(method, Some(params)).await?;
+        let error = app
+            .read_stream_until_error_message(codex_app_server_protocol::RequestId::Integer(id))
+            .await?;
+        assert!(error.error.message.contains("goal changed"), "{error:?}");
+    }
+    let id = app
+        .send_raw_request("thread/goal/snapshot", Some(json!({"threadId":thread_id})))
+        .await?;
+    let current: codex_app_server_protocol::ThreadGoalSnapshotResponse =
+        app.read_response(id).await?;
+    assert_eq!(
+        current.goal.expect("retained goal").objective,
+        "later human definition"
+    );
+    let id = app
+        .send_raw_request(
+            "thread/goal/conditionalClear",
+            Some(json!({"threadId":thread_id,"expectedRevision":current.revision,"origin":"user"})),
+        )
+        .await?;
+    let cleared: codex_app_server_protocol::ThreadGoalConditionalClearResponse =
+        app.read_response(id).await?;
+    assert!(cleared.cleared);
+    let id = app
+        .send_raw_request("thread/goal/snapshot", Some(json!({"threadId":thread_id})))
+        .await?;
+    let final_snapshot: codex_app_server_protocol::ThreadGoalSnapshotResponse =
+        app.read_response(id).await?;
+    assert!(final_snapshot.goal.is_none());
+    assert_eq!(cleared.revision, final_snapshot.revision);
+    assert_ne!(initial.revision, final_snapshot.revision);
+    let path = codex_rollout::find_thread_path_by_id_str(home.path(), &thread_id, None)
+        .await?
+        .expect("retained history");
+    let history = std::fs::read_to_string(path)?;
+    assert!(!history.contains("stale-mutation-must-not-be-recorded"));
+    app.shutdown_gracefully().await?;
+    Ok(())
+}

@@ -1,0 +1,108 @@
+name: Interaction native goal controls
+on:
+  pull_request:
+    branches: [release/interaction-0.163]
+permissions:
+  contents: read
+concurrency:
+  group: interaction-native-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  linux-native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: codex-rs
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      RUSTFLAGS: -C link-arg=-fuse-ld=lld
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
+        with:
+          components: rustfmt
+      - name: Prepare disposable Linux build capacity
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get update
+          sudo apt-get install -y lld pkg-config libssl-dev cmake clang protobuf-compiler libcap-dev
+          df -h .
+      - uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7
+        id: native-cache
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            codex-rs/target
+          key: interaction-native-linux-1.95-${{ hashFiles('codex-rs/Cargo.lock', '.github/workflows/interaction-goal-controls.yml') }}
+      - name: Format native patch
+        run: cargo fmt --all -- --config imports_granularity=Item --check
+      - name: Generate stable and experimental schemas using one compiled writer
+        run: |
+          cargo test --locked --profile dev-small -j 2 -p codex-app-server-protocol --lib --no-run --message-format=json > "$RUNNER_TEMP/schema-build.jsonl"
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          artifacts=[json.loads(line) for line in Path(os.environ['RUNNER_TEMP'],'schema-build.jsonl').read_text().splitlines() if line.startswith('{')]
+          writers=[a['executable'] for a in artifacts if a.get('reason')=='compiler-artifact' and a.get('executable') and a['target']['name']=='codex_app_server_protocol']
+          assert len(writers)==1, writers
+          for experimental in ('0','1'):
+              env={**os.environ,'CODEX_APP_SERVER_SCHEMA_ROOT':str(Path('app-server-protocol/schema').resolve()),'CODEX_APP_SERVER_SCHEMA_EXPERIMENTAL':experimental}
+              subprocess.run([writers[0],'schema_fixtures_tests::write_schema_fixtures_from_env','--exact','--ignored'],env=env,check=True)
+          PY
+      - name: Install locked SDK generator environment
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+        with:
+          version: "0.11.3"
+      - name: Generate the Python SDK from the same schemas
+        run: uv run --project ../sdk/python --frozen --only-group test python ../sdk/python/scripts/update_sdk_artifacts.py generate-types --schema-dir app-server-protocol/schema/json
+      - name: Protocol exports and schema contracts
+        run: cargo test --locked --profile dev-small -j 2 -p codex-app-server-protocol --lib
+      - name: State goal accounting and conditional transactions
+        run: cargo test --locked --profile dev-small -j 2 -p codex-state --lib goals
+      - name: Goal extension
+        run: cargo test --locked --profile dev-small -j 2 -p codex-goal-extension --lib
+      - name: Actual App Server goal controls including loaded and unloaded races
+        run: |
+          cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all guardian_v2::goals -- --list > "$RUNNER_TEMP/goal-tests.txt"
+          cat "$RUNNER_TEMP/goal-tests.txt"
+          test "$(grep -c 'conditional_goal_controls_reject_stale_selection_without_recording.*: test' "$RUNNER_TEMP/goal-tests.txt")" = 2
+          cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all guardian_v2::goals -- --nocapture
+      - name: Build the actual native CLI candidate
+        id: native-build
+        run: |
+          cargo build --locked --profile dev-small -j 2 -p codex-cli --bin codex
+          target/dev-small/codex --version
+          sha256sum target/dev-small/codex
+          git rev-parse HEAD > target/dev-small/interaction-source.txt
+      - name: Retain successful native compilation before SDK journeys
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            codex-rs/target
+          key: ${{ steps.native-cache.outputs.cache-primary-key }}
+      - name: Same-CLI Python SDK contract and mock-server journeys
+        working-directory: sdk/python
+        run: CODEX_EXEC_PATH="$GITHUB_WORKSPACE/codex-rs/target/dev-small/codex" uv run --frozen --only-group test pytest
+      - name: Retain schemas, test inventory and executable for receiving qualification
+        if: ${{ !cancelled() && steps.native-build.outcome == 'success' }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: interaction-native-linux
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            codex-rs/target/dev-small/codex
+            codex-rs/target/dev-small/interaction-source.txt
+            codex-rs/app-server-protocol/schema/
+            sdk/python/src/openai_codex/generated/
+            sdk/python/src/openai_codex/api.py
+            ${{ runner.temp }}/goal-tests.txt
