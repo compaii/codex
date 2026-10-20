@@ -41,6 +41,7 @@ jobs:
           key: interaction-native-linux-1.95-${{ hashFiles('codex-rs/Cargo.lock', '.github/workflows/interaction-goal-controls.yml') }}-${{ github.sha }}
           restore-keys: |
             interaction-native-linux-1.95-${{ hashFiles('codex-rs/Cargo.lock', '.github/workflows/interaction-goal-controls.yml') }}
+            interaction-native-linux-1.95-
       - name: Format native patch
         run: cargo fmt --all -- --config imports_granularity=Item --check
       - name: Generate stable and experimental schemas using one compiled writer
@@ -74,13 +75,17 @@ jobs:
           cat "$RUNNER_TEMP/goal-tests.txt"
           test "$(grep -c 'conditional_goal_controls_reject_stale_selection_without_recording.*: test' "$RUNNER_TEMP/goal-tests.txt")" = 2
           cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all guardian_v2::goals -- --nocapture
-      - name: Build the actual native CLI candidate
+      - name: Build the native CLI and its required tool host
         id: native-build
         run: |
           cargo build --locked --profile dev-small -j 2 -p codex-cli --bin codex
+          cargo build --locked --profile dev-small -j 2 -p codex-code-mode-host --bin codex-code-mode-host
           target/dev-small/codex --version
-          sha256sum target/dev-small/codex
+          test -x target/dev-small/codex-code-mode-host
+          sha256sum target/dev-small/codex target/dev-small/codex-code-mode-host
           git rev-parse HEAD > target/dev-small/interaction-source.txt
+      - name: Exercise the actual core-to-tool-host connection
+        run: cargo test --locked --profile dev-small -j 2 -p codex-core --lib code_mode_host::tests -- --nocapture
       - name: Retain native compilation cache, including partial builds
         if: always() && steps.native-cache.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -103,6 +108,7 @@ jobs:
           if-no-files-found: error
           path: |
             codex-rs/target/dev-small/codex
+            codex-rs/target/dev-small/codex-code-mode-host
             codex-rs/target/dev-small/interaction-source.txt
             codex-rs/app-server-protocol/schema/
             sdk/python/src/openai_codex/generated/
