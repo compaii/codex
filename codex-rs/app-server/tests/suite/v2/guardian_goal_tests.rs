@@ -373,3 +373,97 @@ async fn conditional_activation_unloaded_rejects_before_mutating_goal() -> Resul
     app.shutdown_gracefully().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn conditional_activation_steers_the_existing_useful_turn() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let mock = responses::mount_response_sequence(
+        &server,
+        vec![
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(responses::sse(vec![
+                    responses::ev_response_created("busy"),
+                    responses::ev_function_call(
+                        "complete-busy-goal",
+                        "update_goal",
+                        r#"{"status":"complete"}"#,
+                    ),
+                    responses::ev_completed("busy"),
+                ]))
+                .set_delay(Duration::from_secs(5)),
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(responses::sse(vec![
+                    responses::ev_assistant_message("final", "Finished current work."),
+                    responses::ev_completed("finished"),
+                ])),
+        ],
+    )
+    .await;
+    let home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri())
+        .with_provider_config("supports_websockets = false")
+        .enable_feature(Feature::Goals)
+        .disable_feature(Feature::EnableRequestCompression)
+        .write(home.path())?;
+    let mut app = TestAppServer::builder()
+        .with_codex_home(home.path())
+        .without_managed_config()
+        .build_initialized_with_timeout(TIMEOUT)
+        .await?;
+    let thread = app.start_thread(ThreadStartParams::default()).await?.thread;
+    let id=app.send_raw_request("thread/goal/set",Some(json!({"threadId":thread.id,"objective":"Existing goal","status":"paused","origin":"user"}))).await?;
+    let _: ThreadGoalSetResponse = app.read_response(id).await?;
+    let id = app
+        .send_raw_request("thread/goal/snapshot", Some(json!({"threadId":thread.id})))
+        .await?;
+    let snapshot: codex_app_server_protocol::ThreadGoalSnapshotResponse =
+        app.read_response(id).await?;
+    let id = app
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![UserInput::Text {
+                text: "Continue this authorized work.".into(),
+                text_elements: vec![],
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let started: TurnStartResponse = app.read_response(id).await?;
+    timeout(TIMEOUT, async {
+        while mock.requests().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    let id=app.send_raw_request("thread/goal/conditionalActivate",Some(json!({"threadId":thread.id,"expectedRevision":snapshot.revision,"origin":"user","additionalContext":{"interaction":{"value":"FRESH-CONTEXT-WHILE-BUSY","kind":"untrusted"}}}))).await?;
+    let activation: codex_app_server_protocol::ThreadGoalConditionalActivateResponse =
+        app.read_response(id).await?;
+    assert_eq!(
+        activation.activation,
+        codex_app_server_protocol::ThreadGoalActivationDisposition::Steered {
+            turn_id: started.turn.id.clone()
+        }
+    );
+    let completed: TurnCompletedNotification =
+        timeout(TIMEOUT, app.read_notification("turn/completed")).await??;
+    assert_eq!(completed.turn.id, started.turn.id);
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2, "no additional physical turn");
+    assert!(
+        !requests[0]
+            .body_json()
+            .to_string()
+            .contains("FRESH-CONTEXT-WHILE-BUSY")
+    );
+    assert!(
+        requests[1]
+            .body_json()
+            .to_string()
+            .contains("FRESH-CONTEXT-WHILE-BUSY")
+    );
+    app.shutdown_gracefully().await?;
+    Ok(())
+}
