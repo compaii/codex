@@ -85,7 +85,11 @@ jobs:
           sha256sum target/dev-small/codex target/dev-small/codex-code-mode-host
           git rev-parse HEAD > target/dev-small/interaction-source.txt
       - name: Exercise the actual core-to-tool-host connection
-        run: cargo test --locked --profile dev-small -j 2 -p codex-core --lib code_mode_host::tests -- --nocapture
+        run: |
+          cargo test --locked --profile dev-small -j 2 -p codex-core --lib code_mode_host::tests -- --list > "$RUNNER_TEMP/tool-host-tests.txt"
+          cat "$RUNNER_TEMP/tool-host-tests.txt"
+          grep -q 'grpc_stdio_sessions_share_a_host_and_isolate_state: test' "$RUNNER_TEMP/tool-host-tests.txt"
+          cargo test --locked --profile dev-small -j 2 -p codex-core --lib code_mode_host::tests -- --nocapture
       - name: Retain native compilation cache, including partial builds
         if: always() && steps.native-cache.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -114,3 +118,4 @@ jobs:
             sdk/python/src/openai_codex/generated/
             sdk/python/src/openai_codex/api.py
             ${{ runner.temp }}/goal-tests.txt
+            ${{ runner.temp }}/tool-host-tests.txt
