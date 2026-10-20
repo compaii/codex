@@ -68,6 +68,7 @@ pub struct GoalSetOutcome {
     activation_context: Option<BTreeMap<String, codex_protocol::protocol::AdditionalContextEntry>>,
     // Retain the original permit through rollout publication and work admission.
     activation_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    activation_runtime: Option<Weak<GoalRuntimeHandle>>,
 }
 
 impl GoalSetOutcome {
@@ -89,6 +90,18 @@ impl GoalSetOutcome {
         let runtime = service
             .runtime_for_thread(self.goal.thread_id)
             .ok_or("Selected runtime unavailable after commitment")?;
+        let selected = self
+            .activation_runtime
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .ok_or("Selected activation runtime retired")?;
+        if !Arc::ptr_eq(&runtime, &selected) {
+            return Err(
+                "Selected runtime changed after metadata commitment; context was not submitted"
+                    .into(),
+            );
+        }
+
         runtime
             .activate_with_context(
                 self.state_goal.clone(),
@@ -361,6 +374,9 @@ impl GoalService {
             return Ok(GoalSetOutcome {
                 goal: protocol_goal_from_state(goal.clone()),
                 previous_goal,
+                activation_runtime: activation_permit
+                    .as_ref()
+                    .and_then(|_| runtime.as_ref().map(Arc::downgrade)),
                 activation_context,
                 activation_permit,
                 state_goal: goal,
@@ -453,6 +469,7 @@ impl GoalService {
             revision: None,
             activation_context: None,
             activation_permit: None,
+            activation_runtime: None,
         })
     }
 

@@ -541,7 +541,7 @@ impl GoalRuntimeHandle {
         };
         self.inner
             .metrics
-            .record_terminal_if_status_changed(previous_status, goal);
+            .record_terminal_if_status_changed(previous_status, &goal);
         self.inner.analytics.status_changed(
             &goal,
             previous_status,
@@ -732,7 +732,7 @@ impl GoalRuntimeHandle {
                 let goal_id = goal.goal_id.clone();
                 self.inner
                     .metrics
-                    .record_terminal_if_status_changed(previous_status, goal);
+                    .record_terminal_if_status_changed(previous_status, &goal);
                 self.inner
                     .analytics
                     .usage_accounted(&goal, GoalEventAttribution::Turn(turn_id));
@@ -794,7 +794,7 @@ impl GoalRuntimeHandle {
                 let goal_id = goal.goal_id.clone();
                 self.inner
                     .metrics
-                    .record_terminal_if_status_changed(previous_status, goal);
+                    .record_terminal_if_status_changed(previous_status, &goal);
                 self.inner
                     .analytics
                     .usage_accounted(&goal, GoalEventAttribution::NoTurn);
