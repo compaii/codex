@@ -11,6 +11,19 @@ remain separate. Receiving adoption and real-session qualification are required.
   `expectedRevision`, returning `goal` and the revision of the matched mutation.
 - `thread/goal/conditionalClear` takes `threadId`, required `expectedRevision`
   and optional provenance `origin`, returning `cleared` and the new revision.
+- `thread/goal/conditionalActivate` takes `threadId`, `expectedRevision`,
+  optional objective/budget/provenance and required `additionalContext`. It
+  activates the matched goal and admits the current invocation context to its
+  first useful turn, or to the exact existing regular turn. The response retains
+  the committed goal/revision and a separate activation disposition. It requires
+  a loaded goal runtime; an unloaded selection is rejected before mutation.
+
+Conditional activation holds the existing goal-state permit through publication
+and context admission. Busy admission uses the core's internal context queue;
+it does not manufacture human input to satisfy `turn/steer`. A successful metadata
+write alone does not prove admission: retain `notStarted`/`uncertain` separately
+and never replay an unknown effect. Additional context is limited to eight
+nonempty keys of at most 128 characters and 32 KiB serialized content.
 
 Use these method names for selected operations; never downgrade to a legacy
 mutation when the native server rejects an unsupported conditional method. An

@@ -1355,6 +1355,11 @@ impl MessageProcessor {
                     .thread_goal_snapshot(params)
                     .await
             }
+            ClientRequest::ThreadGoalConditionalActivate { params, .. } => {
+                self.thread_goal_processor
+                    .thread_goal_conditional_activate(request_id.clone(), params)
+                    .await
+            }
             ClientRequest::ThreadGoalConditionalSet { params, .. } => {
                 self.thread_goal_processor
                     .thread_goal_conditional_set(request_id.clone(), params)

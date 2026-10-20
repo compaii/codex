@@ -617,6 +617,11 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadGoalSnapshotResponse,
     },
+    ThreadGoalConditionalActivate => "thread/goal/conditionalActivate" {
+        params: v2::ThreadGoalConditionalActivateParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadGoalConditionalActivateResponse,
+    },
     ThreadGoalConditionalSet => "thread/goal/conditionalSet" {
         params: v2::ThreadGoalConditionalSetParams,
         serialization: thread_id(params.thread_id),

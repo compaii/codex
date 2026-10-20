@@ -38,7 +38,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             codex-rs/target
-          key: interaction-native-linux-1.95-${{ hashFiles('codex-rs/Cargo.lock', '.github/workflows/interaction-goal-controls.yml') }}
+          key: interaction-native-linux-1.95-${{ hashFiles('codex-rs/Cargo.lock', '.github/workflows/interaction-goal-controls.yml') }}-${{ github.sha }}
+          restore-keys: |
+            interaction-native-linux-1.95-${{ hashFiles('codex-rs/Cargo.lock', '.github/workflows/interaction-goal-controls.yml') }}
       - name: Format native patch
         run: cargo fmt --all -- --config imports_granularity=Item --check
       - name: Generate stable and experimental schemas using one compiled writer
@@ -79,8 +81,8 @@ jobs:
           target/dev-small/codex --version
           sha256sum target/dev-small/codex
           git rev-parse HEAD > target/dev-small/interaction-source.txt
-      - name: Retain successful native compilation before SDK journeys
-        if: steps.native-cache.outputs.cache-hit != 'true'
+      - name: Retain native compilation cache, including partial builds
+        if: always() && steps.native-cache.outputs.cache-hit != 'true'
         continue-on-error: true
         uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7
         with:

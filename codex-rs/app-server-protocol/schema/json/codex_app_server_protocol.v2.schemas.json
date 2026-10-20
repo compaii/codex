@@ -2000,6 +2000,30 @@
             },
             "method": {
               "enum": [
+                "thread/goal/conditionalActivate"
+              ],
+              "title": "Thread/goal/conditionalActivateRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/ThreadGoalConditionalActivateParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/goal/conditionalActivateRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "enum": [
                 "thread/goal/conditionalSet"
               ],
               "title": "Thread/goal/conditionalSetRequestMethod",
@@ -19666,6 +19690,83 @@
       ],
       "type": "object"
     },
+    "ThreadGoalActivationDisposition": {
+      "description": "Admission is not evidence of incorporation, goal completion or hearing.",
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "uncertain"
+              ],
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "reason"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "started"
+              ],
+              "type": "string"
+            },
+            "turn_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "turn_id"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "steered"
+              ],
+              "type": "string"
+            },
+            "turn_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "turn_id"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "notStarted"
+              ],
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "reason"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "ThreadGoalClearParams": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -19714,6 +19815,74 @@
         "threadId"
       ],
       "title": "ThreadGoalClearedNotification",
+      "type": "object"
+    },
+    "ThreadGoalConditionalActivateParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "additionalContext": {
+          "additionalProperties": {
+            "$ref": "#/definitions/AdditionalContextEntry"
+          },
+          "type": "object"
+        },
+        "expectedRevision": {
+          "type": "string"
+        },
+        "objective": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "origin": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadGoalMutationOrigin"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "tokenBudget": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "additionalContext",
+        "expectedRevision",
+        "threadId"
+      ],
+      "title": "ThreadGoalConditionalActivateParams",
+      "type": "object"
+    },
+    "ThreadGoalConditionalActivateResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "activation": {
+          "$ref": "#/definitions/ThreadGoalActivationDisposition"
+        },
+        "goal": {
+          "$ref": "#/definitions/ThreadGoal"
+        },
+        "revision": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "activation",
+        "goal",
+        "revision"
+      ],
+      "title": "ThreadGoalConditionalActivateResponse",
       "type": "object"
     },
     "ThreadGoalConditionalClearParams": {

@@ -5330,6 +5330,60 @@ class ThreadExtra(BaseModel):
     )
 
 
+class ThreadGoalActivationDisposition1(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    kind: Literal["uncertain"]
+    reason: str
+
+
+class ThreadGoalActivationDisposition2(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    kind: Literal["started"]
+    turn_id: str
+
+
+class ThreadGoalActivationDisposition3(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    kind: Literal["steered"]
+    turn_id: str
+
+
+class ThreadGoalActivationDisposition4(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    kind: Literal["notStarted"]
+    reason: str
+
+
+class ThreadGoalActivationDisposition(
+    RootModel[
+        ThreadGoalActivationDisposition1
+        | ThreadGoalActivationDisposition2
+        | ThreadGoalActivationDisposition3
+        | ThreadGoalActivationDisposition4
+    ]
+):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    root: Annotated[
+        ThreadGoalActivationDisposition1
+        | ThreadGoalActivationDisposition2
+        | ThreadGoalActivationDisposition3
+        | ThreadGoalActivationDisposition4,
+        Field(
+            description="Admission is not evidence of incorporation, goal completion or hearing."
+        ),
+    ]
+
+
 class ThreadGoalClearResponse(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -10027,6 +10081,29 @@ class ThreadGoalClearParams(BaseModel):
     thread_id: Annotated[str, Field(alias="threadId")]
 
 
+class ThreadGoalConditionalActivateParams(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    additional_context: Annotated[
+        dict[str, AdditionalContextEntry], Field(alias="additionalContext")
+    ]
+    expected_revision: Annotated[str, Field(alias="expectedRevision")]
+    objective: str | None = None
+    origin: ThreadGoalMutationOrigin | None = None
+    thread_id: Annotated[str, Field(alias="threadId")]
+    token_budget: Annotated[int | None, Field(alias="tokenBudget")] = None
+
+
+class ThreadGoalConditionalActivateResponse(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    activation: ThreadGoalActivationDisposition
+    goal: ThreadGoal
+    revision: str
+
+
 class ThreadGoalConditionalClearParams(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -10792,6 +10869,18 @@ class ThreadForkRequest(BaseModel):
     id: RequestId
     method: Annotated[Literal["thread/fork"], Field(title="Thread/forkRequestMethod")]
     params: ThreadForkParams
+
+
+class ThreadGoalConditionalActivateRequest(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    id: RequestId
+    method: Annotated[
+        Literal["thread/goal/conditionalActivate"],
+        Field(title="Thread/goal/conditionalActivateRequestMethod"),
+    ]
+    params: ThreadGoalConditionalActivateParams
 
 
 class ThreadGoalConditionalSetRequest(BaseModel):
@@ -12880,6 +12969,7 @@ class ClientRequest(
         | ThreadUnsubscribeRequest
         | ThreadNameSetRequest
         | ThreadGoalSnapshotRequest
+        | ThreadGoalConditionalActivateRequest
         | ThreadGoalConditionalSetRequest
         | ThreadGoalConditionalClearRequest
         | ThreadGoalSetRequest
@@ -12994,6 +13084,7 @@ class ClientRequest(
         | ThreadUnsubscribeRequest
         | ThreadNameSetRequest
         | ThreadGoalSnapshotRequest
+        | ThreadGoalConditionalActivateRequest
         | ThreadGoalConditionalSetRequest
         | ThreadGoalConditionalClearRequest
         | ThreadGoalSetRequest

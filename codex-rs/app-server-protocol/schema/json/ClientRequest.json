@@ -4603,6 +4603,51 @@
       ],
       "type": "object"
     },
+    "ThreadGoalConditionalActivateParams": {
+      "properties": {
+        "additionalContext": {
+          "additionalProperties": {
+            "$ref": "#/definitions/AdditionalContextEntry"
+          },
+          "type": "object"
+        },
+        "expectedRevision": {
+          "type": "string"
+        },
+        "objective": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "origin": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadGoalMutationOrigin"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "tokenBudget": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "additionalContext",
+        "expectedRevision",
+        "threadId"
+      ],
+      "type": "object"
+    },
     "ThreadGoalConditionalClearParams": {
       "properties": {
         "expectedRevision": {
@@ -6542,6 +6587,30 @@
         "params"
       ],
       "title": "Thread/goal/snapshotRequest",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "thread/goal/conditionalActivate"
+          ],
+          "title": "Thread/goal/conditionalActivateRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ThreadGoalConditionalActivateParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Thread/goal/conditionalActivateRequest",
       "type": "object"
     },
     {
