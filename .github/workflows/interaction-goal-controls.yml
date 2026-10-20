@@ -44,6 +44,10 @@ jobs:
             interaction-native-linux-1.95-
       - name: Format native patch
         run: cargo fmt --all -- --config imports_granularity=Item --check
+      - name: Select upstream checksum-verified V8 artifacts for the tool host
+        uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: x86_64-unknown-linux-gnu
       - name: Generate stable and experimental schemas using one compiled writer
         run: |
           cargo test --locked --profile dev-small -j 2 -p codex-app-server-protocol --lib --no-run --message-format=json > "$RUNNER_TEMP/schema-build.jsonl"
