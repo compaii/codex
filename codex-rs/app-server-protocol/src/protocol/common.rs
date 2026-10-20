@@ -612,6 +612,21 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadPredictionRequestResponse,
     },
+    ThreadGoalSnapshot => "thread/goal/snapshot" {
+        params: v2::ThreadGoalGetParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadGoalSnapshotResponse,
+    },
+    ThreadGoalConditionalSet => "thread/goal/conditionalSet" {
+        params: v2::ThreadGoalConditionalSetParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadGoalConditionalSetResponse,
+    },
+    ThreadGoalConditionalClear => "thread/goal/conditionalClear" {
+        params: v2::ThreadGoalConditionalClearParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadGoalConditionalClearResponse,
+    },
     ThreadGoalSet => "thread/goal/set" {
         params: v2::ThreadGoalSetParams,
         serialization: thread_id(params.thread_id),
