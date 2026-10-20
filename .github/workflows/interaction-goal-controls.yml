@@ -31,7 +31,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y lld pkg-config libssl-dev cmake clang protobuf-compiler libcap-dev
           df -h .
-      - uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7
+      - uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7
+        id: native-cache
         with:
           path: |
             ~/.cargo/registry
@@ -78,6 +79,16 @@ jobs:
           target/dev-small/codex --version
           sha256sum target/dev-small/codex
           git rev-parse HEAD > target/dev-small/interaction-source.txt
+      - name: Retain successful native compilation before SDK journeys
+        if: steps.native-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            codex-rs/target
+          key: ${{ steps.native-cache.outputs.cache-primary-key }}
       - name: Same-CLI Python SDK contract and mock-server journeys
         working-directory: sdk/python
         run: CODEX_EXEC_PATH="$GITHUB_WORKSPACE/codex-rs/target/dev-small/codex" uv run --frozen --only-group test pytest
