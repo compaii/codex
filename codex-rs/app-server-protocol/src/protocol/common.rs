@@ -613,7 +613,7 @@ client_request_definitions! {
         response: v2::ThreadPredictionRequestResponse,
     },
     ThreadGoalSnapshot => "thread/goal/snapshot" {
-        params: v2::ThreadGoalGetParams,
+        params: v2::ThreadGoalSnapshotParams,
         serialization: thread_id(params.thread_id),
         response: v2::ThreadGoalSnapshotResponse,
     },

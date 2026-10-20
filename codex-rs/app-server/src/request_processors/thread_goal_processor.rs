@@ -88,7 +88,7 @@ impl ThreadGoalRequestProcessor {
 
     pub(crate) async fn thread_goal_snapshot(
         &self,
-        params: ThreadGoalGetParams,
+        params: ThreadGoalSnapshotParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         if !self.config.features.enabled(Feature::Goals) {
             return Err(invalid_request("goals feature is disabled"));

@@ -920,6 +920,13 @@ pub struct ThreadGoalClearResponse {
     pub cleared: bool,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadGoalSnapshotParams {
+    pub thread_id: String,
+}
+
 /// A consistent goal/definition snapshot. Revision survives clear/recreate and
 /// excludes ordinary usage accounting; it is not an authorization credential.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
