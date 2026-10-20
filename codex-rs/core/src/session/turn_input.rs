@@ -897,7 +897,7 @@ impl Session {
     }
 }
 
-async fn merge_additional_context_input(
+pub(super) async fn merge_additional_context_input(
     session: &Session,
     additional_context: BTreeMap<String, AdditionalContextEntry>,
 ) -> Vec<TurnInput> {

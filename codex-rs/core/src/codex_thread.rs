@@ -614,6 +614,21 @@ impl CodexThread {
         self.session.inject_if_running(items).await
     }
 
+    /// Context-aware internal steering, fenced to the selected regular turn.
+    pub async fn inject_context_for_running_turn(
+        &self,
+        expected_turn: &str,
+        items: Vec<ResponseItem>,
+        context: std::collections::BTreeMap<
+            String,
+            codex_protocol::protocol::AdditionalContextEntry,
+        >,
+    ) -> Option<String> {
+        self.session
+            .inject_context_for_running_turn(expected_turn, items, context)
+            .await
+    }
+
     /// Environment selections captured by the active turn, before later settings updates.
     /// Includes environments that are still starting or have failed. Hosts use this snapshot
     /// to authorize steering against every executor that the active turn selected.

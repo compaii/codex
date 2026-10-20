@@ -5,7 +5,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use codex_core::StartIfIdleSubmission;
-use codex_core::SteerSubmission;
 use codex_core::ThreadManager;
 use codex_core::TurnInput;
 use codex_core::TurnInputRequest;
@@ -341,21 +340,20 @@ impl GoalRuntimeHandle {
             .await
             .map_err(|e| e.to_string())?;
         if let Some(current) = self.inner.accounting_state.current_turn_id() {
-            let request = TurnInputRequest::new(TurnInput::ResponseItem(
-                objective_updated_steering_item(&protocol_goal_from_state(goal.clone())),
-            ))
-            .with_additional_context(context.clone());
-            match thread
-                .steer_turn(request, current)
+            if let Some(turn_id) = thread
+                .inject_context_for_running_turn(
+                    &current,
+                    vec![objective_updated_steering_item(&protocol_goal_from_state(
+                        goal.clone(),
+                    ))],
+                    context.clone(),
+                )
                 .await
-                .map_err(|e| e.to_string())?
             {
-                SteerSubmission::Steered { turn_id } => {
-                    return Ok(GoalActivationDisposition::Steered { turn_id });
-                }
-                SteerSubmission::NotSubmitted { .. } => (),
+                return Ok(GoalActivationDisposition::Steered { turn_id });
             }
         }
+
         if self
             .inner
             .state_dbs
