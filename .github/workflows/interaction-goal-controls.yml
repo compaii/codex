@@ -88,6 +88,8 @@ jobs:
           test -x target/dev-small/codex-code-mode-host
           sha256sum target/dev-small/codex target/dev-small/codex-code-mode-host
           git rev-parse HEAD > target/dev-small/interaction-source.txt
+      - name: Foreground control notices without agent input
+        run: cargo test --locked --profile dev-small -j 2 -p codex-tui --lib foreground_notices -- --nocapture
       - name: Exercise the actual core-to-tool-host connection
         run: |
           cargo test --locked --profile dev-small -j 2 -p codex-core --lib code_mode_host::tests -- --list > "$RUNNER_TEMP/tool-host-tests.txt"

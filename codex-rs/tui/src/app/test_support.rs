@@ -22,6 +22,7 @@ pub(crate) async fn make_test_app() -> Box<App> {
 
     Box::new(App {
         feature_write_lock: Arc::default(),
+        foreground_notices: Default::default(),
         config_notification_test_generation: 0,
         config_notification_test_pending: None,
         model_catalog: chat_widget.model_catalog(),
