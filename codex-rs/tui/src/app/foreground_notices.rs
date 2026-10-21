@@ -41,7 +41,12 @@ impl ForegroundNotices {
             socket: std::env::var_os("CODEX_FOREGROUND_NOTICES_SOCKET")
                 .filter(|path| !path.is_empty())
                 .map(PathBuf::from),
-            ..Self::default()
+            thread: None,
+            cursor: None,
+            request: None,
+            task: None,
+            next: None,
+            failed: false,
         }
     }
 
