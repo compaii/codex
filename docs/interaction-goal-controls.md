@@ -79,3 +79,10 @@ reuse, changed-config rebuild and an arriving subscriber/turn during loading.
 Digital timing does not establish first audible sound or human hearing. A source
 change is not adopted by an already-running native daemon; use the maintained
 writer-preserving native package route and record receiving adoption separately.
+
+The native qualification workflow also accepts `workflow_call` with an explicit
+`source_ref`, so the owning Interaction CI can reuse the same build/tests when
+native-repository Actions cannot be dispatched. Checkout remains fixed to
+`compaii/codex`; callers must pin both the workflow and source to reviewed commit
+SHAs. No deployment or secrets are inherited. Artifacts retain the checked-out
+source ID separately from the caller's workflow revision.
