@@ -551,8 +551,15 @@ impl codex_config::ThreadConfigLoader for ResumeConfigBarrier {
 }
 
 // Actual processor/Core/rollout journey with a loopback model. No paid provider.
-#[tokio::test]
-async fn resolved_resume_reuses_identical_idle_runtime_and_rebuilds_changes() -> Result<()> {
+#[test]
+fn resolved_resume_reuses_identical_idle_runtime_and_rebuilds_changes() -> Result<()> {
+    super::message_processor_tracing_tests::run_current_thread_test_with_stack(
+        "resolved-resume",
+        async { Box::pin(resolved_resume_journey()).await },
+    )
+}
+
+async fn resolved_resume_journey() -> Result<()> {
     let server = app_test_support::create_mock_responses_server_repeating_assistant("Done").await;
     let home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri())

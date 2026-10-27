@@ -301,7 +301,7 @@ pub(super) async fn build_test_processor_with_thread_config_loader(
     (processor, outgoing_rx)
 }
 
-fn run_current_thread_test_with_stack<F>(name: &str, future: F) -> Result<()>
+pub(super) fn run_current_thread_test_with_stack<F>(name: &str, future: F) -> Result<()>
 where
     F: Future<Output = Result<()>> + Send + 'static,
 {
