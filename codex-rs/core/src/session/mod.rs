@@ -2255,8 +2255,40 @@ impl Session {
         if !reusable {
             // Values may contain private credentials or paths. Diagnose only
             // equality categories, never the configurations themselves.
+            fn debug_fields(config: &Config) -> std::collections::BTreeMap<String, String> {
+                let mut fields = std::collections::BTreeMap::<String, String>::new();
+                let mut current = None;
+                for line in format!("{config:#?}").lines() {
+                    if let Some(field) = line.strip_prefix("    ")
+                        && !field.starts_with(' ')
+                        && let Some((key, _)) = field.split_once(':')
+                        && !key.is_empty()
+                        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    {
+                        current = Some(key.to_string());
+                    }
+                    if let Some(key) = &current {
+                        fields.entry(key.clone()).or_default().push_str(line);
+                    }
+                }
+                fields
+            }
+            let debug_input_differences = || {
+                let left = debug_fields(candidate);
+                let right = debug_fields(input);
+                left.keys()
+                    .chain(right.keys())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .filter(|key| left.get(*key) != right.get(*key))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
             tracing::debug!(
                 target: "codex_core::session::resume_equivalence",
+                // Debug map ordering can differ even for equal values. Field
+                // names guide inspection; only full PartialEq decides reuse.
+                debug_input_differences = ?debug_input_differences(),
                 input_equal = candidate == input.as_ref(),
                 runtime_config_equal = current.original_config_do_not_use == initial.original_config_do_not_use,
                 settings_equal = initial.thread_settings_snapshot(&initial.environments) == current.thread_settings_snapshot(&current.environments),

@@ -62,7 +62,7 @@ jobs:
           cargo test --locked --profile dev-small -j 2 -p codex-core -p codex-app-server --lib resolved_resume -- --list > "$RUNNER_TEMP/resume-tests.txt"
           grep -q 'resolved_resume_requires_full_config_and_unchanged_runtime: test' "$RUNNER_TEMP/resume-tests.txt"
           test "$(grep -c 'resolved_resume_reuses_identical_idle_runtime_and_rebuilds_changes.*: test' "$RUNNER_TEMP/resume-tests.txt")" = 2
-          cargo test --locked --profile dev-small -j 2 -p codex-core -p codex-app-server --lib resolved_resume -- --nocapture
+          cargo test --locked --profile dev-small -j 2 --no-fail-fast -p codex-core -p codex-app-server --lib resolved_resume -- --nocapture
       - name: Generate stable and experimental schemas using one compiled writer
         run: |
           cargo test --locked --profile dev-small -j 2 -p codex-app-server-protocol --lib --no-run --message-format=json > "$RUNNER_TEMP/schema-build.jsonl"
