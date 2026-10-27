@@ -155,7 +155,14 @@ async fn managed_maintenance_stalled_persistence_times_out_and_late_writer_canno
     .context("maintenance did not reach persistence barrier")?;
     // The actual managed path has a five-second finalization deadline.
     assert_eq!(maintenance_outcome(&mut maintenance).await?, "deferred");
-    start_thread(&mut client, 3, json!({})).await?;
+    start_thread(&mut client, 3, json!({}))
+        .await
+        .with_context(|| {
+            format!(
+                "independent conversation after snapshot timeout: {}",
+                diagnostic_tail(home.path())
+            )
+        })?;
     assert!(!daemon_recovery_file_path(home.path()).exists());
     drop(blocked);
     sleep(Duration::from_millis(100)).await;
@@ -164,7 +171,12 @@ async fn managed_maintenance_stalled_persistence_times_out_and_late_writer_canno
         "abandoned writer published recovery"
     );
     request_shutdown(&server, &socket).await?;
-    wait_success(&mut server).await?;
+    wait_success(&mut server).await.with_context(|| {
+        format!(
+            "explicit cleanup after released persistence: {}",
+            diagnostic_tail(home.path())
+        )
+    })?;
     Ok(())
 }
 
@@ -567,11 +579,35 @@ async fn managed_force_shutdown_exits_with_blocked_rollout_writer() -> Result<()
     // The running parent can create a child after admissions drain. Its listener
     // needs the unload lock held by the blocked snapshot.
     release_spawn.send(()).expect("parent is waiting to spawn");
-    wait_for_requests(&mock, /*count*/ 3).await?;
+    wait_for_requests(&mock, /*count*/ 3)
+        .await
+        .with_context(|| {
+            format!(
+                "delegated child while snapshot writer blocked: {}",
+                diagnostic_tail(home.path())
+            )
+        })?;
     assert_still_running(&mut server, "graceful shutdown must wait for the writer").await;
     request_shutdown(&server, &socket_path).await?;
-    wait_success(&mut server).await?;
+    wait_success(&mut server).await.with_context(|| {
+        format!(
+            "explicit forced-exit response: {}",
+            diagnostic_tail(home.path())
+        )
+    })?;
     Ok(())
+}
+
+fn diagnostic_tail(home: &Path) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(home.join("daemon-stderr.log")) else {
+        return "no fixture log".into();
+    };
+    let size = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    let _ = file.seek(SeekFrom::Start(size.saturating_sub(16384)));
+    let mut bytes = Vec::new();
+    let _ = file.take(16384).read_to_end(&mut bytes);
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 async fn wait_success(server: &mut Child) -> Result<()> {
@@ -961,7 +997,7 @@ pub(super) fn spawn_server(home: &Path, socket_path: &Path) -> Result<Child> {
         )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(std::fs::File::create(home.join("daemon-stderr.log"))?)
         .kill_on_drop(true)
         .spawn()?)
 }
