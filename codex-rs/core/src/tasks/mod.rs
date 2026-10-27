@@ -462,6 +462,12 @@ impl Session {
             return;
         }
 
+        // Mailbox/durable-sleep wakeups must not consume pending input after a
+        // host has claimed maintenance idle. Hold through synchronous lifecycle
+        // registration, just like explicit and extension-driven submissions.
+        let Some(_admission) = self.services.extensions.admit_turn_start() else {
+            return;
+        };
         let Some((turn_state, previous_options)) = self.reserve_pending_work_turn().await else {
             return;
         };

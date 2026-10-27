@@ -15,7 +15,6 @@ use codex_extension_api::ExtensionEventSink;
 use codex_extension_api::ExtensionRegistry;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::ExtensionWarning;
-use codex_extension_api::TurnStartAdmission;
 use codex_goal_extension::GoalExtensionConfig;
 use codex_goal_extension::GoalService;
 use codex_http_client::HttpClientFactory;
@@ -30,6 +29,7 @@ use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::ThreadScopedOutgoingMessageSender;
 use crate::thread_state::ThreadListenerCommand;
 use crate::thread_state::ThreadStateManager;
+use crate::turn_admission::TurnAdmission;
 
 pub(crate) struct ThreadExtensionDependencies {
     pub(crate) event_sink: Arc<dyn ExtensionEventSink>,
@@ -44,7 +44,7 @@ pub(crate) struct ThreadExtensionDependencies {
     pub(crate) http_client_factory: HttpClientFactory,
     /// Process-scoped queue shared by idle dispatch and app-server requests.
     pub(crate) queue_service: Option<Arc<QueuedItemService>>,
-    pub(crate) turn_start_admission: Option<Arc<dyn TurnStartAdmission>>,
+    pub(crate) turn_start_admission: Option<Arc<TurnAdmission>>,
 }
 
 pub(crate) fn thread_extensions(
@@ -66,7 +66,8 @@ pub(crate) fn thread_extensions(
     } = dependencies;
     let mut builder = ExtensionRegistryBuilder::<Config>::with_event_sink(Arc::clone(&event_sink));
     if let Some(admission) = turn_start_admission {
-        builder.turn_start_admission(admission);
+        builder.turn_start_admission(admission.clone());
+        builder.turn_lifecycle_contributor(admission);
     }
     if let Some(queue_service) = queue_service {
         codex_queue_extension::install(&mut builder, queue_service);

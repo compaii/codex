@@ -44,3 +44,17 @@ fn idle_maintenance_checks_live_turns_and_preparing_starts_before_closing() {
     admission.cancel_drain();
     assert!(admission.admit_turn_start().is_some());
 }
+
+#[test]
+fn idle_maintenance_waits_for_core_lifetime_when_host_events_are_delayed() {
+    let admission = TurnAdmission::default();
+    let (_, running) = tokio::sync::watch::channel(0);
+    let submission = admission.admit().unwrap();
+    let lifetime = admission.track_started_turn();
+    drop(submission);
+    // The host has not consumed TurnStarted, but Core already owns the task.
+    assert!(!admission.begin_idle_drain(&running));
+    assert!(admission.admit().is_ok());
+    drop(lifetime);
+    assert!(admission.begin_idle_drain(&running));
+}

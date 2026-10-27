@@ -58,8 +58,12 @@ jobs:
           cargo test --locked --profile dev-small -j 2 -p codex-app-server --lib maintenance -- --nocapture
           cargo test --locked --profile dev-small -j 2 -p codex-app-server --lib shutdown_waits -- --nocapture
           cargo test --locked --profile dev-small -j 2 -p codex-app-server --lib turn_admission -- --nocapture
-      - name: Signal-driven real process and independent conversation regression
-        run: cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all connection_handling_websocket_unix -- --nocapture
+      - name: Signal-driven process and managed failure regressions
+        run: |
+          cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all connection_handling_websocket_unix -- --nocapture
+          cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all daemon_update_recovery -- --nocapture
+      - name: Core input and automatic-start admission contracts
+        run: cargo test --locked --profile dev-small -j 2 -p codex-core --test all turn_input_submission -- --nocapture
       - name: Build the exact native package
         run: |
           cargo build --locked --profile dev-small -j 2 -p codex-cli --bin codex

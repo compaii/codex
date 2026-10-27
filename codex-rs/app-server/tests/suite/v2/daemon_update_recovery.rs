@@ -34,6 +34,114 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::client_async;
 use tokio_tungstenite::tungstenite::Message;
 
+#[cfg(unix)]
+fn request_maintenance(server: &Child) -> Result<()> {
+    let status = StdCommand::new("kill")
+        .arg("-HUP")
+        .arg(server.id().context("server pid")?.to_string())
+        .status()?;
+    anyhow::ensure!(status.success(), "maintenance signal failed");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn managed_maintenance_keeps_admitting_while_a_turn_runs_then_saves_idle_roots() -> Result<()>
+{
+    let home = TempDir::new()?;
+    let (release, gate) = oneshot::channel();
+    let (mock, _completions) =
+        start_streaming_sse_server(vec![vec![stream_chunk(Some(gate), "Done")?]]).await;
+    create_config_toml(home.path(), mock.uri(), "never")?;
+    let socket = home.path().join("control/server.sock");
+    let mut server = spawn_server(home.path(), &socket)?;
+    let mut client = connect_default_daemon_client(&socket).await?;
+    let first = start_thread(&mut client, 2, json!({})).await?;
+    start_turn(&mut client, 3, &first.thread.id).await?;
+    wait_for_requests(&mock, 1).await?;
+    request_maintenance(&server)?;
+    assert_still_running(&mut server, "maintenance waits without closing admission").await;
+    request_maintenance(&server)?;
+    let second = start_thread(&mut client, 4, json!({})).await?;
+    release.send(()).expect("held turn waiting");
+    wait_success(&mut server).await?;
+    let snapshot = daemon_recovery::read_snapshot(&daemon_recovery_file_path(home.path()))?;
+    assert_eq!(snapshot.loaded, [first.thread.id, second.thread.id].into());
+    assert!(snapshot.interrupted.is_empty());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn managed_maintenance_publish_failure_reopens_without_disconnecting() -> Result<()> {
+    let home = TempDir::new()?;
+    create_config_toml(home.path(), "http://127.0.0.1:1", "never")?;
+    let socket = home.path().join("control/server.sock");
+    let mut server = spawn_server(home.path(), &socket)?;
+    let mut client = connect_default_daemon_client(&socket).await?;
+    start_thread(&mut client, 2, json!({})).await?;
+    let recovery = daemon_recovery_file_path(home.path());
+    // Staging succeeds, but publishing over a directory must fail.
+    std::fs::create_dir_all(&recovery)?;
+    request_maintenance(&server)?;
+    sleep(Duration::from_millis(500)).await;
+    assert_still_running(&mut server, "failed maintenance must keep serving").await;
+    start_thread(&mut client, 3, json!({})).await?;
+    assert!(recovery.is_dir());
+    std::fs::remove_dir(&recovery)?;
+    request_shutdown(&server, &socket).await?;
+    wait_success(&mut server).await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn managed_maintenance_stalled_persistence_times_out_and_late_writer_cannot_publish()
+-> Result<()> {
+    let home = TempDir::new()?;
+    create_config_toml(home.path(), "http://127.0.0.1:1", "never")?;
+    let socket = home.path().join("control/server.sock");
+    let mut server = spawn_server(home.path(), &socket)?;
+    let mut client = connect_default_daemon_client(&socket).await?;
+    let root = start_thread(&mut client, 2, json!({})).await?;
+    let rollout = root.thread.path.context("idle rollout path")?;
+    assert!(!rollout.exists());
+    let compressed = rollout.with_extension("jsonl.zst");
+    std::fs::create_dir_all(compressed.parent().context("rollout directory")?)?;
+    anyhow::ensure!(
+        StdCommand::new("mkfifo")
+            .arg(&compressed)
+            .status()?
+            .success(),
+        "mkfifo failed"
+    );
+    request_maintenance(&server)?;
+    let blocked = timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(sender) = tokio::net::unix::pipe::OpenOptions::new().open_sender(&compressed)
+            {
+                return sender;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("maintenance did not reach persistence barrier")?;
+    // The actual managed path has a five-second finalization deadline.
+    sleep(Duration::from_millis(5500)).await;
+    start_thread(&mut client, 3, json!({})).await?;
+    assert!(!daemon_recovery_file_path(home.path()).exists());
+    drop(blocked);
+    sleep(Duration::from_millis(100)).await;
+    assert!(
+        !daemon_recovery_file_path(home.path()).exists(),
+        "abandoned writer published recovery"
+    );
+    request_shutdown(&server, &socket).await?;
+    wait_success(&mut server).await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn managed_restart_resumes_loaded_threads_and_goal_without_client() -> Result<()> {
     let home = TempDir::new()?;

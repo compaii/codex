@@ -290,6 +290,12 @@ impl ShutdownState {
             turn_admission.begin_drain();
         }
         self.requested = true;
+        if self.maintenance {
+            // A maintenance caller must have a bounded deferred outcome, not a
+            // permanent pending request that exits unexpectedly hours later.
+            self.maintenance_deadline =
+                Some(tokio::time::Instant::now() + std::time::Duration::from_secs(120));
+        }
         self.last_logged_running_turn_count = None;
         info!(
             "received shutdown signal (connections={}, runningAssistantTurns={}, maintenance={}, acceptingNewTurns={})",
@@ -1081,12 +1087,12 @@ pub async fn run_main_with_transport_options(
             };
             let mut listen_for_threads = true;
             // Keep force signals and daemon control events responsive while saving.
-            let make_snapshot = |path| {
+            let make_snapshot = |path, maintenance| {
                 let processor = Arc::clone(&processor);
                 Box::pin(async move {
                     // Run independently: snapshot locks can require the event loop to make progress.
                     let task = tokio::spawn(async move {
-                        let saved = processor.daemon_recovery_snapshot().await;
+                        let saved = processor.daemon_recovery_snapshot(maintenance).await?;
                         daemon_thread_recovery::snapshot(path, saved).await
                     });
                     tokio_util::task::AbortOnDropHandle::new(task)
@@ -1094,7 +1100,7 @@ pub async fn run_main_with_transport_options(
                         .map_err(std::io::Error::other)?
                 })
             };
-            let mut snapshot = make_snapshot(recovery_file.clone());
+            let mut snapshot = make_snapshot(recovery_file.clone(), false);
             let mut snapshot_started = false;
             let mut snapshot_is_maintenance = false;
             let mut snapshot_attempt = 0_u64;
@@ -1118,7 +1124,7 @@ pub async fn run_main_with_transport_options(
                     // Dropping the future aborts its async task. A late filesystem
                     // writer can only touch this attempt's private staging file,
                     // never publish an abandoned continuation for a later restart.
-                    snapshot = make_snapshot(recovery_file.clone());
+                    snapshot = make_snapshot(recovery_file.clone(), false);
                     snapshot_started = false;
                 }
                 let ready_to_exit = matches!(action, ShutdownAction::Finish);
@@ -1133,7 +1139,7 @@ pub async fn run_main_with_transport_options(
                     } else {
                         recovery_file.clone()
                     };
-                    snapshot = make_snapshot(snapshot_file.clone());
+                    snapshot = make_snapshot(snapshot_file.clone(), snapshot_is_maintenance);
                     snapshot_started = true;
                 }
                 if ready_to_exit {
@@ -1171,7 +1177,7 @@ pub async fn run_main_with_transport_options(
                             warn!("failed to save threads during daemon shutdown: {err}");
                             if shutdown_state.maintenance {
                                 shutdown_state.cancel_maintenance(&processor.turn_admission);
-                                snapshot = make_snapshot(recovery_file.clone());
+                                snapshot = make_snapshot(recovery_file.clone(), false);
                                 snapshot_started = false;
                                 continue;
                             }
@@ -1740,6 +1746,23 @@ mod tests {
         ));
         assert!(admission.admit().is_err());
         // A stalled snapshot must never leave the shared server closed.
+        shutdown.maintenance_deadline = Some(tokio::time::Instant::now());
+        assert!(matches!(
+            shutdown.update(&running, 0, 1, &admission),
+            ShutdownAction::ResumeServing
+        ));
+        assert!(!shutdown.requested());
+        assert!(admission.admit().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn maintenance_pending_request_expires_without_ever_closing_admission() {
+        let admission = TurnAdmission::default();
+        let (_, running) = watch::channel(1);
+        let mut shutdown = ShutdownState::default();
+        shutdown.on_signal(ShutdownSignal::GracefulOnly, 1, 1, &admission);
+        assert!(!shutdown.draining);
         shutdown.maintenance_deadline = Some(tokio::time::Instant::now());
         assert!(matches!(
             shutdown.update(&running, 0, 1, &admission),
