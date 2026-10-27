@@ -574,6 +574,11 @@ async fn resolved_resume_journey(history_mode: &str) -> Result<()> {
             .build()
             .await?,
     );
+    // Match the bridge's explicit routing at start and resume. With SQLite,
+    // sparse resumes restore persisted effort into a new config layer and may
+    // conservatively rebuild despite having the same effective effort.
+    let model = config.model.clone().context("mock model is configured")?;
+    let model_provider = config.model_provider_id.clone();
     let auth = AuthManager::shared_from_config(config.as_ref(), false).await?;
     let state_db = codex_rollout::state_db::try_init(config.as_ref()).await?;
     let barrier = Arc::new(ResumeConfigBarrier::default());
@@ -594,7 +599,8 @@ async fn resolved_resume_journey(history_mode: &str) -> Result<()> {
         let _: InitializeResponse = read_response_from(&mut outgoing, first_id, 1).await;
         processor.connection_initialized(first_id, first.request_attestation()).await;
         send_request(&processor, first_id, &first, json!({"id":2,"method":"thread/start","params":{
-            "config":{"web_search":"disabled"},"historyMode":history_mode
+            "model":model,"modelProvider":model_provider,
+            "config":{"web_search":"disabled","model_reasoning_effort":"medium"},"historyMode":history_mode
         }})).await;
         let started: ThreadStartResponse = read_response_from(&mut outgoing, first_id, 2).await;
         assert_eq!(serde_json::to_value(&started.thread.history_mode)?, json!(history_mode));
@@ -626,7 +632,8 @@ async fn resolved_resume_journey(history_mode: &str) -> Result<()> {
         let _: InitializeResponse = read_response_from(&mut outgoing, second_id, 4).await;
         processor.connection_initialized(second_id, second.request_attestation()).await;
         send_request(&processor, second_id, &second, json!({"id":5,"method":"thread/resume","params":{
-            "threadId":started.thread.id,"excludeTurns":true,"config":{"web_search":"disabled"}
+            "threadId":started.thread.id,"excludeTurns":true,"model":model,"modelProvider":model_provider,
+            "config":{"web_search":"disabled","model_reasoning_effort":"medium"}
         }})).await;
         let _: codex_app_server_protocol::ThreadResumeResponse = read_response_from(&mut outgoing, second_id, 5).await;
         let reused = processor.thread_processor.thread_manager.get_thread(id).await?;
@@ -640,7 +647,8 @@ async fn resolved_resume_journey(history_mode: &str) -> Result<()> {
         let _: InitializeResponse = read_response_from(&mut outgoing, third_id, 6).await;
         processor.connection_initialized(third_id, third.request_attestation()).await;
         send_request(&processor, third_id, &third, json!({"id":7,"method":"thread/resume","params":{
-            "threadId":started.thread.id,"excludeTurns":false,"config":{"web_search":"live"}
+            "threadId":started.thread.id,"excludeTurns":false,"model":model,"modelProvider":model_provider,
+            "config":{"web_search":"live","model_reasoning_effort":"medium"}
         }})).await;
         let resumed: codex_app_server_protocol::ThreadResumeResponse = read_response_from(&mut outgoing, third_id, 7).await;
         assert_eq!(serde_json::to_value(&resumed.thread.history_mode)?, json!(history_mode));
@@ -657,7 +665,8 @@ async fn resolved_resume_journey(history_mode: &str) -> Result<()> {
         processor.connection_initialized(fourth_id, fourth.request_attestation()).await;
         barrier.armed.store(true, std::sync::atomic::Ordering::SeqCst);
         send_request(&processor, fourth_id, &fourth, json!({"id":9,"method":"thread/resume","params":{
-            "threadId":started.thread.id,"excludeTurns":true,"config":{"web_search":"disabled"}
+            "threadId":started.thread.id,"excludeTurns":true,"model":model,"modelProvider":model_provider,
+            "config":{"web_search":"disabled","model_reasoning_effort":"medium"}
         }})).await;
         timeout(Duration::from_secs(10), barrier.entered.notified())
             .await.context("resume did not reach the deferred configuration loader")?;
