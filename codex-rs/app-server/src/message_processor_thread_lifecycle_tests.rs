@@ -587,6 +587,7 @@ async fn resolved_resume_journey() -> Result<()> {
             "clientInfo":{"name":"resolved-resume","version":"1"},"capabilities":{"experimentalApi":true}
         }})).await;
         let _: InitializeResponse = read_response_from(&mut outgoing, first_id, 1).await;
+        processor.connection_initialized(first_id, first.request_attestation()).await;
         send_request(&processor, first_id, &first, json!({"id":2,"method":"thread/start","params":{
             "config":{"web_search":"disabled"}
         }})).await;
@@ -607,7 +608,7 @@ async fn resolved_resume_journey() -> Result<()> {
                     _ => {}
                 }
             }
-        }).await??;
+        }).await.context("initial materialized turn did not complete")??;
         let original = processor.thread_processor.thread_manager.get_thread(id).await?;
         assert!(matches!(original.agent_status().await, AgentStatus::Completed(_)));
         processor.connection_closed(first_id, &first).await;
@@ -617,6 +618,7 @@ async fn resolved_resume_journey() -> Result<()> {
             "clientInfo":{"name":"resolved-resume","version":"1"},"capabilities":{"experimentalApi":true}
         }})).await;
         let _: InitializeResponse = read_response_from(&mut outgoing, second_id, 4).await;
+        processor.connection_initialized(second_id, second.request_attestation()).await;
         send_request(&processor, second_id, &second, json!({"id":5,"method":"thread/resume","params":{
             "threadId":started.thread.id,"excludeTurns":true,"config":{"web_search":"disabled"}
         }})).await;
@@ -630,6 +632,7 @@ async fn resolved_resume_journey() -> Result<()> {
             "clientInfo":{"name":"resolved-resume","version":"1"},"capabilities":{"experimentalApi":true}
         }})).await;
         let _: InitializeResponse = read_response_from(&mut outgoing, third_id, 6).await;
+        processor.connection_initialized(third_id, third.request_attestation()).await;
         send_request(&processor, third_id, &third, json!({"id":7,"method":"thread/resume","params":{
             "threadId":started.thread.id,"excludeTurns":false,"config":{"web_search":"live"}
         }})).await;
@@ -644,11 +647,13 @@ async fn resolved_resume_journey() -> Result<()> {
             "clientInfo":{"name":"resolved-resume","version":"1"},"capabilities":{"experimentalApi":true}
         }})).await;
         let _: InitializeResponse = read_response_from(&mut outgoing, fourth_id, 8).await;
+        processor.connection_initialized(fourth_id, fourth.request_attestation()).await;
         barrier.armed.store(true, std::sync::atomic::Ordering::SeqCst);
         send_request(&processor, fourth_id, &fourth, json!({"id":9,"method":"thread/resume","params":{
             "threadId":started.thread.id,"excludeTurns":true,"config":{"web_search":"disabled"}
         }})).await;
-        timeout(Duration::from_secs(10), barrier.entered.notified()).await?;
+        timeout(Duration::from_secs(10), barrier.entered.notified())
+            .await.context("resume did not reach the deferred configuration loader")?;
         // A separate plain subscriber must attach while config loading waits.
         // This also proves that host work does not retain the shared permit.
         let fifth_id = ConnectionId(45);
@@ -657,6 +662,7 @@ async fn resolved_resume_journey() -> Result<()> {
             "clientInfo":{"name":"arriving-subscriber","version":"1"},"capabilities":{"experimentalApi":true}
         }})).await;
         let _: InitializeResponse = read_response_from(&mut outgoing, fifth_id, 10).await;
+        processor.connection_initialized(fifth_id, fifth.request_attestation()).await;
         send_request(&processor, fifth_id, &fifth, json!({"id":11,"method":"thread/resume","params":{
             "threadId":started.thread.id,"excludeTurns":true
         }})).await;

@@ -481,8 +481,14 @@ pub(super) async fn read_response_from<T: serde::de::DeserializeOwned>(
         if connection_id != expected_connection_id {
             continue;
         }
-        let crate::outgoing_message::OutgoingMessage::Response(response) = message else {
-            continue;
+        let response = match message {
+            crate::outgoing_message::OutgoingMessage::Response(response) => response,
+            crate::outgoing_message::OutgoingMessage::Error(error)
+                if error.id == RequestId::Integer(request_id) =>
+            {
+                panic!("request {request_id} on {expected_connection_id:?} failed: {error:?}");
+            }
+            _ => continue,
         };
         if response.id != RequestId::Integer(request_id) {
             continue;
