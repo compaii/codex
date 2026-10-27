@@ -71,7 +71,9 @@ jobs:
           cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all connection_handling_websocket_unix -- --nocapture
           cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all daemon_update_recovery -- --nocapture
       - name: Build the CLI required by Core remote-session fixtures
-        run: cargo build --locked --profile dev-small -j 2 -p codex-cli --bin codex
+        run: |
+          cargo build --locked --profile dev-small -j 2 -p codex-cli --bin codex
+          target/dev-small/codex app-server daemon maintenance --help
       - name: Core input and automatic-start admission contracts
         run: |
           cargo test --locked --profile dev-small -j 2 -p codex-core --lib session::input_queue -- --nocapture
