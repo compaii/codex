@@ -1,5 +1,11 @@
 name: Nonblocking native maintenance
 on:
+  workflow_call:
+    inputs:
+      source_ref:
+        description: Exact native source revision to qualify
+        required: true
+        type: string
   push:
     branches: [fix/nonblocking-maintenance]
 permissions:
@@ -19,6 +25,8 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           persist-credentials: false
+          repository: compaii/codex
+          ref: ${{ inputs.source_ref || github.sha }}
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
         with:
           components: rustfmt
@@ -59,6 +67,16 @@ jobs:
           target/dev-small/codex --version
           sha256sum target/dev-small/codex target/dev-small/codex-code-mode-host
           git rev-parse HEAD > target/dev-small/interaction-source.txt
+      - name: Retain native compilation cache
+        if: always() && steps.native-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@668228422ae6a00e4ad889ee87cd7109ec5666a7
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            codex-rs/target
+          key: ${{ steps.native-cache.outputs.cache-primary-key }}
       - name: Retain qualified native package
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
