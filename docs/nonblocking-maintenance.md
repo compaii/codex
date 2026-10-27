@@ -32,8 +32,10 @@ guarantee progress if the operating system itself blocks that syscall.
 
 ## Receiving operation
 
-Do not send SIGHUP to an older server to install this correction. Refuse that
-operation before acquiring the shared daemon lock. Do not hold that lock while
+Do not use the older SIGHUP path to close admission while unrelated work is live.
+Human correction2026-10-27 removes the blanket signal prohibition: a controlled
+scoped legacy replacement at verified idle is permitted. Do not hold the shared
+daemon operation lock while
 waiting for unrelated turns; it can itself block ordinary CLI attachment.
 Retired adoption helpers are historical evidence, not executable recovery routes.
 
@@ -71,8 +73,19 @@ adoption; pre-handoff deferral retains the ordinary update interval. Explicit St
 and the journal; changed/consumed recovery cancels automatic replacement.
 Explicit manual update, Stop and Restart retain their separate semantics.
 
-For the initial older receiver, retain a deployment gap until a supported safe
-handoff actually exists. Do not substitute a global pause or destructive shutdown.
+For the initial older receiver, wait with admission open and inspect actual loaded
+thread activity. When every loaded thread is idle, recheck the exact receiver
+identity and perform one controlled SIGTERM, without force or repeated signals.
+If busy or unknown, defer; do not substitute paused goals or global Stop. Require
+confirmed exit and a fresh complete recovery snapshot without interrupted turns
+before package selection. Retain the previous package and snapshot.
+
+Use the existing complete-package install confirmation, not a new approval gate:
+the installer describes whether a running daemon would restart. Cancel if it
+would restart another receiver; confirm only a stopped replacement. Its existing
+operation-lock recheck rejects a changed running state. Then use supported
+`restart` so recovery is preserved; fresh `start` clears it. This is a finite
+initial compatibility bridge, not the routine path for the repaired receiver.
 Native metadata readiness and actual CLI/Telegram/Interaction admission are
 separate receiving observations. Keep qualification, publication, installation and
 human acceptance distinct.
