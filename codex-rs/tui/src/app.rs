@@ -259,6 +259,7 @@ mod resize_reflow;
 mod resume_config;
 mod right_click_paste;
 pub(crate) use right_click_paste::PasteEnvironment;
+pub(crate) mod foreground_notices;
 mod safety_buffering;
 mod server_version_notice;
 mod session_lifecycle;
@@ -532,6 +533,7 @@ struct InitialHistoryReplayBuffer {
 
 pub(crate) struct App {
     feature_write_lock: Arc<tokio::sync::Mutex<()>>,
+    foreground_notices: foreground_notices::ForegroundNotices,
     config_notification_test_generation: u64,
     config_notification_test_pending: Option<u64>,
     model_catalog: Arc<ModelCatalog>,
@@ -1153,6 +1155,7 @@ impl App {
                         owner.refresh_realtime_microphone_level();
                     }
                     self.chat_widget.pre_draw_tick();
+                    self.refresh_foreground_notices(tui.frame_requester());
                     self.refresh_agents_overview_usage(app_server, tui.frame_requester());
                     let rendered_area = self.render_chat_widget_frame(tui, screen_size)?;
                     if tui.is_owned_screen()

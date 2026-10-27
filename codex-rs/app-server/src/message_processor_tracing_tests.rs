@@ -242,6 +242,24 @@ pub(super) async fn build_test_processor(
     Arc<MessageProcessor>,
     mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
 ) {
+    build_test_processor_with_thread_config_loader(
+        config,
+        auth_manager,
+        Arc::new(codex_config::NoopThreadConfigLoader),
+        None,
+    )
+    .await
+}
+
+pub(super) async fn build_test_processor_with_thread_config_loader(
+    config: Arc<Config>,
+    auth_manager: Arc<AuthManager>,
+    loader: Arc<dyn codex_config::ThreadConfigLoader>,
+    state_db: Option<codex_rollout::state_db::StateDbHandle>,
+) -> (
+    Arc<MessageProcessor>,
+    mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
+) {
     let (outgoing_tx, outgoing_rx) = mpsc::channel(16);
     let config_manager = ConfigManager::new(
         config.codex_home.to_path_buf(),
@@ -252,7 +270,7 @@ pub(super) async fn build_test_processor(
         /*strict_config*/ false,
         CloudConfigBundleLoader::default(),
         Arg0DispatchPaths::default(),
-        Arc::new(codex_config::NoopThreadConfigLoader),
+        loader,
     );
     let analytics_events_client =
         analytics_events_client_from_config(Arc::clone(&auth_manager), config.as_ref());
@@ -269,7 +287,7 @@ pub(super) async fn build_test_processor(
         environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
         feedback: CodexFeedback::new(),
         log_db: None,
-        state_db: None,
+        state_db,
         config_warnings: Vec::new(),
         session_source: SessionSource::VSCode,
         user_verification: Arc::new(crate::user_verification::Service::new(Arc::clone(
@@ -285,7 +303,18 @@ pub(super) async fn build_test_processor(
     (processor, outgoing_rx)
 }
 
-fn run_current_thread_test_with_stack<F>(name: &str, future: F) -> Result<()>
+pub(super) fn run_current_thread_test_with_stack<F>(name: &str, future: F) -> Result<()>
+where
+    F: Future<Output = Result<()>> + Send + 'static,
+{
+    run_current_thread_test_with_stack_and_dispatch(name, future, None)
+}
+
+pub(super) fn run_current_thread_test_with_stack_and_dispatch<F>(
+    name: &str,
+    future: F,
+    dispatch: Option<tracing::Dispatch>,
+) -> Result<()>
 where
     F: Future<Output = Result<()>> + Send + 'static,
 {
@@ -298,7 +327,14 @@ where
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            runtime.block_on(Box::pin(future))
+            match dispatch {
+                // Scope the dispatcher to this dedicated thread, including tasks
+                // spawned on its current-thread runtime. Never replace globals.
+                Some(dispatch) => tracing::dispatcher::with_default(&dispatch, || {
+                    runtime.block_on(Box::pin(future))
+                }),
+                None => runtime.block_on(Box::pin(future)),
+            }
         })?;
 
     match handle.join() {
@@ -452,7 +488,9 @@ pub(super) async fn read_response_from<T: serde::de::DeserializeOwned>(
     loop {
         let envelope = tokio::time::timeout(Duration::from_secs(/*secs*/ 30), outgoing_rx.recv())
             .await
-            .expect("timed out waiting for response")
+            .unwrap_or_else(|error| {
+                panic!("request {request_id} on {expected_connection_id:?} timed out: {error}")
+            })
             .expect("outgoing channel closed");
         let crate::outgoing_message::OutgoingEnvelope::ToConnection {
             connection_id,
@@ -465,8 +503,14 @@ pub(super) async fn read_response_from<T: serde::de::DeserializeOwned>(
         if connection_id != expected_connection_id {
             continue;
         }
-        let crate::outgoing_message::OutgoingMessage::Response(response) = message else {
-            continue;
+        let response = match message {
+            crate::outgoing_message::OutgoingMessage::Response(response) => response,
+            crate::outgoing_message::OutgoingMessage::Error(error)
+                if error.id == RequestId::Integer(request_id) =>
+            {
+                panic!("request {request_id} on {expected_connection_id:?} failed: {error:?}");
+            }
+            _ => continue,
         };
         if response.id != RequestId::Integer(request_id) {
             continue;

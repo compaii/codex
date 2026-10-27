@@ -78,6 +78,7 @@ impl App {
                     | AppEvent::TranscriptCopyClosed
                     | AppEvent::ConfirmDaemonUpdate(_)
                     | AppEvent::RunDaemonUpdate(_)
+                    | AppEvent::ForegroundNoticesLoaded { .. }
                     | AppEvent::InsertHistoryCell(_)
                     | AppEvent::CommitRealtimeTranscriptHistory
                     | AppEvent::ResetTranscriptForThreadSwitch
@@ -1330,6 +1331,9 @@ impl App {
                     self.account_email_request_id = None;
                     self.chat_widget.on_account_email_loaded(email);
                 }
+            }
+            AppEvent::ForegroundNoticesLoaded { thread, request, result } => {
+                self.foreground_notices_loaded(thread, request, result, tui.frame_requester());
             }
             AppEvent::SecuritySetupLoaded { request_id, identity, notice } => {
                 tracing::debug!(current = request_id == self.chat_widget.security_setup_request_id, "handling security setup notice");

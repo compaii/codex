@@ -720,6 +720,7 @@ impl Session {
         };
 
         let mut config = Arc::new(config);
+        let resume_input_config = Arc::clone(&config);
         let refresh_strategy = if session_source.is_non_root_agent() {
             codex_models_manager::manager::RefreshStrategy::Offline
         } else {
@@ -1005,6 +1006,7 @@ impl Session {
                 Err(error) => map_session_init_error(&error, &config.codex_home),
             }
         })?;
+        let _ = session.initial_resume_input_config.set(resume_input_config);
         if let Some(message) = initial_service_tier_warning {
             session
                 .send_event_raw(Event {
@@ -2213,6 +2215,69 @@ impl Session {
             environments,
             reasoning_effort_pin,
         )
+    }
+
+    pub(crate) async fn can_reuse_resolved_resume_config(&self, candidate: &Config) -> bool {
+        let state = self.state.lock().await;
+        let current = &state.session_configuration;
+        let Some(initial) = self.initial_resume_configuration.get() else {
+            return false;
+        };
+        let Some(input) = self.initial_resume_input_config.get() else {
+            return false;
+        };
+        // Compare full loader inputs, then separately require unchanged runtime
+        // activation. Startup adds model-owned token-budget state to Config;
+        // a freshly resolved input must not be compared to that derived state.
+        // Opaque host data still has no known equivalence.
+        // A basic guardian can skip restrictions only on fresh startup. Cold
+        // resume intentionally re-evaluates those history-dependent restrictions.
+        let reusable = !initial.trusted_guardian_reviewer
+            && !current.trusted_guardian_reviewer
+            && candidate == input.as_ref()
+            && current.original_config_do_not_use == initial.original_config_do_not_use
+            && initial.turn_extension_init.is_empty()
+            && current.turn_extension_init.is_empty()
+            && initial.thread_settings_snapshot(&initial.environments)
+                == current.thread_settings_snapshot(&current.environments)
+            && initial.environments == current.environments
+            && initial.permission_profile() == current.permission_profile()
+            && initial.permission_profile_state.profile_workspace_roots()
+                == current.permission_profile_state.profile_workspace_roots()
+            && state
+                .reasoning_effort_pin
+                .get(current.step_settings.collaboration_mode.model())
+                .is_none_or(|effort| candidate.model_reasoning_effort.as_ref() == Some(&effort))
+            && initial.windows_sandbox_level == current.windows_sandbox_level
+            && initial.windows_sandbox_type == current.windows_sandbox_type
+            && initial.base_instructions == current.base_instructions
+            && initial.developer_instructions == current.developer_instructions;
+        if !reusable {
+            // Values may contain private credentials or paths. Diagnose only
+            // equality categories, never the configurations themselves.
+            tracing::debug!(
+                target: "codex_core::session::resume_equivalence",
+                input_equal = candidate == input.as_ref(),
+                runtime_config_equal = current.original_config_do_not_use == initial.original_config_do_not_use,
+                settings_equal = initial.thread_settings_snapshot(&initial.environments) == current.thread_settings_snapshot(&current.environments),
+                environments_equal = initial.environments == current.environments,
+                permissions_equal = initial.permission_profile() == current.permission_profile(),
+                roots_equal = initial.permission_profile_state.profile_workspace_roots() == current.permission_profile_state.profile_workspace_roots(),
+                opaque_empty = initial.turn_extension_init.is_empty() && current.turn_extension_init.is_empty(),
+                trusted_guardian = initial.trusted_guardian_reviewer || current.trusted_guardian_reviewer,
+                input_layers_equal = candidate.config_layer_stack == input.config_layer_stack,
+                input_permissions_equal = candidate.permissions == input.permissions,
+                input_roots_equal = candidate.workspace_roots == input.workspace_roots && candidate.cwd == input.cwd && candidate.workspace_roots_explicit == input.workspace_roots_explicit,
+                input_model_equal = candidate.model == input.model && candidate.model_reasoning_effort == input.model_reasoning_effort,
+                input_provider_equal = candidate.model_provider == input.model_provider && candidate.model_provider_id == input.model_provider_id && candidate.model_providers == input.model_providers,
+                input_features_equal = candidate.features == input.features,
+                input_budget_equal = candidate.token_budget == input.token_budget && candidate.token_budget_startup_config == input.token_budget_startup_config,
+                input_auth_route_equal = candidate.application_auth_route_config == input.application_auth_route_config,
+                input_network_policy_equal = candidate.application_network_policy == input.application_network_policy,
+                "idle resume requires cold reconstruction"
+            );
+        }
+        reusable
     }
 
     pub(crate) async fn get_config(&self) -> std::sync::Arc<Config> {
