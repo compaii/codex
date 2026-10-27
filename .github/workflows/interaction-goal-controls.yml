@@ -1,5 +1,6 @@
 name: Interaction native goal controls
 on:
+  workflow_dispatch:
   pull_request:
     branches: [release/interaction-0.163]
 permissions:
