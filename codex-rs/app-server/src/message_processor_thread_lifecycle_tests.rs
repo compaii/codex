@@ -527,3 +527,143 @@ async fn send_request(
         )
         .await;
 }
+
+#[derive(Default)]
+struct ResumeConfigBarrier {
+    armed: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl codex_config::ThreadConfigLoader for ResumeConfigBarrier {
+    fn load(
+        &self,
+        _: codex_config::ThreadConfigContext,
+    ) -> codex_config::ThreadConfigLoaderFuture<'_, Vec<codex_config::ThreadConfigSource>> {
+        Box::pin(async move {
+            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(Vec::new())
+        })
+    }
+}
+
+// Actual processor/Core/rollout journey with a loopback model. No paid provider.
+#[tokio::test]
+async fn resolved_resume_reuses_identical_idle_runtime_and_rebuilds_changes() -> Result<()> {
+    let server = app_test_support::create_mock_responses_server_repeating_assistant("Done").await;
+    let home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri())
+        .with_root_config("thread_unload_delay_secs = 3600\nweb_search = \"disabled\"\nmodel_reasoning_effort = \"medium\"")
+        .write(home.path())?;
+    let config = Arc::new(
+        ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await?,
+    );
+    let auth = AuthManager::shared_from_config(config.as_ref(), false).await?;
+    let barrier = Arc::new(ResumeConfigBarrier::default());
+    let (processor, mut outgoing) =
+        super::message_processor_tracing_tests::build_test_processor_with_thread_config_loader(
+            config,
+            auth,
+            barrier.clone(),
+        )
+        .await;
+    let first_id = ConnectionId(41);
+    let first = Arc::new(ConnectionSessionState::new(ConnectionOrigin::WebSocket));
+    let result: Result<()> = async {
+        send_request(&processor, first_id, &first, json!({"id":1,"method":"initialize","params":{
+            "clientInfo":{"name":"resolved-resume","version":"1"},"capabilities":{"experimentalApi":true}
+        }})).await;
+        let _: InitializeResponse = read_response_from(&mut outgoing, first_id, 1).await;
+        send_request(&processor, first_id, &first, json!({"id":2,"method":"thread/start","params":{
+            "config":{"web_search":"disabled"}
+        }})).await;
+        let started: ThreadStartResponse = read_response_from(&mut outgoing, first_id, 2).await;
+        let id = codex_protocol::ThreadId::from_string(&started.thread.id)?;
+        send_request(&processor, first_id, &first, json!({"id":3,"method":"turn/start","params":{
+            "threadId":started.thread.id,"input":[{"type":"text","text":"materialize once","text_elements":[]}]
+        }})).await;
+        let _: TurnStartResponse = read_response_from(&mut outgoing, first_id, 3).await;
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let envelope = outgoing.recv().await.context("outgoing closed")?;
+                match envelope {
+                    OutgoingEnvelope::ToConnection { message: OutgoingMessage::AppServerNotification(notification), .. }
+                    | OutgoingEnvelope::Broadcast { message: OutgoingMessage::AppServerNotification(notification) } => {
+                        if matches!(notification.notification, ServerNotification::TurnCompleted(_)) { return anyhow::Ok(()); }
+                    }
+                    _ => {}
+                }
+            }
+        }).await??;
+        let original = processor.thread_processor.thread_manager.get_thread(id).await?;
+        assert!(matches!(original.agent_status().await, AgentStatus::Completed(_)));
+        processor.connection_closed(first_id, &first).await;
+        let second_id = ConnectionId(42);
+        let second = Arc::new(ConnectionSessionState::new(ConnectionOrigin::WebSocket));
+        send_request(&processor, second_id, &second, json!({"id":4,"method":"initialize","params":{
+            "clientInfo":{"name":"resolved-resume","version":"1"},"capabilities":{"experimentalApi":true}
+        }})).await;
+        let _: InitializeResponse = read_response_from(&mut outgoing, second_id, 4).await;
+        send_request(&processor, second_id, &second, json!({"id":5,"method":"thread/resume","params":{
+            "threadId":started.thread.id,"excludeTurns":true,"config":{"web_search":"disabled"}
+        }})).await;
+        let _: codex_app_server_protocol::ThreadResumeResponse = read_response_from(&mut outgoing, second_id, 5).await;
+        let reused = processor.thread_processor.thread_manager.get_thread(id).await?;
+        assert!(Arc::ptr_eq(&original, &reused), "identical resolved config should retain the loaded runtime");
+        processor.connection_closed(second_id, &second).await;
+        let third_id = ConnectionId(43);
+        let third = Arc::new(ConnectionSessionState::new(ConnectionOrigin::WebSocket));
+        send_request(&processor, third_id, &third, json!({"id":6,"method":"initialize","params":{
+            "clientInfo":{"name":"resolved-resume","version":"1"},"capabilities":{"experimentalApi":true}
+        }})).await;
+        let _: InitializeResponse = read_response_from(&mut outgoing, third_id, 6).await;
+        send_request(&processor, third_id, &third, json!({"id":7,"method":"thread/resume","params":{
+            "threadId":started.thread.id,"excludeTurns":false,"config":{"web_search":"live"}
+        }})).await;
+        let resumed: codex_app_server_protocol::ThreadResumeResponse = read_response_from(&mut outgoing, third_id, 7).await;
+        let changed = processor.thread_processor.thread_manager.get_thread(id).await?;
+        assert!(!Arc::ptr_eq(&original, &changed));
+        assert_eq!(resumed.thread.turns.len(), 1, "rebuild retains the original materialized turn");
+        processor.connection_closed(third_id, &third).await;
+        let fourth_id = ConnectionId(44);
+        let fourth = Arc::new(ConnectionSessionState::new(ConnectionOrigin::WebSocket));
+        send_request(&processor, fourth_id, &fourth, json!({"id":8,"method":"initialize","params":{
+            "clientInfo":{"name":"resolved-resume","version":"1"},"capabilities":{"experimentalApi":true}
+        }})).await;
+        let _: InitializeResponse = read_response_from(&mut outgoing, fourth_id, 8).await;
+        barrier.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        send_request(&processor, fourth_id, &fourth, json!({"id":9,"method":"thread/resume","params":{
+            "threadId":started.thread.id,"excludeTurns":true,"config":{"web_search":"disabled"}
+        }})).await;
+        timeout(Duration::from_secs(10), barrier.entered.notified()).await?;
+        // A separate plain subscriber must attach while config loading waits.
+        // This also proves that host work does not retain the shared permit.
+        let fifth_id = ConnectionId(45);
+        let fifth = Arc::new(ConnectionSessionState::new(ConnectionOrigin::WebSocket));
+        send_request(&processor, fifth_id, &fifth, json!({"id":10,"method":"initialize","params":{
+            "clientInfo":{"name":"arriving-subscriber","version":"1"},"capabilities":{"experimentalApi":true}
+        }})).await;
+        let _: InitializeResponse = read_response_from(&mut outgoing, fifth_id, 10).await;
+        send_request(&processor, fifth_id, &fifth, json!({"id":11,"method":"thread/resume","params":{
+            "threadId":started.thread.id,"excludeTurns":true
+        }})).await;
+        let _: codex_app_server_protocol::ThreadResumeResponse = read_response_from(&mut outgoing, fifth_id, 11).await;
+        barrier.release.notify_one();
+        let _: codex_app_server_protocol::ThreadResumeResponse = read_response_from(&mut outgoing, fourth_id, 9).await;
+        let still_loaded = processor.thread_processor.thread_manager.get_thread(id).await?;
+        assert!(Arc::ptr_eq(&changed, &still_loaded), "an arriving subscriber retains ordinary rejoin semantics");
+        let requests = server.received_requests().await.context("mock requests unavailable")?;
+        assert_eq!(requests.iter().filter(|r|r.url.path().ends_with("/responses")).count(), 1);
+        Ok(())
+    }.await;
+    drop(outgoing);
+    processor.clear_runtime_references();
+    processor.shutdown_threads().await;
+    result
+}

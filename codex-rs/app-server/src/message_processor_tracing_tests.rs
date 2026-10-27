@@ -242,6 +242,22 @@ pub(super) async fn build_test_processor(
     Arc<MessageProcessor>,
     mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
 ) {
+    build_test_processor_with_thread_config_loader(
+        config,
+        auth_manager,
+        Arc::new(codex_config::NoopThreadConfigLoader),
+    )
+    .await
+}
+
+pub(super) async fn build_test_processor_with_thread_config_loader(
+    config: Arc<Config>,
+    auth_manager: Arc<AuthManager>,
+    loader: Arc<dyn codex_config::ThreadConfigLoader>,
+) -> (
+    Arc<MessageProcessor>,
+    mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
+) {
     let (outgoing_tx, outgoing_rx) = mpsc::channel(16);
     let config_manager = ConfigManager::new(
         config.codex_home.to_path_buf(),
@@ -252,7 +268,7 @@ pub(super) async fn build_test_processor(
         /*strict_config*/ false,
         CloudConfigBundleLoader::default(),
         Arg0DispatchPaths::default(),
-        Arc::new(codex_config::NoopThreadConfigLoader),
+        loader,
     );
     let analytics_events_client =
         analytics_events_client_from_config(Arc::clone(&auth_manager), config.as_ref());

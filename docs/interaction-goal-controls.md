@@ -57,3 +57,25 @@ definition ABA, replaced/absent goals, restart, concurrent conditional writers,
 failed instruction recording and budget preservation. API checks cover loaded
 and unloaded native contexts and rejected stale intent. Publication of this
 source does not claim those API checks or receiving adoption passed.
+
+## Idle resume and unchanged configuration
+
+Interaction repeatedly resumes its native thread with explicit routing settings.
+An idle unsubscribed thread now resolves those overrides through the normal full
+configuration loader before deciding to replace its runtime. That loading stays
+outside the shared thread-list permit and retains the existing stored-state
+recheck. A loaded runtime is reusable only when the complete resolved configuration
+matches both its startup and current configuration, and its startup-owned runtime
+settings remain unchanged. Opaque host initialization data prevents this shortcut.
+
+This is an in-memory optimization, not a new input, permission or persistence
+format. Changed settings, unknown equivalence or changed runtime state retain
+shutdown and a fresh history read. Already subscribed/running threads retain
+existing rejoin behavior. No model/provider/effort is selected by the shortcut.
+Do not skip actual selected-profile verification in the receiving client.
+
+Qualification must exercise the processor/Core/rollout path, including identical
+reuse, changed-config rebuild and an arriving subscriber/turn during loading.
+Digital timing does not establish first audible sound or human hearing. A source
+change is not adopted by an already-running native daemon; use the maintained
+writer-preserving native package route and record receiving adoption separately.

@@ -79,6 +79,14 @@ jobs:
           cat "$RUNNER_TEMP/goal-tests.txt"
           test "$(grep -c 'conditional_goal_controls_reject_stale_selection_without_recording.*: test' "$RUNNER_TEMP/goal-tests.txt")" = 2
           cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all guardian_v2::goals -- --nocapture
+      - name: Resolved idle resume reuse and configuration boundaries
+        run: |
+          cargo test --locked --profile dev-small -j 2 -p codex-core --lib resolved_resume -- --list > "$RUNNER_TEMP/resume-core-tests.txt"
+          grep -q 'resolved_resume_requires_full_config_and_unchanged_runtime: test' "$RUNNER_TEMP/resume-core-tests.txt"
+          cargo test --locked --profile dev-small -j 2 -p codex-core --lib resolved_resume -- --nocapture
+          cargo test --locked --profile dev-small -j 2 -p codex-app-server --lib resolved_resume -- --list > "$RUNNER_TEMP/resume-processor-tests.txt"
+          grep -q 'resolved_resume_reuses_identical_idle_runtime_and_rebuilds_changes: test' "$RUNNER_TEMP/resume-processor-tests.txt"
+          cargo test --locked --profile dev-small -j 2 -p codex-app-server --lib resolved_resume -- --nocapture
       - name: Build the native CLI and its required tool host
         id: native-build
         run: |

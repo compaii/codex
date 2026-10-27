@@ -2215,6 +2215,34 @@ impl Session {
         )
     }
 
+    pub(crate) async fn can_reuse_resolved_resume_config(&self, candidate: &Config) -> bool {
+        let state = self.state.lock().await;
+        let current = &state.session_configuration;
+        let Some(initial) = self.initial_resume_configuration.get() else {
+            return false;
+        };
+        // Never infer equality for opaque host data. Config equality includes
+        // resolved provider definitions/catalog contents and all loaded layers.
+        candidate == current.original_config_do_not_use.as_ref()
+            && candidate == initial.original_config_do_not_use.as_ref()
+            && initial.turn_extension_init.is_empty()
+            && current.turn_extension_init.is_empty()
+            && initial.thread_settings_snapshot(&initial.environments)
+                == current.thread_settings_snapshot(&current.environments)
+            && initial.environments == current.environments
+            && initial.permission_profile() == current.permission_profile()
+            && initial.permission_profile_state.profile_workspace_roots()
+                == current.permission_profile_state.profile_workspace_roots()
+            && state
+                .reasoning_effort_pin
+                .get(current.step_settings.collaboration_mode.model())
+                .is_none_or(|effort| candidate.model_reasoning_effort.as_ref() == Some(&effort))
+            && initial.windows_sandbox_level == current.windows_sandbox_level
+            && initial.windows_sandbox_type == current.windows_sandbox_type
+            && initial.base_instructions == current.base_instructions
+            && initial.developer_instructions == current.developer_instructions
+    }
+
     pub(crate) async fn get_config(&self) -> std::sync::Arc<Config> {
         let state = self.state.lock().await;
         state
