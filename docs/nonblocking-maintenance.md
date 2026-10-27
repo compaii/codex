@@ -34,10 +34,14 @@ operation before acquiring the shared daemon lock. Do not hold that lock while
 waiting for unrelated turns; it can itself block ordinary CLI attachment.
 Retired adoption helpers are historical evidence, not executable recovery routes.
 
-Only a qualified receiving binary may use the corrected maintenance request.
-Its caller must record the exact process/package identity and the single request,
-wait at most130s for that process to exit, and report deferred/abandoned if it
-remains alive. Never force, resend, select a package or start another writer after
+Use `codex app-server daemon maintenance` against a qualified receiver. It uses
+only the private managed control socket, without acquiring daemon.lock. The
+receiver must advertise the versioned nonblocking capability and its process ID
+before the caller sends any lifecycle request. Older receivers are refused
+without sending a signal or a maintenance command. The caller waits at most133s
+and reports the exact receiver's outcome: `deferred`, `alreadyPending`,
+`supersededByExplicitStop`, or `handoffReady`. The last confirms a saved handoff,
+not process exit or installation. A lost/expired response is unconfirmed. Never force, resend, select a package or start another writer after
 an uncertain result. The server-side pending expiry prevents a deferred request
 from silently remaining armed indefinitely. Preserve the exact snapshot and all
 uncertain originals. Package selection/restart is a separate operation only after

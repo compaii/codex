@@ -225,6 +225,21 @@ enum RestartDecision {
     Restart,
 }
 
+#[derive(Debug, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceOutput {
+    pub pid: u32,
+    /// handoffReady confirms the snapshot, not process exit or package adoption.
+    pub outcome: String,
+}
+
+/// Request a bounded natural-idle handoff without blocking ordinary attachment.
+pub async fn maintenance() -> Result<MaintenanceOutput> {
+    ensure_supported_platform()?;
+    let daemon = Daemon::from_environment()?;
+    client::request_maintenance(&daemon.socket_path).await
+}
+
 pub async fn run(command: LifecycleCommand) -> Result<LifecycleOutput> {
     ensure_supported_platform()?;
     #[cfg(windows)]

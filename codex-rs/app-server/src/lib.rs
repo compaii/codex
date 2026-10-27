@@ -204,6 +204,8 @@ struct ShutdownState {
     maintenance: bool,
     draining: bool,
     maintenance_deadline: Option<tokio::time::Instant>,
+    maintenance_reply: Option<oneshot::Sender<&'static str>>,
+    maintenance_flushed: Option<oneshot::Receiver<()>>,
     last_logged_running_turn_count: Option<usize>,
 }
 
@@ -216,7 +218,6 @@ enum ShutdownAction {
 #[derive(Clone, Copy)]
 enum ShutdownSignal {
     Forceable,
-    #[cfg(unix)]
     GracefulOnly,
 }
 
@@ -259,6 +260,9 @@ impl ShutdownState {
 
     fn cancel_maintenance(&mut self, turn_admission: &turn_admission::TurnAdmission) {
         turn_admission.cancel_drain();
+        if let Some(reply) = self.maintenance_reply.take() {
+            let _ = reply.send("deferred");
+        }
         *self = Self::default();
         warn!("maintenance handoff abandoned; continuing to serve without interrupting work");
     }
@@ -273,6 +277,10 @@ impl ShutdownState {
         if self.requested {
             if matches!(signal, ShutdownSignal::Forceable) {
                 if self.maintenance {
+                    if let Some(reply) = self.maintenance_reply.take() {
+                        let _ = reply.send("supersededByExplicitStop");
+                    }
+                    self.maintenance_flushed = None;
                     self.maintenance = false;
                     self.maintenance_deadline = None;
                     self.draining = true;
@@ -1145,6 +1153,16 @@ pub async fn run_main_with_transport_options(
                 if ready_to_exit {
                     let finished = snapshot_finished || shutdown_state.forced();
                     if finished {
+                        if let Some(reply) = shutdown_state.maintenance_reply.take() {
+                            let _ = reply.send("handoffReady");
+                            if let Some(flushed) = shutdown_state.maintenance_flushed.take() {
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_secs(2),
+                                    flushed,
+                                )
+                                .await;
+                            }
+                        }
                         if let Some(task) = &recovery_task {
                             task.abort();
                         }
@@ -1166,6 +1184,14 @@ pub async fn run_main_with_transport_options(
 
                 tokio::select! {
                     result = &mut snapshot, if shutdown_state.draining && active_admissions == 0 && !snapshot_finished => {
+                        // A ready writer and timer can become runnable together.
+                        // Deadline expiry still wins before publishing recovery.
+                        if shutdown_state.maintenance && shutdown_state.maintenance_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                            shutdown_state.cancel_maintenance(&processor.turn_admission);
+                            snapshot = make_snapshot(recovery_file.clone(), false);
+                            snapshot_started = false;
+                            continue;
+                        }
                         let result = result.and_then(|()| {
                             if snapshot_is_maintenance {
                                 std::fs::rename(&snapshot_file, &recovery_file)
@@ -1221,6 +1247,15 @@ pub async fn run_main_with_transport_options(
                             continue;
                         }
                         match event {
+                            TransportEvent::DaemonMaintenance { reply, flushed } => {
+                                if shutdown_state.requested() {
+                                    let _ = reply.send("alreadyPending");
+                                } else {
+                                    shutdown_state.on_signal(ShutdownSignal::GracefulOnly, connections.len(), *running_turn_count_rx.borrow(), &processor.turn_admission);
+                                    shutdown_state.maintenance_reply = Some(reply);
+                                    shutdown_state.maintenance_flushed = Some(flushed);
+                                }
+                            }
                             TransportEvent::DaemonShutdown => {
                                 shutdown_state.on_signal(ShutdownSignal::Forceable, connections.len(), *running_turn_count_rx.borrow(), &processor.turn_admission);
                             }

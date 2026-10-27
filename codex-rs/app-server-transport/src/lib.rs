@@ -41,3 +41,6 @@ pub use transport::start_remote_control;
 pub use transport::start_stdio_connection;
 pub use transport::start_websocket_acceptor;
 pub use transport::take_remote_control_disabled_env;
+
+/// Capability advertised only by nonblocking managed-maintenance receivers.
+pub const DAEMON_MAINTENANCE_CAPABILITY_HEADER: &str = "x-codex-nonblocking-maintenance";

@@ -205,3 +205,125 @@ mod tests {
         assert!(parse_version_from_user_agent("codex_app_server_daemon").is_err());
     }
 }
+
+/// Never falls back to signals or holds the daemon operation lock. Older
+/// receivers lack the capability header, so refusal has no lifecycle effect.
+pub(crate) async fn request_maintenance(socket_path: &Path) -> Result<crate::MaintenanceOutput> {
+    request_maintenance_with_timeout(socket_path, Duration::from_secs(133)).await
+}
+
+async fn request_maintenance_with_timeout(
+    socket_path: &Path,
+    limit: Duration,
+) -> Result<crate::MaintenanceOutput> {
+    timeout(limit, async {
+        let stream = UnixStream::connect(socket_path).await?;
+        let (mut websocket, response) = timeout(
+            CONTROL_SOCKET_RESPONSE_TIMEOUT,
+            client_async("ws://localhost/daemon/maintenance", stream),
+        )
+        .await??;
+        let capability = response
+            .headers()
+            .get(codex_app_server_transport::DAEMON_MAINTENANCE_CAPABILITY_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("v1:"))
+            .context("receiver does not support nonblocking maintenance; no request was sent")?;
+        let pid: u32 = capability
+            .parse()
+            .context("invalid maintenance receiver identity")?;
+        websocket
+            .send(Message::Text(pid.to_string().into()))
+            .await?;
+        let reply = websocket
+            .next()
+            .await
+            .context("maintenance outcome unconfirmed; do not retry or force shutdown")??;
+        let Message::Text(reply) = reply else {
+            anyhow::bail!("maintenance outcome unconfirmed; do not retry")
+        };
+        let outcome: crate::MaintenanceOutput = serde_json::from_str(&reply)?;
+        anyhow::ensure!(
+            outcome.pid == pid,
+            "maintenance receiver identity changed; outcome unconfirmed"
+        );
+        anyhow::ensure!(
+            matches!(
+                outcome.outcome.as_str(),
+                "handoffReady" | "deferred" | "alreadyPending" | "supersededByExplicitStop"
+            ),
+            "unknown maintenance outcome"
+        );
+        Ok(outcome)
+    })
+    .await
+    .context("maintenance observation expired; outcome unconfirmed; never force or replay")?
+}
+
+#[cfg(all(test, unix))]
+mod maintenance_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn maintenance_refuses_old_receiver_before_sending_any_request() -> Result<()> {
+        let home = tempfile::TempDir::new()?;
+        let path = home.path().join("server.sock");
+        let listener = tokio::net::UnixListener::bind(&path)?;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            assert!(!matches!(ws.next().await, Some(Ok(Message::Text(_)))));
+        });
+        let error = request_maintenance(&path).await.unwrap_err();
+        assert!(error.to_string().contains("no request was sent"));
+        server.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn maintenance_reports_deferred_and_rejects_mismatched_or_missing_outcomes() -> Result<()>
+    {
+        for mode in ["deferred", "mismatch", "missing"] {
+            let home = tempfile::TempDir::new()?;
+            let path = home.path().join("server.sock");
+            let listener = tokio::net::UnixListener::bind(&path)?;
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_hdr_async(stream,
+                    |_request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                     mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                        response.headers_mut().insert(codex_app_server_transport::DAEMON_MAINTENANCE_CAPABILITY_HEADER, "v1:42".parse().unwrap());
+                        Ok(response)
+                    }).await.unwrap();
+                assert_eq!(
+                    ws.next().await.unwrap().unwrap(),
+                    Message::Text("42".into())
+                );
+                if mode == "missing" {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                } else {
+                    let pid = if mode == "mismatch" { 43 } else { 42 };
+                    ws.send(Message::Text(
+                        serde_json::json!({"pid":pid,"outcome":"deferred"})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                }
+            });
+            let result = request_maintenance_with_timeout(&path, Duration::from_millis(300)).await;
+            match mode {
+                "deferred" => assert_eq!(result?.outcome, "deferred"),
+                "mismatch" => assert!(result.unwrap_err().to_string().contains("identity changed")),
+                _ => assert!(result.unwrap_err().to_string().contains("unconfirmed")),
+            }
+            if mode == "missing" {
+                server.abort();
+            } else {
+                server.await?;
+            }
+        }
+        Ok(())
+    }
+}

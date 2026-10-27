@@ -44,6 +44,31 @@ fn request_maintenance(server: &Child) -> Result<()> {
     Ok(())
 }
 
+async fn begin_maintenance(socket: &Path) -> Result<WebSocketStream<UnixStream>> {
+    let stream = UnixStream::connect(socket).await?;
+    let (mut ws, response) = client_async("ws://localhost/daemon/maintenance", stream).await?;
+    let pid = response.headers()[codex_app_server_transport::DAEMON_MAINTENANCE_CAPABILITY_HEADER]
+        .to_str()?
+        .strip_prefix("v1:")
+        .context("nonblocking maintenance capability")?;
+    ws.send(Message::Text(pid.to_owned().into())).await?;
+    Ok(ws)
+}
+
+async fn maintenance_outcome(ws: &mut WebSocketStream<UnixStream>) -> Result<String> {
+    let frame = timeout(Duration::from_secs(10), ws.next())
+        .await?
+        .context("maintenance reply")??;
+    let Message::Text(frame) = frame else {
+        anyhow::bail!("expected maintenance outcome")
+    };
+    let result: serde_json::Value = serde_json::from_str(&frame)?;
+    Ok(result["outcome"]
+        .as_str()
+        .context("outcome string")?
+        .to_owned())
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn managed_maintenance_keeps_admitting_while_a_turn_runs_then_saves_idle_roots() -> Result<()>
@@ -83,8 +108,8 @@ async fn managed_maintenance_publish_failure_reopens_without_disconnecting() -> 
     let recovery = daemon_recovery_file_path(home.path());
     // Staging succeeds, but publishing over a directory must fail.
     std::fs::create_dir_all(&recovery)?;
-    request_maintenance(&server)?;
-    sleep(Duration::from_millis(500)).await;
+    let mut maintenance = begin_maintenance(&socket).await?;
+    assert_eq!(maintenance_outcome(&mut maintenance).await?, "deferred");
     assert_still_running(&mut server, "failed maintenance must keep serving").await;
     start_thread(&mut client, 3, json!({})).await?;
     assert!(recovery.is_dir());
@@ -115,7 +140,7 @@ async fn managed_maintenance_stalled_persistence_times_out_and_late_writer_canno
             .success(),
         "mkfifo failed"
     );
-    request_maintenance(&server)?;
+    let mut maintenance = begin_maintenance(&socket).await?;
     let blocked = timeout(Duration::from_secs(3), async {
         loop {
             if let Ok(sender) = tokio::net::unix::pipe::OpenOptions::new().open_sender(&compressed)
@@ -128,7 +153,7 @@ async fn managed_maintenance_stalled_persistence_times_out_and_late_writer_canno
     .await
     .context("maintenance did not reach persistence barrier")?;
     // The actual managed path has a five-second finalization deadline.
-    sleep(Duration::from_millis(5500)).await;
+    assert_eq!(maintenance_outcome(&mut maintenance).await?, "deferred");
     start_thread(&mut client, 3, json!({})).await?;
     assert!(!daemon_recovery_file_path(home.path()).exists());
     drop(blocked);
