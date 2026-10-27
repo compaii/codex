@@ -84,11 +84,12 @@ async fn managed_maintenance_keeps_admitting_while_a_turn_runs_then_saves_idle_r
     let first = start_thread(&mut client, 2, json!({})).await?;
     start_turn(&mut client, 3, &first.thread.id).await?;
     wait_for_requests(&mock, 1).await?;
-    request_maintenance(&server)?;
+    let mut maintenance = begin_maintenance(&socket).await?;
     assert_still_running(&mut server, "maintenance waits without closing admission").await;
     request_maintenance(&server)?;
     let second = start_thread(&mut client, 4, json!({})).await?;
     release.send(()).expect("held turn waiting");
+    assert_eq!(maintenance_outcome(&mut maintenance).await?, "handoffReady");
     wait_success(&mut server).await?;
     let snapshot = daemon_recovery::read_snapshot(&daemon_recovery_file_path(home.path()))?;
     assert_eq!(snapshot.loaded, [first.thread.id, second.thread.id].into());

@@ -180,6 +180,7 @@ pub enum TransportEvent {
     DaemonShutdown,
     /// Nonforcing, bounded maintenance on the managed local control socket.
     DaemonMaintenance {
+        expires_at: tokio::time::Instant,
         reply: tokio::sync::oneshot::Sender<&'static str>,
         flushed: tokio::sync::oneshot::Receiver<()>,
     },

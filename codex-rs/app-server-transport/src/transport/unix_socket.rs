@@ -241,19 +241,27 @@ async fn run_daemon_maintenance(
     if !matches!(request, Ok(Some(Ok(Message::Text(request)))) if request == pid) {
         return;
     }
+    // The lease begins at socket receipt, not after a possibly stalled queue.
+    let expires_at = tokio::time::Instant::now() + Duration::from_secs(120);
     let (reply, outcome) = tokio::sync::oneshot::channel();
     let (flushed, flush_complete) = tokio::sync::oneshot::channel();
-    if transport_event_tx
-        .send(TransportEvent::DaemonMaintenance {
-            reply,
-            flushed: flush_complete,
-        })
-        .await
-        .is_err()
-    {
+    if !matches!(
+        tokio::time::timeout_at(
+            expires_at,
+            transport_event_tx.send(TransportEvent::DaemonMaintenance {
+                expires_at,
+                reply,
+                flushed: flush_complete
+            })
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
         return;
     }
-    if let Ok(Ok(outcome)) = tokio::time::timeout(Duration::from_secs(130), outcome).await {
+    if let Ok(Ok(outcome)) =
+        tokio::time::timeout_at(expires_at + Duration::from_secs(7), outcome).await
+    {
         let payload = serde_json::json!({"pid":std::process::id(),"outcome":outcome});
         if websocket
             .send(Message::Text(payload.to_string().into()))

@@ -42,8 +42,9 @@ without sending a signal or a maintenance command. The caller waits at most133s
 and reports the exact receiver's outcome: `deferred`, `alreadyPending`,
 `supersededByExplicitStop`, or `handoffReady`. The last confirms a saved handoff,
 not process exit or installation. A lost/expired response is unconfirmed. Never force, resend, select a package or start another writer after
-an uncertain result. The server-side pending expiry prevents a deferred request
-from silently remaining armed indefinitely. Preserve the exact snapshot and all
+an uncertain result. A fixed lease begins at socket receipt; enqueueing is bounded, and the receiver
+rejects expired or abandoned requests before arming maintenance. Queue delay can
+never create a fresh pending window after the observer expires. Preserve the exact snapshot and all
 uncertain originals. Package selection/restart is a separate operation only after
 confirmed old-process exit, using the supported complete local-package route.
 

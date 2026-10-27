@@ -565,7 +565,7 @@ async fn maintenance_control_requires_managed_receiver_and_returns_bounded_outco
                 .await
                 .unwrap()
                 .unwrap();
-            let TransportEvent::DaemonMaintenance { reply, flushed } = event else {
+            let TransportEvent::DaemonMaintenance { reply, flushed, .. } = event else {
                 panic!("maintenance must never become stop")
             };
             reply.send("deferred").unwrap();

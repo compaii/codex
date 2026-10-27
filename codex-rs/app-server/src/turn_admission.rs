@@ -40,7 +40,7 @@ impl TurnAdmission {
             .closed = true;
     }
 
-    // Core's synchronous lifecycle guard bridges submission to actual task
+    // Core's task-lifetime guard bridges submission to actual task
     // completion, independent of delayed TurnStarted/TurnCompleted consumption.
     // The live host count additionally protects work still finishing in the host.
     pub(crate) fn begin_idle_drain(&self, running: &watch::Receiver<usize>) -> bool {

@@ -267,6 +267,29 @@ impl ShutdownState {
         warn!("maintenance handoff abandoned; continuing to serve without interrupting work");
     }
 
+    fn on_maintenance_request(
+        &mut self,
+        expires_at: tokio::time::Instant,
+        reply: oneshot::Sender<&'static str>,
+        flushed: oneshot::Receiver<()>,
+        _turn_admission: &turn_admission::TurnAdmission,
+    ) {
+        if reply.is_closed() || tokio::time::Instant::now() >= expires_at {
+            let _ = reply.send("deferred");
+        } else if self.requested() {
+            let _ = reply.send("alreadyPending");
+        } else {
+            self.requested = true;
+            self.maintenance = true;
+            self.draining = false;
+            self.last_logged_running_turn_count = None;
+            self.maintenance_deadline = Some(expires_at);
+            info!("received bounded maintenance request; continuing to serve until idle");
+            self.maintenance_reply = Some(reply);
+            self.maintenance_flushed = Some(flushed);
+        }
+    }
+
     fn on_signal(
         &mut self,
         signal: ShutdownSignal,
@@ -1247,14 +1270,8 @@ pub async fn run_main_with_transport_options(
                             continue;
                         }
                         match event {
-                            TransportEvent::DaemonMaintenance { reply, flushed } => {
-                                if shutdown_state.requested() {
-                                    let _ = reply.send("alreadyPending");
-                                } else {
-                                    shutdown_state.on_signal(ShutdownSignal::GracefulOnly, connections.len(), *running_turn_count_rx.borrow(), &processor.turn_admission);
-                                    shutdown_state.maintenance_reply = Some(reply);
-                                    shutdown_state.maintenance_flushed = Some(flushed);
-                                }
+                            TransportEvent::DaemonMaintenance { expires_at, reply, flushed } => {
+                                shutdown_state.on_maintenance_request(expires_at, reply, flushed, &processor.turn_admission);
                             }
                             TransportEvent::DaemonShutdown => {
                                 shutdown_state.on_signal(ShutdownSignal::Forceable, connections.len(), *running_turn_count_rx.borrow(), &processor.turn_admission);
@@ -1788,6 +1805,31 @@ mod tests {
         ));
         assert!(!shutdown.requested());
         assert!(admission.admit().is_ok());
+    }
+
+    #[test]
+    fn maintenance_does_not_rearm_after_queue_expiry_or_lost_observer() {
+        let admission = TurnAdmission::default();
+        for abandoned in [false, true] {
+            let mut shutdown = ShutdownState::default();
+            let (reply, observer) = oneshot::channel();
+            let (_flushed, flush_complete) = oneshot::channel();
+            let expires = if abandoned {
+                drop(observer);
+                tokio::time::Instant::now() + std::time::Duration::from_secs(120)
+            } else {
+                tokio::time::Instant::now()
+            };
+            shutdown.on_maintenance_request(expires, reply, flush_complete, &admission);
+            assert!(!shutdown.requested());
+            assert!(admission.admit().is_ok());
+        }
+        let mut shutdown = ShutdownState::default();
+        let (reply, _observer) = oneshot::channel();
+        let (_flushed, flush_complete) = oneshot::channel();
+        let received_expiry = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        shutdown.on_maintenance_request(received_expiry, reply, flush_complete, &admission);
+        assert_eq!(shutdown.maintenance_deadline, Some(received_expiry));
     }
 
     #[cfg(unix)]
