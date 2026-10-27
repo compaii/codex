@@ -673,6 +673,7 @@ struct TestMaintenance {
     pid: u32,
     outcome: &'static str,
     lock_released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    lock_checked: std::sync::Arc<tokio::sync::Notify>,
     requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -735,6 +736,7 @@ async fn test_control_server_with_maintenance(
                     std::sync::atomic::Ordering::SeqCst,
                 );
                 drop(lock);
+                test.lock_checked.notify_one();
             }
             let Some(Ok(Message::Text(request))) = websocket.next().await else {
                 continue; // An older-receiver refusal sends no lifecycle frame.
@@ -901,6 +903,7 @@ async fn scheduled_maintenance_keeps_work_and_restarts_only_after_observed_exit(
             pid: process.pid(),
             outcome: mode,
             lock_released: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lock_checked: std::sync::Arc::new(tokio::sync::Notify::new()),
             requests: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         let server =
@@ -936,6 +939,11 @@ async fn scheduled_maintenance_keeps_work_and_restarts_only_after_observed_exit(
         assert!(
             matches!(outcome, (super::UpdateLoopControl::Continue, Some(value)) if value == expected)
         );
+        // An unsupported receiver can complete its capability refusal before
+        // the peer's async lock inspection runs. Observe that inspection first.
+        tokio::time::timeout(Duration::from_secs(2), test.lock_checked.notified())
+            .await
+            .expect("maintenance lock observation did not complete");
         assert!(
             test.lock_released.load(std::sync::atomic::Ordering::SeqCst),
             "maintenance held operation lock"
