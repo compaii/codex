@@ -63,6 +63,10 @@ pub(crate) struct Session {
     pub(super) tx_event: Sender<Event>,
     pub(super) agent_status: watch::Sender<AgentStatus>,
     pub(super) state: Mutex<SessionState>,
+    /// Startup state for conservative idle-resume reuse; never persisted.
+    pub(super) initial_resume_configuration: OnceLock<SessionConfiguration>,
+    /// Complete loader input before model-owned startup activation.
+    pub(super) initial_resume_input_config: OnceLock<Arc<Config>>,
     /// Orders accepted settings commits and their persisted events with compaction checkpoints.
     /// Keep this separate from `state` so storage I/O does not block runtime state access.
     pub(super) thread_settings_persistence: Semaphore,
@@ -1826,6 +1830,8 @@ impl Session {
                 tx_event: tx_event.clone(),
                 agent_status,
                 state: Mutex::new(state),
+                initial_resume_configuration: OnceLock::new(),
+                initial_resume_input_config: OnceLock::new(),
                 thread_settings_persistence: Semaphore::new(/*permits*/ 1),
                 code_mode_message_tasks: CodeModeMessageTasks::default(),
                 managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
@@ -1980,6 +1986,12 @@ impl Session {
             {
                 let mut state = sess.state.lock().await;
                 state.queue_pending_session_start_source(session_start_source);
+            }
+            {
+                let state = sess.state.lock().await;
+                let _ = sess
+                    .initial_resume_configuration
+                    .set(state.session_configuration.clone());
             }
             Ok(sess)
         }

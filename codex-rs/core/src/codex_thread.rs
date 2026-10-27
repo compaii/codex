@@ -1017,6 +1017,12 @@ impl CodexThread {
             .collect()
     }
 
+    /// Whether full resolved resume config and startup-owned runtime settings
+    /// are unchanged. Unknown/changed state conservatively requires rebuilding.
+    pub async fn can_reuse_resolved_resume_config(&self, config: &crate::config::Config) -> bool {
+        self.session.can_reuse_resolved_resume_config(config).await
+    }
+
     pub async fn config(&self) -> Arc<crate::config::Config> {
         self.session.get_config().await
     }

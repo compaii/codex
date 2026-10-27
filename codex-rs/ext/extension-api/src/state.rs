@@ -24,6 +24,11 @@ impl ExtensionDataInit {
         Self::default()
     }
 
+    /// Whether this initializer has no opaque host-owned attachments.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Stores `value` as the initial attachment of type `T`.
     pub fn insert<T>(&mut self, value: T) -> Option<Arc<T>>
     where

@@ -57,3 +57,42 @@ definition ABA, replaced/absent goals, restart, concurrent conditional writers,
 failed instruction recording and budget preservation. API checks cover loaded
 and unloaded native contexts and rejected stale intent. Publication of this
 source does not claim those API checks or receiving adoption passed.
+
+## Idle resume and unchanged configuration
+
+Interaction repeatedly resumes its native thread with explicit routing settings.
+An idle unsubscribed thread now resolves those overrides through the normal full
+configuration loader before deciding to replace its runtime. That loading stays
+outside the shared thread-list permit and retains the existing stored-state
+recheck. A loaded runtime is reusable only when the complete resolved configuration
+matches its complete pre-activation startup input, and its post-startup configuration
+and runtime settings remain unchanged. The input and runtime snapshots are separate:
+model-owned token-budget activation derives Config during startup, so comparing a
+fresh loader input directly to that activated Config would always miss reuse.
+Opaque host initialization data prevents this shortcut. Fresh trusted guardian
+sessions also retain cold-resume re-evaluation of history-dependent restrictions. A first
+resume can also turn inferred roots into an explicitly restored saved selection;
+that provenance change still rebuilds. Subsequent resumes of the same saved
+selection can qualify for reuse. The concurrent-attachment fixture uses a supported
+empty-ID/rollout-path alias: requests with the same explicit thread ID are
+deliberately serialized across clients, independently of the released host-work
+locks.
+
+This is an in-memory optimization, not a new input, permission or persistence
+format. Changed settings, unknown equivalence or changed runtime state retain
+shutdown and a fresh history read. Already subscribed/running threads retain
+existing rejoin behavior. No model/provider/effort is selected by the shortcut.
+Do not skip actual selected-profile verification in the receiving client.
+
+Qualification must exercise the processor/Core/rollout path, including identical
+reuse, changed-config rebuild and an arriving subscriber/turn during loading.
+Digital timing does not establish first audible sound or human hearing. A source
+change is not adopted by an already-running native daemon; use the maintained
+writer-preserving native package route and record receiving adoption separately.
+
+The native qualification workflow also accepts `workflow_call` with an explicit
+`source_ref`, so the owning Interaction CI can reuse the same build/tests when
+native-repository Actions cannot be dispatched. Checkout remains fixed to
+`compaii/codex`; callers must pin both the workflow and source to reviewed commit
+SHAs. No deployment or secrets are inherited. Artifacts retain the checked-out
+source ID separately from the caller's workflow revision.
