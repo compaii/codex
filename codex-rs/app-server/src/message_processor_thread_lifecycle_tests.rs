@@ -696,8 +696,11 @@ async fn resolved_resume_journey(history_mode: &str) -> Result<()> {
         }})).await;
         timeout(Duration::from_secs(10), barrier.entered.notified())
             .await.context("resume did not reach the deferred configuration loader")?;
-        // A separate plain subscriber must attach while config loading waits.
-        // This also proves that host work does not retain the shared permit.
+        // Same-ID resume requests are deliberately serialized across clients.
+        // The supported path alias uses a separate request queue and resolves
+        // back to this thread, exercising the actual concurrent attach race.
+        // It must attach while host work has released the shared permit.
+        let alias_path = resumed.thread.path.as_ref().context("saved rollout path")?;
         let fifth_id = ConnectionId(45);
         let fifth = Arc::new(ConnectionSessionState::new(ConnectionOrigin::WebSocket));
         send_request(&processor, fifth_id, &fifth, json!({"id":10,"method":"initialize","params":{
@@ -706,7 +709,7 @@ async fn resolved_resume_journey(history_mode: &str) -> Result<()> {
         let _: InitializeResponse = read_response_from(&mut outgoing, fifth_id, 10).await;
         processor.connection_initialized(fifth_id, fifth.request_attestation()).await;
         send_request(&processor, fifth_id, &fifth, json!({"id":11,"method":"thread/resume","params":{
-            "threadId":started.thread.id,"excludeTurns":true
+            "threadId":"","path":alias_path,"excludeTurns":true
         }})).await;
         let _: codex_app_server_protocol::ThreadResumeResponse = read_response_from(&mut outgoing, fifth_id, 11).await;
         barrier.release.notify_one();

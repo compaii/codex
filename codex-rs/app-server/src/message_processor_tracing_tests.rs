@@ -488,7 +488,9 @@ pub(super) async fn read_response_from<T: serde::de::DeserializeOwned>(
     loop {
         let envelope = tokio::time::timeout(Duration::from_secs(/*secs*/ 30), outgoing_rx.recv())
             .await
-            .expect("timed out waiting for response")
+            .unwrap_or_else(|error| {
+                panic!("request {request_id} on {expected_connection_id:?} timed out: {error}")
+            })
             .expect("outgoing channel closed");
         let crate::outgoing_message::OutgoingEnvelope::ToConnection {
             connection_id,
