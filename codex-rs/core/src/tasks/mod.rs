@@ -290,6 +290,7 @@ impl Session {
         input: Vec<TurnInput>,
         task: T,
     ) {
+        let host_running_guard = self.services.extensions.track_running_turn();
         self.activate_plugin_selection(&turn_context).await;
         // Inherited or recovered roots are applied before task start. Otherwise this
         // task owns its turn, including background work. Later mail cannot change it.
@@ -368,7 +369,9 @@ impl Session {
             codex.turn.token_usage.total_tokens = field::Empty,
         );
         let storage_originator = AuthStorageOriginator::from_client_name(&turn_context.originator);
+        let future_running_guard = Arc::clone(&host_running_guard);
         let task_future = async move {
+            let _host_running_guard = future_running_guard;
             let ctx_for_finish = Arc::clone(&ctx);
             let task_result = task_for_run
                 .run(
@@ -412,6 +415,7 @@ impl Session {
             .start_timer(TURN_E2E_DURATION_METRIC, &[])
             .ok();
         let running_task = RunningTask {
+            _host_running_guard: host_running_guard,
             done,
             handle: AbortOnDropHandle::new(handle),
             kind: task_kind,

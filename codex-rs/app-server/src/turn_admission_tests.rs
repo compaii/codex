@@ -58,3 +58,15 @@ fn idle_maintenance_waits_for_core_lifetime_when_host_events_are_delayed() {
     drop(lifetime);
     assert!(admission.begin_idle_drain(&running));
 }
+
+#[test]
+fn core_lifetime_waits_for_both_task_future_and_abort_owner() {
+    let admission = TurnAdmission::default();
+    let (_, running) = tokio::sync::watch::channel(0);
+    let future = admission.track_running_turn();
+    let abort_owner = std::sync::Arc::clone(&future);
+    drop(future);
+    assert!(!admission.begin_idle_drain(&running));
+    drop(abort_owner);
+    assert!(admission.begin_idle_drain(&running));
+}

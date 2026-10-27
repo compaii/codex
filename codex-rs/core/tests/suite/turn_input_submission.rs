@@ -1698,3 +1698,82 @@ async fn tool_output_retention_is_submission_metadata() -> anyhow::Result<()> {
     server.shutdown().await;
     Ok(())
 }
+
+#[derive(Debug)]
+struct LifetimeAdmission(Arc<std::sync::atomic::AtomicUsize>);
+
+struct LifetimeGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for LifetimeGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl TurnStartAdmission for LifetimeAdmission {
+    fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
+        Some(Box::new(()))
+    }
+    fn track_running_turn(&self) -> Arc<dyn Send + Sync> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Arc::new(LifetimeGuard(Arc::clone(&self.0)))
+    }
+}
+
+struct DelayTerminalLifecycle {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl codex_extension_api::TurnLifecycleContributor for DelayTerminalLifecycle {
+    fn on_turn_stop<'a>(
+        &'a self,
+        _input: codex_extension_api::TurnStopInput<'a>,
+    ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            self.entered.notify_one();
+            self.release.notified().await;
+        })
+    }
+}
+
+#[tokio::test]
+async fn host_running_guard_survives_delayed_terminal_and_unconsumed_host_events()
+-> anyhow::Result<()> {
+    let server = responses::start_mock_server().await;
+    responses::mount_sse_once(&server, responses::sse_completed("done")).await;
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let lifecycle = Arc::new(DelayTerminalLifecycle {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let mut extensions = ExtensionRegistryBuilder::new();
+    extensions.turn_start_admission(Arc::new(LifetimeAdmission(Arc::clone(&active))));
+    extensions.turn_lifecycle_contributor(lifecycle.clone());
+    let test = test_codex()
+        .with_extensions(Arc::new(extensions.build()))
+        .build_with_auto_env(&server)
+        .await?;
+    test.codex
+        .start_turn_if_idle(user_message_request("held terminal"))
+        .await?;
+    // Do not consume any lifecycle events: the host still reports no running turn.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        lifecycle.entered.notified(),
+    )
+    .await?;
+    assert_eq!(active.load(Ordering::SeqCst), 1);
+    lifecycle.release.notify_one();
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while active.load(Ordering::SeqCst) != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    Ok(())
+}

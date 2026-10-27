@@ -9,4 +9,11 @@
 /// gate so delegated work can finish before exit. Automatic starts remain gated.
 pub trait TurnStartAdmission: std::fmt::Debug + Send + Sync {
     fn admit_turn_start(&self) -> Option<Box<dyn Send>>;
+
+    /// Tracks an already-admitted task through terminal persistence and abort
+    /// cleanup, independently of asynchronous host lifecycle event delivery.
+    /// Core retains shared ownership in both the task future and RunningTask.
+    fn track_running_turn(&self) -> std::sync::Arc<dyn Send + Sync> {
+        std::sync::Arc::new(())
+    }
 }

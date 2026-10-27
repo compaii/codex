@@ -202,6 +202,14 @@ impl<C: Sync> ExtensionRegistry<C> {
         }
     }
 
+    /// Tracks already-admitted work until both its future and abort owner finish.
+    pub fn track_running_turn(&self) -> Arc<dyn Send + Sync> {
+        match &self.turn_start_admission {
+            Some(admission) => admission.track_running_turn(),
+            None => Arc::new(()),
+        }
+    }
+
     /// Returns the host event sink retained by this registry.
     pub fn event_sink(&self) -> Arc<dyn ExtensionEventSink> {
         Arc::clone(&self.event_sink)

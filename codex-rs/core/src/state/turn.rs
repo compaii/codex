@@ -74,6 +74,9 @@ pub(crate) enum TaskKind {
 }
 
 pub(crate) struct RunningTask {
+    // Also retained by the task future; completion and abort must both finish
+    // before a host can regard this admitted turn as idle for maintenance.
+    pub(crate) _host_running_guard: Arc<dyn Send + Sync>,
     pub(crate) done: Arc<Notify>,
     pub(crate) kind: TaskKind,
     pub(crate) task: Arc<dyn AnySessionTask>,

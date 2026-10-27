@@ -1,12 +1,7 @@
 //! Tracks client runtime changes and turn starts admitted before a shutdown drain.
 
 use codex_app_server_protocol::JSONRPCErrorError;
-use codex_extension_api::ExtensionFuture;
-use codex_extension_api::TurnAbortInput;
-use codex_extension_api::TurnLifecycleContributor;
 use codex_extension_api::TurnStartAdmission;
-use codex_extension_api::TurnStartInput;
-use codex_extension_api::TurnStopInput;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::watch;
@@ -108,10 +103,14 @@ impl TurnStartAdmission for TurnAdmission {
         self.try_admit()
             .map(|permit| Box::new(permit) as Box<dyn Send>)
     }
+
+    fn track_running_turn(&self) -> Arc<dyn Send + Sync> {
+        Arc::new(self.track_started_turn())
+    }
 }
 
-// The turn store owns the guard until stop/abort (or teardown). No event
-// consumer acknowledgement is needed to keep maintenance from claiming idle.
+// Shared ownership spans the actual task future and its abort owner, including
+// terminal persistence. Delayed host events cannot make a live task appear idle.
 struct RunningTurnPermit(TurnAdmission);
 
 impl Drop for RunningTurnPermit {
@@ -124,26 +123,6 @@ impl Drop for RunningTurnPermit {
         state.running -= 1;
         // Wake pending maintenance even when the request-admission count is unchanged.
         self.0.active_tx.send_replace(state.active);
-    }
-}
-
-impl TurnLifecycleContributor for TurnAdmission {
-    fn on_turn_start<'a>(&'a self, input: TurnStartInput<'a>) -> ExtensionFuture<'a, ()> {
-        Box::pin(async move {
-            input.turn_store.insert(self.track_started_turn());
-        })
-    }
-
-    fn on_turn_stop<'a>(&'a self, input: TurnStopInput<'a>) -> ExtensionFuture<'a, ()> {
-        Box::pin(async move {
-            input.turn_store.remove::<RunningTurnPermit>();
-        })
-    }
-
-    fn on_turn_abort<'a>(&'a self, input: TurnAbortInput<'a>) -> ExtensionFuture<'a, ()> {
-        Box::pin(async move {
-            input.turn_store.remove::<RunningTurnPermit>();
-        })
     }
 }
 
