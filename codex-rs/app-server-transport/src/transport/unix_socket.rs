@@ -37,6 +37,8 @@ const MAX_UNFRAGMENTED_MESSAGE_BYTES_HEADER: &str =
 #[derive(Clone, Copy)]
 pub enum DaemonShutdownAccess {
     Disabled,
+    /// A managed receiver with nonblocking maintenance, without socket shutdown.
+    MaintenanceOnly,
     Managed,
 }
 
@@ -179,7 +181,7 @@ async fn run_control_socket_acceptor(
                 |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
                  mut response: HandshakeResponse| {
                     if request.uri().path() == "/daemon/maintenance" {
-                        if !matches!(daemon_shutdown_access, DaemonShutdownAccess::Managed) {
+                        if matches!(daemon_shutdown_access, DaemonShutdownAccess::Disabled) {
                             let mut rejection = Response::new(Some("unmanaged server".to_string()));
                             *rejection.status_mut() = StatusCode::FORBIDDEN;
                             return Err(rejection);

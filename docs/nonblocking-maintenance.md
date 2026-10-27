@@ -40,7 +40,9 @@ Retired adoption helpers are historical evidence, not executable recovery routes
 Use `codex app-server daemon maintenance` against a qualified receiver. It uses
 only the private managed control socket, without acquiring daemon.lock. The
 receiver must advertise the versioned nonblocking capability and its process ID
-before the caller sends any lifecycle request. Older receivers are refused
+before the caller sends any lifecycle request. Managed Unix receivers enable
+maintenance independently of the platform-specific explicit-shutdown socket;
+unmanaged receivers expose neither maintenance capability nor its control route. Older receivers are refused
 without sending a signal or a maintenance command. The caller waits at most133s
 and reports the exact receiver's outcome: `deferred`, `alreadyPending`,
 `supersededByExplicitStop`, or `handoffReady`. The last confirms a saved handoff,

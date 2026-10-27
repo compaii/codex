@@ -896,6 +896,8 @@ pub async fn run_main_with_transport_options(
                         .is_some()
                 {
                     DaemonShutdownAccess::Managed
+                } else if managed_daemon {
+                    DaemonShutdownAccess::MaintenanceOnly
                 } else {
                     DaemonShutdownAccess::Disabled
                 },

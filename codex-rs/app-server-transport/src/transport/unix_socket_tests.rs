@@ -533,6 +533,7 @@ fn assert_socket_path_removed(_socket_path: &Path) {
 async fn maintenance_control_requires_managed_receiver_and_returns_bounded_outcome() {
     for access in [
         DaemonShutdownAccess::Disabled,
+        DaemonShutdownAccess::MaintenanceOnly,
         DaemonShutdownAccess::Managed,
     ] {
         let home = tempfile::TempDir::new().unwrap();
@@ -542,6 +543,15 @@ async fn maintenance_control_requires_managed_receiver_and_returns_bounded_outco
         let acceptor = start_control_socket_acceptor(socket.clone(), tx, shutdown.clone(), access)
             .await
             .unwrap();
+        if matches!(access, DaemonShutdownAccess::MaintenanceOnly) {
+            let stream = connect_to_socket(socket.as_path()).await.unwrap();
+            assert!(
+                client_async("ws://localhost/daemon/shutdown", stream)
+                    .await
+                    .is_err()
+            );
+            assert!(rx.try_recv().is_err());
+        }
         let stream = connect_to_socket(socket.as_path()).await.unwrap();
         let upgraded = client_async("ws://localhost/daemon/maintenance", stream).await;
         if matches!(access, DaemonShutdownAccess::Disabled) {
