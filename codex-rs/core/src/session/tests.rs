@@ -13575,6 +13575,13 @@ async fn resolved_resume_requires_full_config_and_unchanged_runtime() {
             .can_reuse_resolved_resume_config(config.as_ref())
             .await
     );
+    let mut rebound_roots = config.as_ref().clone();
+    rebound_roots.workspace_roots_explicit = !config.workspace_roots_explicit;
+    assert!(
+        !session
+            .can_reuse_resolved_resume_config(&rebound_roots)
+            .await
+    );
     let mut changed = config.as_ref().clone();
     changed.model_provider.http_headers = Some(std::collections::HashMap::from([(
         "X-Changed".to_string(),

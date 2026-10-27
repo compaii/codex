@@ -642,9 +642,29 @@ async fn resolved_resume_journey(history_mode: &str) -> Result<()> {
             "config":{"web_search":"disabled","model_reasoning_effort":"medium"}
         }})).await;
         let _: codex_app_server_protocol::ThreadResumeResponse = read_response_from(&mut outgoing, second_id, 5).await;
+        let seeded = processor.thread_processor.thread_manager.get_thread(id).await?;
+        // Fresh startup inferred its roots; the first resume explicitly restores
+        // the saved selection. That provenance transition must still rebuild.
+        assert!(!original.config().await.workspace_roots_explicit);
+        assert!(seeded.config().await.workspace_roots_explicit);
+        assert!(!Arc::ptr_eq(&original, &seeded), "binding saved roots changes complete configuration");
+        processor.connection_closed(second_id, &second).await;
+        let original = seeded;
+        let warm_id = ConnectionId(46);
+        let warm = Arc::new(ConnectionSessionState::new(ConnectionOrigin::WebSocket));
+        send_request(&processor, warm_id, &warm, json!({"id":12,"method":"initialize","params":{
+            "clientInfo":{"name":"resolved-resume","version":"1"},"capabilities":{"experimentalApi":true}
+        }})).await;
+        let _: InitializeResponse = read_response_from(&mut outgoing, warm_id, 12).await;
+        processor.connection_initialized(warm_id, warm.request_attestation()).await;
+        send_request(&processor, warm_id, &warm, json!({"id":13,"method":"thread/resume","params":{
+            "threadId":started.thread.id,"excludeTurns":true,"model":model,"modelProvider":model_provider,
+            "config":{"web_search":"disabled","model_reasoning_effort":"medium"}
+        }})).await;
+        let _: codex_app_server_protocol::ThreadResumeResponse = read_response_from(&mut outgoing, warm_id, 13).await;
         let reused = processor.thread_processor.thread_manager.get_thread(id).await?;
         assert!(Arc::ptr_eq(&original, &reused), "identical resolved config should retain the loaded runtime");
-        processor.connection_closed(second_id, &second).await;
+        processor.connection_closed(warm_id, &warm).await;
         let third_id = ConnectionId(43);
         let third = Arc::new(ConnectionSessionState::new(ConnectionOrigin::WebSocket));
         send_request(&processor, third_id, &third, json!({"id":6,"method":"initialize","params":{

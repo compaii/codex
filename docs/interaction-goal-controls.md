@@ -70,7 +70,10 @@ and runtime settings remain unchanged. The input and runtime snapshots are separ
 model-owned token-budget activation derives Config during startup, so comparing a
 fresh loader input directly to that activated Config would always miss reuse.
 Opaque host initialization data prevents this shortcut. Fresh trusted guardian
-sessions also retain cold-resume re-evaluation of history-dependent restrictions.
+sessions also retain cold-resume re-evaluation of history-dependent restrictions. A first
+resume can also turn inferred roots into an explicitly restored saved selection;
+that provenance change still rebuilds. Subsequent resumes of the same saved
+selection can qualify for reuse.
 
 This is an in-memory optimization, not a new input, permission or persistence
 format. Changed settings, unknown equivalence or changed runtime state retain

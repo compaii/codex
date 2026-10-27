@@ -2255,40 +2255,8 @@ impl Session {
         if !reusable {
             // Values may contain private credentials or paths. Diagnose only
             // equality categories, never the configurations themselves.
-            fn debug_fields(config: &Config) -> std::collections::BTreeMap<String, String> {
-                let mut fields = std::collections::BTreeMap::<String, String>::new();
-                let mut current = None;
-                for line in format!("{config:#?}").lines() {
-                    if let Some(field) = line.strip_prefix("    ")
-                        && !field.starts_with(' ')
-                        && let Some((key, _)) = field.split_once(':')
-                        && !key.is_empty()
-                        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                    {
-                        current = Some(key.to_string());
-                    }
-                    if let Some(key) = &current {
-                        fields.entry(key.clone()).or_default().push_str(line);
-                    }
-                }
-                fields
-            }
-            let debug_input_differences = || {
-                let left = debug_fields(candidate);
-                let right = debug_fields(input);
-                left.keys()
-                    .chain(right.keys())
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .into_iter()
-                    .filter(|key| left.get(*key) != right.get(*key))
-                    .cloned()
-                    .collect::<Vec<_>>()
-            };
             tracing::debug!(
                 target: "codex_core::session::resume_equivalence",
-                // Debug map ordering can differ even for equal values. Field
-                // names guide inspection; only full PartialEq decides reuse.
-                debug_input_differences = ?debug_input_differences(),
                 input_equal = candidate == input.as_ref(),
                 runtime_config_equal = current.original_config_do_not_use == initial.original_config_do_not_use,
                 settings_equal = initial.thread_settings_snapshot(&initial.environments) == current.thread_settings_snapshot(&current.environments),
@@ -2299,9 +2267,9 @@ impl Session {
                 trusted_guardian = initial.trusted_guardian_reviewer || current.trusted_guardian_reviewer,
                 input_layers_equal = candidate.config_layer_stack == input.config_layer_stack,
                 input_permissions_equal = candidate.permissions == input.permissions,
-                input_roots_equal = candidate.workspace_roots == input.workspace_roots && candidate.cwd == input.cwd,
+                input_roots_equal = candidate.workspace_roots == input.workspace_roots && candidate.cwd == input.cwd && candidate.workspace_roots_explicit == input.workspace_roots_explicit,
                 input_model_equal = candidate.model == input.model && candidate.model_reasoning_effort == input.model_reasoning_effort,
-                input_provider_equal = candidate.model_provider == input.model_provider && candidate.model_provider_id == input.model_provider_id,
+                input_provider_equal = candidate.model_provider == input.model_provider && candidate.model_provider_id == input.model_provider_id && candidate.model_providers == input.model_providers,
                 input_features_equal = candidate.features == input.features,
                 input_budget_equal = candidate.token_budget == input.token_budget && candidate.token_budget_startup_config == input.token_budget_startup_config,
                 input_auth_route_equal = candidate.application_auth_route_config == input.application_auth_route_config,
