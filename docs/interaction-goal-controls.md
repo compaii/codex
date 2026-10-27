@@ -65,8 +65,12 @@ An idle unsubscribed thread now resolves those overrides through the normal full
 configuration loader before deciding to replace its runtime. That loading stays
 outside the shared thread-list permit and retains the existing stored-state
 recheck. A loaded runtime is reusable only when the complete resolved configuration
-matches both its startup and current configuration, and its startup-owned runtime
-settings remain unchanged. Opaque host initialization data prevents this shortcut.
+matches its complete pre-activation startup input, and its post-startup configuration
+and runtime settings remain unchanged. The input and runtime snapshots are separate:
+model-owned token-budget activation derives Config during startup, so comparing a
+fresh loader input directly to that activated Config would always miss reuse.
+Opaque host initialization data prevents this shortcut. Fresh trusted guardian
+sessions also retain cold-resume re-evaluation of history-dependent restrictions.
 
 This is an in-memory optimization, not a new input, permission or persistence
 format. Changed settings, unknown equivalence or changed runtime state retain

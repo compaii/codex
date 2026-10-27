@@ -6968,6 +6968,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         agent_status: agent_status_tx,
         state: Mutex::new(state),
         initial_resume_configuration: std::sync::OnceLock::new(),
+        initial_resume_input_config: std::sync::OnceLock::new(),
         thread_settings_persistence: Semaphore::new(/*permits*/ 1),
         code_mode_message_tasks: Default::default(),
         managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
@@ -9237,6 +9238,7 @@ where
         agent_status: agent_status_tx,
         state: Mutex::new(state),
         initial_resume_configuration: std::sync::OnceLock::new(),
+        initial_resume_input_config: std::sync::OnceLock::new(),
         thread_settings_persistence: Semaphore::new(/*permits*/ 1),
         code_mode_message_tasks: Default::default(),
         managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
@@ -13542,6 +13544,25 @@ async fn resolved_resume_requires_full_config_and_unchanged_runtime() {
             .can_reuse_resolved_resume_config(config.as_ref())
             .await
     );
+    // Normal startup derives token-budget activation even with no configured
+    // budget. Resume resolves the original loader input, not that derived Config.
+    let mut activated = config.as_ref().clone();
+    activated
+        .prepare_token_budget_for_startup()
+        .expect("startup config");
+    assert_ne!(activated, *config);
+    session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .original_config_do_not_use = Arc::new(activated);
+    assert!(
+        session
+            .initial_resume_input_config
+            .set(Arc::clone(&config))
+            .is_ok()
+    );
     let initial = session.state.lock().await.session_configuration.clone();
     assert!(
         session
@@ -13621,4 +13642,34 @@ async fn resolved_resume_requires_full_config_and_unchanged_runtime() {
         state.session_configuration.original_config_do_not_use = Arc::new(changed.clone());
     }
     assert!(!session.can_reuse_resolved_resume_config(&changed).await);
+    assert!(
+        !session
+            .can_reuse_resolved_resume_config(config.as_ref())
+            .await
+    );
+
+    let (guardian, _) = make_session_and_context().await;
+    let guardian_config = guardian.get_config().await;
+    let guardian_initial = {
+        let mut state = guardian.state.lock().await;
+        state.session_configuration.trusted_guardian_reviewer = true;
+        state.session_configuration.clone()
+    };
+    assert!(
+        guardian
+            .initial_resume_input_config
+            .set(Arc::clone(&guardian_config))
+            .is_ok()
+    );
+    assert!(
+        guardian
+            .initial_resume_configuration
+            .set(guardian_initial)
+            .is_ok()
+    );
+    assert!(
+        !guardian
+            .can_reuse_resolved_resume_config(guardian_config.as_ref())
+            .await
+    );
 }

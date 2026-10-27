@@ -720,6 +720,7 @@ impl Session {
         };
 
         let mut config = Arc::new(config);
+        let resume_input_config = Arc::clone(&config);
         let refresh_strategy = if session_source.is_non_root_agent() {
             codex_models_manager::manager::RefreshStrategy::Offline
         } else {
@@ -1005,6 +1006,7 @@ impl Session {
                 Err(error) => map_session_init_error(&error, &config.codex_home),
             }
         })?;
+        let _ = session.initial_resume_input_config.set(resume_input_config);
         if let Some(message) = initial_service_tier_warning {
             session
                 .send_event_raw(Event {
@@ -2221,10 +2223,19 @@ impl Session {
         let Some(initial) = self.initial_resume_configuration.get() else {
             return false;
         };
-        // Never infer equality for opaque host data. Config equality includes
-        // resolved provider definitions/catalog contents and all loaded layers.
-        candidate == current.original_config_do_not_use.as_ref()
-            && candidate == initial.original_config_do_not_use.as_ref()
+        let Some(input) = self.initial_resume_input_config.get() else {
+            return false;
+        };
+        // Compare full loader inputs, then separately require unchanged runtime
+        // activation. Startup adds model-owned token-budget state to Config;
+        // a freshly resolved input must not be compared to that derived state.
+        // Opaque host data still has no known equivalence.
+        // A basic guardian can skip restrictions only on fresh startup. Cold
+        // resume intentionally re-evaluates those history-dependent restrictions.
+        !initial.trusted_guardian_reviewer
+            && !current.trusted_guardian_reviewer
+            && candidate == input.as_ref()
+            && current.original_config_do_not_use == initial.original_config_do_not_use
             && initial.turn_extension_init.is_empty()
             && current.turn_extension_init.is_empty()
             && initial.thread_settings_snapshot(&initial.environments)
