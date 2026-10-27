@@ -13557,7 +13557,7 @@ async fn resolved_resume_requires_full_config_and_unchanged_runtime() {
     let mut changed = config.as_ref().clone();
     changed.model_provider.http_headers = Some(std::collections::HashMap::from([(
         "X-Changed".to_string(),
-        "changed".to_string(),
+        "changed".into(),
     )]));
     assert!(!session.can_reuse_resolved_resume_config(&changed).await);
     for change in 0..9 {
