@@ -466,11 +466,28 @@ impl Session {
             return;
         }
 
-        // Mailbox/durable-sleep wakeups must not consume pending input after a
-        // host has claimed maintenance idle. Hold through synchronous lifecycle
-        // registration, just like explicit and extension-driven submissions.
-        let Some(_admission) = self.services.extensions.admit_turn_start() else {
-            return;
+        let ordinary = self.services.extensions.admit_turn_start();
+        let mut delegated_parent = None;
+        let _admission = if let Some(permit) = ordinary {
+            permit
+        } else {
+            let is_spawned_child = matches!(
+                self.state.lock().await.session_configuration.session_source,
+                codex_protocol::protocol::SessionSource::SubAgent(
+                    codex_protocol::protocol::SubAgentSource::ThreadSpawn { .. }
+                )
+            );
+            if !is_spawned_child {
+                return;
+            }
+            delegated_parent = self.input_queue.pending_delegated_parent().await;
+            if delegated_parent.is_none() {
+                return;
+            }
+            let Some(permit) = self.services.extensions.admit_delegated_turn_start() else {
+                return;
+            };
+            permit
         };
         let Some((turn_state, previous_options)) = self.reserve_pending_work_turn().await else {
             return;
@@ -490,8 +507,14 @@ impl Session {
         {
             return;
         }
-        let (input, mut start_options) =
-            self.input_queue.get_pending_input(&self.active_turn).await;
+        let Some((input, mut start_options)) = self
+            .input_queue
+            .get_pending_input_for_parent(&self.active_turn, delegated_parent.as_deref())
+            .await
+        else {
+            self.clear_reserved_idle_turn(&turn_state).await;
+            return;
+        };
         if !input.iter().any(
             |item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.trigger_turn),
         ) {

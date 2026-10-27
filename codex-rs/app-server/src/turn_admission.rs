@@ -104,6 +104,21 @@ impl TurnStartAdmission for TurnAdmission {
             .map(|permit| Box::new(permit) as Box<dyn Send>)
     }
 
+    fn admit_delegated_turn_start(&self) -> Option<Box<dyn Send>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A closed maintenance gate has no live tasks and cannot be bypassed.
+        // Explicit draining may still finish work delegated by an existing task.
+        if state.closed && state.running == 0 {
+            return None;
+        }
+        state.active += 1;
+        self.active_tx.send_replace(state.active);
+        Some(Box::new(TurnPermit(self.clone())))
+    }
+
     fn track_running_turn(&self) -> Arc<dyn Send + Sync> {
         Arc::new(self.track_started_turn())
     }

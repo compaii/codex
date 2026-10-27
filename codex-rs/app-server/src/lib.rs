@@ -1717,6 +1717,7 @@ mod tests {
     #[cfg(debug_assertions)]
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
+    use tokio::sync::oneshot;
     use tokio::sync::watch;
 
     #[test]

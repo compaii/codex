@@ -67,7 +67,9 @@ jobs:
           cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all connection_handling_websocket_unix -- --nocapture
           cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all daemon_update_recovery -- --nocapture
       - name: Core input and automatic-start admission contracts
-        run: cargo test --locked --profile dev-small -j 2 -p codex-core --test all turn_input_submission -- --nocapture
+        run: |
+          cargo test --locked --profile dev-small -j 2 -p codex-core --lib session::input_queue -- --nocapture
+          cargo test --locked --profile dev-small -j 2 -p codex-core --test all turn_input_submission -- --nocapture
       - name: Build the exact native package
         run: |
           cargo build --locked --profile dev-small -j 2 -p codex-cli --bin codex

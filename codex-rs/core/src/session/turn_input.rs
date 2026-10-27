@@ -402,15 +402,15 @@ async fn start_or_steer(
                         .session_source,
                     SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
                 );
-            let _admission = if is_delegated_input {
-                None
+            let admission = if is_delegated_input {
+                session.services.extensions.admit_delegated_turn_start()
             } else {
-                let Some(admission) = session.services.extensions.admit_turn_start() else {
-                    return Ok(TurnInputSubmission::NotSubmitted {
-                        reason: NotSubmittedReason::ServerDraining,
-                    });
-                };
-                Some(admission)
+                session.services.extensions.admit_turn_start()
+            };
+            let Some(_admission) = admission else {
+                return Ok(TurnInputSubmission::NotSubmitted {
+                    reason: NotSubmittedReason::ServerDraining,
+                });
             };
             let Some(turn_context) = settings
                 .apply_started(session, submission_id.clone(), TurnStartKind::User)
@@ -493,26 +493,30 @@ async fn start_if_idle(
         });
     }
 
-    let _admission = session.services.extensions.admit_turn_start();
-    // A one-shot review delegate completes its already-running parent's work.
-    // Its explicit input carries parent lineage; automatic starts do not qualify.
-    if _admission.is_none()
-        && !(kind == TurnStartKind::User
-            && start.parent_turn_id.is_some()
-            && matches!(
-                session
-                    .state
-                    .lock()
-                    .await
-                    .session_configuration
-                    .session_source,
-                SessionSource::SubAgent(SubAgentSource::Review)
-            ))
-    {
+    let ordinary = session.services.extensions.admit_turn_start();
+    // A one-shot review delegate completes its existing parent's work; the host
+    // still requires a live task when its idle-maintenance gate is closed.
+    let admission = if ordinary.is_none()
+        && kind == TurnStartKind::User
+        && start.parent_turn_id.is_some()
+        && matches!(
+            session
+                .state
+                .lock()
+                .await
+                .session_configuration
+                .session_source,
+            SessionSource::SubAgent(SubAgentSource::Review)
+        ) {
+        session.services.extensions.admit_delegated_turn_start()
+    } else {
+        ordinary
+    };
+    let Some(_admission) = admission else {
         return Ok(TurnInputSubmission::NotSubmitted {
             reason: NotSubmittedReason::ServerDraining,
         });
-    }
+    };
 
     let turn_state = {
         let mut active_turn = session.active_turn.lock().await;
@@ -779,7 +783,10 @@ impl Session {
         Ok(())
     }
 
-    async fn clear_reserved_idle_turn(&self, turn_state: &Arc<tokio::sync::Mutex<TurnState>>) {
+    pub(crate) async fn clear_reserved_idle_turn(
+        &self,
+        turn_state: &Arc<tokio::sync::Mutex<TurnState>>,
+    ) {
         let mut active_turn_guard = self.active_turn.lock().await;
         if let Some(active_turn) = active_turn_guard.as_ref()
             && active_turn.task.is_none()

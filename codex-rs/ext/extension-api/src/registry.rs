@@ -202,6 +202,14 @@ impl<C: Sync> ExtensionRegistry<C> {
         }
     }
 
+    /// Admit only already-delegated child work, distinct from automatic starts.
+    pub fn admit_delegated_turn_start(&self) -> Option<Box<dyn Send>> {
+        match &self.turn_start_admission {
+            Some(admission) => admission.admit_delegated_turn_start(),
+            None => Some(Box::new(())),
+        }
+    }
+
     /// Tracks already-admitted work until both its future and abort owner finish.
     pub fn track_running_turn(&self) -> Arc<dyn Send + Sync> {
         match &self.turn_start_admission {

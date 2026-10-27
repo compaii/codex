@@ -328,6 +328,29 @@ async fn host_drain_allows_spawned_agent_input_but_not_automatic_work() -> anyho
             .single_request()
             .body_contains_text("delegated input")
     );
+    let mailbox =
+        responses::mount_sse_once(&server, responses::sse_completed("delegated mailbox")).await;
+    child
+        .submit(Op::InterAgentCommunication {
+            communication: InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::root(),
+                Vec::new(),
+                "delegated child mail".into(),
+                true,
+            ),
+            start_options: TurnStartOptions {
+                parent_turn_id: Some("parent-turn".into()),
+                ..Default::default()
+            },
+        })
+        .await?;
+    wait_for_event(&child, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    assert!(
+        mailbox
+            .single_request()
+            .body_contains_text("delegated child mail")
+    );
     Ok(())
 }
 
@@ -482,16 +505,17 @@ async fn host_drain_closes_realtime_after_handoff_error() -> anyhow::Result<()> 
 }
 
 #[tokio::test]
-async fn host_drain_allows_mailbox_work_to_start_a_turn() -> anyhow::Result<()> {
+async fn host_drain_retains_root_mailbox_work_until_admission_reopens() -> anyhow::Result<()> {
     let server = responses::start_mock_server().await;
     let response = responses::mount_sse_once(&server, responses::sse_completed("mailbox")).await;
     let mut extensions = ExtensionRegistryBuilder::new();
-    extensions.turn_start_admission(Arc::new(TestAdmission(AtomicBool::new(true))));
+    let admission = Arc::new(TestAdmission(AtomicBool::new(true)));
+    extensions.turn_start_admission(admission.clone());
     let test = test_codex()
         .with_extensions(Arc::new(extensions.build()))
         .build_with_auto_env(&server)
         .await?;
-    // Mailbox input is memory-only and must be processed before the host exits.
+    // Root mailbox work must remain queued while maintenance owns the idle boundary.
     test.codex
         .submit(Op::InterAgentCommunication {
             communication: InterAgentCommunication::new(
@@ -500,6 +524,36 @@ async fn host_drain_allows_mailbox_work_to_start_a_turn() -> anyhow::Result<()> 
                 Vec::new(),
                 "mail while draining".to_string(),
                 /*trigger_turn*/ true,
+            ),
+            start_options: Default::default(),
+        })
+        .await?;
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if matches!(
+                test.codex
+                    .start_turn_if_idle(TurnInputRequest::user_input(Vec::new()))
+                    .await?,
+                StartIfIdleSubmission::NotSubmitted {
+                    reason: NotSubmittedReason::PendingTriggerTurn
+                }
+            ) {
+                return Ok::<(), anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    assert!(response.requests().is_empty());
+    admission.0.store(false, Ordering::SeqCst);
+    test.codex
+        .submit(Op::InterAgentCommunication {
+            communication: InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::root(),
+                Vec::new(),
+                "wake after maintenance".into(),
+                true,
             ),
             start_options: Default::default(),
         })

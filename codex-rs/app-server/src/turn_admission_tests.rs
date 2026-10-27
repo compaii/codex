@@ -70,3 +70,21 @@ fn core_lifetime_waits_for_both_task_future_and_abort_owner() {
     drop(abort_owner);
     assert!(admission.begin_idle_drain(&running));
 }
+
+#[test]
+fn explicit_drain_finishes_delegated_work_but_idle_maintenance_cannot_be_bypassed() {
+    let admission = TurnAdmission::default();
+    let parent = admission.track_running_turn();
+    admission.begin_drain();
+    assert!(admission.admit_turn_start().is_none());
+    let child = admission
+        .admit_delegated_turn_start()
+        .expect("finish existing delegation");
+    drop(parent);
+    assert!(admission.admit_delegated_turn_start().is_none());
+    drop(child);
+    admission.cancel_drain();
+    let (_, running) = tokio::sync::watch::channel(0);
+    assert!(admission.begin_idle_drain(&running));
+    assert!(admission.admit_delegated_turn_start().is_none());
+}

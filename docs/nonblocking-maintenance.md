@@ -17,7 +17,10 @@ It claims an idle boundary only with no preparing starts, no Core task lifetime
 guards and no host-reported running turns. Shared guards cover both the task
 future and its abort owner through terminal persistence; delayed lifecycle events
 cannot manufacture idle. Mailbox/durable-sleep starts acquire admission before
-consuming pending input.
+consuming pending input. Explicit parent-delegated child work can complete
+while another Core task remains live; it cannot bypass a claimed idle boundary.
+Mailbox delegation requires unambiguous parent lineage, revalidated atomically
+against the queue consumed so a later unrelated message remains pending.
 
 Final snapshot preparation has a five-second deadline. Maintenance abandons on
 root persistence failure, a still-interrupted root, write/publish error or timeout,

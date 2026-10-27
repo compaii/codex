@@ -98,23 +98,43 @@ async fn managed_maintenance_keeps_admitting_while_a_turn_runs_then_saves_idle_r
 }
 
 #[cfg(unix)]
+#[test_case::test_case("publish")]
+#[test_case::test_case("root")]
 #[tokio::test]
-async fn managed_maintenance_publish_failure_reopens_without_disconnecting() -> Result<()> {
+async fn managed_maintenance_failure_reopens_without_disconnecting(failure: &str) -> Result<()> {
     let home = TempDir::new()?;
     create_config_toml(home.path(), "http://127.0.0.1:1", "never")?;
     let socket = home.path().join("control/server.sock");
     let mut server = spawn_server(home.path(), &socket)?;
     let mut client = connect_default_daemon_client(&socket).await?;
-    start_thread(&mut client, 2, json!({})).await?;
+    let root = start_thread(&mut client, 2, json!({})).await?;
     let recovery = daemon_recovery_file_path(home.path());
-    // Staging succeeds, but publishing over a directory must fail.
-    std::fs::create_dir_all(&recovery)?;
+    let corrupt_root = root
+        .thread
+        .path
+        .context("persistent root rollout")?
+        .with_extension("jsonl.zst");
+    if failure == "publish" {
+        // Staging succeeds, but publishing over a directory must fail.
+        std::fs::create_dir_all(&recovery)?;
+    } else {
+        std::fs::create_dir_all(corrupt_root.parent().context("rollout directory")?)?;
+        std::fs::write(&corrupt_root, b"invalid compressed rollout")?;
+    }
     let mut maintenance = begin_maintenance(&socket).await?;
     assert_eq!(maintenance_outcome(&mut maintenance).await?, "deferred");
     assert_still_running(&mut server, "failed maintenance must keep serving").await;
     start_thread(&mut client, 3, json!({})).await?;
-    assert!(recovery.is_dir());
-    std::fs::remove_dir(&recovery)?;
+    if failure == "publish" {
+        assert!(recovery.is_dir());
+        std::fs::remove_dir(&recovery)?;
+    } else {
+        assert!(
+            !recovery.exists(),
+            "partial root set must not become recovery"
+        );
+        std::fs::remove_file(&corrupt_root)?;
+    }
     request_shutdown(&server, &socket).await?;
     wait_success(&mut server).await?;
     Ok(())
@@ -164,6 +184,9 @@ async fn managed_maintenance_stalled_persistence_times_out_and_late_writer_canno
             )
         })?;
     assert!(!daemon_recovery_file_path(home.path()).exists());
+    // Keep the blocked reader's open descriptor, but prevent explicit cleanup
+    // from opening this test-only FIFO a second time after its writer closes.
+    std::fs::remove_file(&compressed)?;
     drop(blocked);
     sleep(Duration::from_millis(100)).await;
     assert!(
