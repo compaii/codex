@@ -599,7 +599,9 @@ async fn managed_force_shutdown_exits_with_blocked_rollout_writer() -> Result<()
 }
 
 fn diagnostic_tail(home: &Path) -> String {
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::Read;
+    use std::io::Seek;
+    use std::io::SeekFrom;
     let Ok(mut file) = std::fs::File::open(home.join("daemon-stderr.log")) else {
         return "no fixture log".into();
     };
