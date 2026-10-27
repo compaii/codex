@@ -26,3 +26,21 @@ fn drain_rejects_new_work_without_waiting_for_admitted_work() {
     drop(automatic);
     assert_eq!(*active.borrow(), 0);
 }
+
+#[test]
+fn idle_maintenance_checks_live_turns_and_preparing_starts_before_closing() {
+    let admission = TurnAdmission::default();
+    let (running_tx, running) = tokio::sync::watch::channel(0);
+    let permit = admission.admit().unwrap();
+    assert!(!admission.begin_idle_drain(&running));
+    // Publication happens before the start permit is released.
+    running_tx.send_replace(1);
+    drop(permit);
+    assert!(!admission.begin_idle_drain(&running));
+    assert!(admission.admit_turn_start().is_some());
+    running_tx.send_replace(0);
+    assert!(admission.begin_idle_drain(&running));
+    assert!(admission.admit_turn_start().is_none());
+    admission.cancel_drain();
+    assert!(admission.admit_turn_start().is_some());
+}

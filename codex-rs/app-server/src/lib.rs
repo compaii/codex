@@ -71,6 +71,7 @@ use codex_websocket_auth::WebsocketAuthSettings;
 use codex_websocket_auth::policy_from_settings;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
@@ -200,12 +201,16 @@ enum OutboundControlEvent {
 struct ShutdownState {
     requested: bool,
     forced: bool,
+    maintenance: bool,
+    draining: bool,
+    maintenance_deadline: Option<tokio::time::Instant>,
     last_logged_running_turn_count: Option<usize>,
 }
 
 enum ShutdownAction {
     Noop,
     Finish,
+    ResumeServing,
 }
 
 #[derive(Clone, Copy)]
@@ -252,6 +257,12 @@ impl ShutdownState {
         self.forced
     }
 
+    fn cancel_maintenance(&mut self, turn_admission: &turn_admission::TurnAdmission) {
+        turn_admission.cancel_drain();
+        *self = Self::default();
+        warn!("maintenance handoff abandoned; continuing to serve without interrupting work");
+    }
+
     fn on_signal(
         &mut self,
         signal: ShutdownSignal,
@@ -261,29 +272,60 @@ impl ShutdownState {
     ) {
         if self.requested {
             if matches!(signal, ShutdownSignal::Forceable) {
-                self.forced = true;
+                if self.maintenance {
+                    self.maintenance = false;
+                    self.maintenance_deadline = None;
+                    self.draining = true;
+                    turn_admission.begin_drain();
+                } else {
+                    self.forced = true;
+                }
             }
             return;
         }
 
-        turn_admission.begin_drain();
+        self.maintenance = !matches!(signal, ShutdownSignal::Forceable);
+        self.draining = !self.maintenance;
+        if self.draining {
+            turn_admission.begin_drain();
+        }
         self.requested = true;
         self.last_logged_running_turn_count = None;
         info!(
-            "received shutdown signal; entering graceful restart drain (connections={}, runningAssistantTurns={}, new client turns rejected)",
-            connection_count, running_turn_count,
+            "received shutdown signal (connections={}, runningAssistantTurns={}, maintenance={}, acceptingNewTurns={})",
+            connection_count, running_turn_count, self.maintenance, !self.draining,
         );
     }
 
     fn update(
         &mut self,
-        running_turn_count: usize,
+        running_turn_count_rx: &watch::Receiver<usize>,
         active_admissions: usize,
         connection_count: usize,
+        turn_admission: &turn_admission::TurnAdmission,
     ) -> ShutdownAction {
         if !self.requested {
             return ShutdownAction::Noop;
         }
+
+        if self
+            .maintenance_deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            self.cancel_maintenance(turn_admission);
+            return ShutdownAction::ResumeServing;
+        }
+
+        if self.maintenance && !self.draining {
+            if !turn_admission.begin_idle_drain(running_turn_count_rx) {
+                return ShutdownAction::Noop;
+            }
+            self.draining = true;
+            self.maintenance_deadline =
+                Some(tokio::time::Instant::now() + std::time::Duration::from_secs(5));
+        }
+
+        let running_turn_count = *running_turn_count_rx.borrow();
 
         if self.forced || (running_turn_count == 0 && active_admissions == 0) {
             if self.forced {
@@ -1039,18 +1081,24 @@ pub async fn run_main_with_transport_options(
             };
             let mut listen_for_threads = true;
             // Keep force signals and daemon control events responsive while saving.
-            let mut snapshot = Box::pin(async {
+            let make_snapshot = |path| {
                 let processor = Arc::clone(&processor);
-                let recovery_file = recovery_file.clone();
-                // Run independently: snapshot locks can require the event loop to make progress.
-                let task = tokio::spawn(async move {
-                    let saved = processor.daemon_recovery_snapshot().await;
-                    if let Err(err) = daemon_thread_recovery::snapshot(recovery_file, saved).await {
-                        warn!("failed to save threads during daemon shutdown: {err}");
-                    }
-                });
-                let _ = tokio_util::task::AbortOnDropHandle::new(task).await;
-            });
+                Box::pin(async move {
+                    // Run independently: snapshot locks can require the event loop to make progress.
+                    let task = tokio::spawn(async move {
+                        let saved = processor.daemon_recovery_snapshot().await;
+                        daemon_thread_recovery::snapshot(path, saved).await
+                    });
+                    tokio_util::task::AbortOnDropHandle::new(task)
+                        .await
+                        .map_err(std::io::Error::other)?
+                })
+            };
+            let mut snapshot = make_snapshot(recovery_file.clone());
+            let mut snapshot_started = false;
+            let mut snapshot_is_maintenance = false;
+            let mut snapshot_attempt = 0_u64;
+            let mut snapshot_file = recovery_file.clone();
             let mut snapshot_finished = !managed_daemon;
             let mut clients_disconnected = false;
             let mut shutdown_state = ShutdownState::default();
@@ -1059,23 +1107,47 @@ pub async fn run_main_with_transport_options(
                 // Sample submissions first: one can publish a running turn before
                 // releasing its permit, and shutdown must observe that new turn.
                 let active_admissions = *active_admissions_rx.borrow_and_update();
-                let running_turn_count = *running_turn_count_rx.borrow_and_update();
-                let ready_to_exit = matches!(
-                    shutdown_state.update(running_turn_count, active_admissions, connections.len()),
-                    ShutdownAction::Finish
+                let _ = running_turn_count_rx.borrow_and_update();
+                let action = shutdown_state.update(
+                    &running_turn_count_rx,
+                    active_admissions,
+                    connections.len(),
+                    &processor.turn_admission,
                 );
+                if matches!(action, ShutdownAction::ResumeServing) {
+                    // Dropping the future aborts its async task. A late filesystem
+                    // writer can only touch this attempt's private staging file,
+                    // never publish an abandoned continuation for a later restart.
+                    snapshot = make_snapshot(recovery_file.clone());
+                    snapshot_started = false;
+                }
+                let ready_to_exit = matches!(action, ShutdownAction::Finish);
+                if shutdown_state.draining && !snapshot_started {
+                    snapshot_attempt += 1;
+                    snapshot_is_maintenance = shutdown_state.maintenance;
+                    snapshot_file = if snapshot_is_maintenance {
+                        recovery_file.with_extension(format!(
+                            "maintenance-{}-{snapshot_attempt}",
+                            std::process::id()
+                        ))
+                    } else {
+                        recovery_file.clone()
+                    };
+                    snapshot = make_snapshot(snapshot_file.clone());
+                    snapshot_started = true;
+                }
                 if ready_to_exit {
-                    if let Some(task) = &recovery_task {
-                        task.abort();
-                    }
                     let finished = snapshot_finished || shutdown_state.forced();
                     if finished {
+                        if let Some(task) = &recovery_task {
+                            task.abort();
+                        }
                         transport_shutdown_token.cancel();
                     }
                     if managed_daemon && shutdown_state.forced() {
                         break "forced_shutdown_requested";
                     }
-                    if !clients_disconnected {
+                    if !clients_disconnected && (finished || !shutdown_state.maintenance) {
                         let _ = outbound_control_tx
                             .send(OutboundControlEvent::DisconnectAll)
                             .await;
@@ -1087,8 +1159,28 @@ pub async fn run_main_with_transport_options(
                 }
 
                 tokio::select! {
-                    _ = &mut snapshot, if shutdown_state.requested() && active_admissions == 0 && !snapshot_finished => {
+                    result = &mut snapshot, if shutdown_state.draining && active_admissions == 0 && !snapshot_finished => {
+                        let result = result.and_then(|()| {
+                            if snapshot_is_maintenance {
+                                std::fs::rename(&snapshot_file, &recovery_file)
+                            } else {
+                                Ok(())
+                            }
+                        });
+                        if let Err(err) = result {
+                            warn!("failed to save threads during daemon shutdown: {err}");
+                            if shutdown_state.maintenance {
+                                shutdown_state.cancel_maintenance(&processor.turn_admission);
+                                snapshot = make_snapshot(recovery_file.clone());
+                                snapshot_started = false;
+                                continue;
+                            }
+                        }
                         snapshot_finished = true;
+                        shutdown_state.maintenance_deadline = None;
+                    }
+                    _ = tokio::time::sleep_until(shutdown_state.maintenance_deadline.unwrap_or_else(tokio::time::Instant::now)), if shutdown_state.maintenance_deadline.is_some() && !snapshot_finished => {
+                        // The next update abandons the handoff and reopens admission.
                     }
                     shutdown_signal_result = &mut shutdown_signal_future, if graceful_signal_restart_enabled && !shutdown_state.forced() => {
                         shutdown_signal_future.set(shutdown_signal());
@@ -1116,7 +1208,7 @@ pub async fn run_main_with_transport_options(
                         let Some(event) = event else {
                             break "transport_channel_closed";
                         };
-                        if ready_to_exit && !matches!(event, TransportEvent::DaemonShutdown) {
+                        if ready_to_exit && !shutdown_state.maintenance && !matches!(event, TransportEvent::DaemonShutdown) {
                             if let TransportEvent::ConnectionOpened { disconnect_sender: Some(token), .. } = event {
                                 token.cancel();
                             }
@@ -1567,6 +1659,7 @@ mod tests {
     #[cfg(debug_assertions)]
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
+    use tokio::sync::watch;
 
     #[test]
     fn shutdown_waits_for_admitted_requests_but_force_remains_available() {
@@ -1576,6 +1669,7 @@ mod tests {
         let mut shutdown = ShutdownState::default();
         let connection_count = 1;
         let running_turn_count = 0;
+        let (_, running) = watch::channel(running_turn_count);
         shutdown.on_signal(
             ShutdownSignal::Forceable,
             connection_count,
@@ -1583,7 +1677,7 @@ mod tests {
             &admission,
         );
         assert!(matches!(
-            shutdown.update(running_turn_count, *active.borrow(), connection_count),
+            shutdown.update(&running, *active.borrow(), connection_count, &admission),
             ShutdownAction::Noop
         ));
         shutdown.on_signal(
@@ -1594,10 +1688,80 @@ mod tests {
         );
         assert!(shutdown.forced());
         assert!(matches!(
-            shutdown.update(running_turn_count, *active.borrow(), connection_count),
+            shutdown.update(&running, *active.borrow(), connection_count, &admission),
             ShutdownAction::Finish
         ));
         drop(in_flight);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn maintenance_waits_without_closing_admission_then_commits_only_at_idle() {
+        let admission = TurnAdmission::default();
+        let (running_tx, running) = watch::channel(1);
+        let active = admission.subscribe_active();
+        let mut shutdown = ShutdownState::default();
+        for _ in 0..2 {
+            shutdown.on_signal(ShutdownSignal::GracefulOnly, 2, 1, &admission);
+            assert!(matches!(
+                shutdown.update(&running, *active.borrow(), 2, &admission),
+                ShutdownAction::Noop
+            ));
+            assert!(!shutdown.draining);
+            assert!(!shutdown.forced());
+            drop(admission.admit().expect("other clients remain admitted"));
+        }
+        // A start still preparing work must also keep maintenance out.
+        let start = admission.admit().expect("request admitted before idle");
+        running_tx.send_replace(0);
+        assert!(matches!(
+            shutdown.update(&running, *active.borrow(), 2, &admission),
+            ShutdownAction::Noop
+        ));
+        drop(start);
+        assert!(matches!(
+            shutdown.update(&running, *active.borrow(), 2, &admission),
+            ShutdownAction::Finish
+        ));
+        assert!(admission.admit().is_err());
+        assert!(shutdown.maintenance_deadline.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn maintenance_stalled_snapshot_reopens_admission_and_cancels_handoff() {
+        let admission = TurnAdmission::default();
+        let (_, running) = watch::channel(0);
+        let mut shutdown = ShutdownState::default();
+        shutdown.on_signal(ShutdownSignal::GracefulOnly, 1, 0, &admission);
+        assert!(matches!(
+            shutdown.update(&running, 0, 1, &admission),
+            ShutdownAction::Finish
+        ));
+        assert!(admission.admit().is_err());
+        // A stalled snapshot must never leave the shared server closed.
+        shutdown.maintenance_deadline = Some(tokio::time::Instant::now());
+        assert!(matches!(
+            shutdown.update(&running, 0, 1, &admission),
+            ShutdownAction::ResumeServing
+        ));
+        assert!(!shutdown.requested());
+        assert!(admission.admit().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn maintenance_request_is_not_the_first_of_two_forceable_stop_signals() {
+        let admission = TurnAdmission::default();
+        let mut shutdown = ShutdownState::default();
+        shutdown.on_signal(ShutdownSignal::GracefulOnly, 1, 1, &admission);
+        shutdown.on_signal(ShutdownSignal::Forceable, 1, 1, &admission);
+        assert!(!shutdown.forced());
+        assert!(shutdown.draining);
+        assert!(!shutdown.maintenance);
+        assert!(admission.admit().is_err());
+        shutdown.on_signal(ShutdownSignal::Forceable, 1, 1, &admission);
+        assert!(shutdown.forced());
     }
 
     #[test]

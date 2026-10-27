@@ -39,6 +39,28 @@ impl TurnAdmission {
             .closed = true;
     }
 
+    // The live running count is sampled under the admission lock. A turn must
+    // publish its running count before releasing its start permit, so an idle
+    // maintenance handoff cannot race a client or automatic turn start.
+    pub(crate) fn begin_idle_drain(&self, running: &watch::Receiver<usize>) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.active != 0 || *running.borrow() != 0 {
+            return false;
+        }
+        state.closed = true;
+        true
+    }
+
+    pub(crate) fn cancel_drain(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closed = false;
+    }
+
     pub(crate) fn subscribe_active(&self) -> watch::Receiver<usize> {
         self.active_tx.subscribe()
     }
