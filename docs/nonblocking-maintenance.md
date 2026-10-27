@@ -107,3 +107,17 @@ available host memory and preserve original evidence.
 Parent plan: https://github.com/AlterMundi/telecodex/issues/301 (milestone9).
 Continuous-voice delivery resumes after this availability repair; staged latency
 optimizations are separate and must not override it.
+
+
+## Combined release qualification
+
+The maintenance branch now includes release/interaction-0.163 through PR8
+(36995731), retaining resolved idle-resume reuse and foreground TUI notices.
+Their separate earlier passing runs do not qualify this combined executable.
+The native-maintenance workflow now runs their resolved-configuration and notice
+regressions, plus goal accounting/conditional controls, alongside the existing
+admission, managed-recovery and strict-snapshot checks on one source tree.
+Only the artifact from a passing combined run is eligible to replace the older
+maintenance-only prepared candidate. Existing preparation/rollback remains
+unchanged until that qualification succeeds; this source integration is not
+receiving installation or a permission to interrupt live threads.

@@ -59,6 +59,20 @@ jobs:
         run: |
           cargo build --locked --profile dev-small -j 2 -p codex-cli --bin codex
           target/dev-small/codex app-server daemon maintenance --help
+      - name: Preserve idle resume and foreground behavior in the combined package
+        run: |
+          cargo test --locked --profile dev-small -j 2 -p codex-core -p codex-app-server --lib resolved_resume -- --list > "$RUNNER_TEMP/resume-tests.txt"
+          grep -q 'resolved_resume_requires_full_config_and_unchanged_runtime: test' "$RUNNER_TEMP/resume-tests.txt"
+          test "$(grep -c 'resolved_resume_reuses_identical_idle_runtime_and_rebuilds_changes.*: test' "$RUNNER_TEMP/resume-tests.txt")" = 2
+          cargo test --locked --profile dev-small -j 2 --no-fail-fast -p codex-core -p codex-app-server --lib resolved_resume -- --nocapture
+          cargo test --locked --profile dev-small -j 2 -p codex-tui --lib foreground_notices -- --nocapture
+      - name: Preserve goal accounting and controls in the combined package
+        run: |
+          cargo test --locked --profile dev-small -j 2 -p codex-state --lib goals
+          cargo test --locked --profile dev-small -j 2 -p codex-goal-extension --lib
+          cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all guardian_v2::goals -- --list > "$RUNNER_TEMP/goal-tests.txt"
+          test "$(grep -c 'conditional_goal_controls_reject_stale_selection_without_recording.*: test' "$RUNNER_TEMP/goal-tests.txt")" = 2
+          cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all guardian_v2::goals -- --nocapture
       - name: Nonforcing caller and managed transport contracts
         run: |
           cargo test --locked --profile dev-small -j 2 -p codex-app-server-daemon --lib maintenance -- --nocapture
