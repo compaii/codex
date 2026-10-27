@@ -551,15 +551,18 @@ impl codex_config::ThreadConfigLoader for ResumeConfigBarrier {
 }
 
 // Actual processor/Core/rollout journey with a loopback model. No paid provider.
-#[test]
-fn resolved_resume_reuses_identical_idle_runtime_and_rebuilds_changes() -> Result<()> {
+#[test_case("legacy"; "legacy")]
+#[test_case("paginated"; "paginated")]
+fn resolved_resume_reuses_identical_idle_runtime_and_rebuilds_changes(
+    history_mode: &'static str,
+) -> Result<()> {
     super::message_processor_tracing_tests::run_current_thread_test_with_stack(
         "resolved-resume",
-        async { Box::pin(resolved_resume_journey()).await },
+        async move { Box::pin(resolved_resume_journey(history_mode)).await },
     )
 }
 
-async fn resolved_resume_journey() -> Result<()> {
+async fn resolved_resume_journey(history_mode: &str) -> Result<()> {
     let server = app_test_support::create_mock_responses_server_repeating_assistant("Done").await;
     let home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri())
@@ -572,12 +575,14 @@ async fn resolved_resume_journey() -> Result<()> {
             .await?,
     );
     let auth = AuthManager::shared_from_config(config.as_ref(), false).await?;
+    let state_db = codex_rollout::state_db::try_init(config.as_ref()).await?;
     let barrier = Arc::new(ResumeConfigBarrier::default());
     let (processor, mut outgoing) =
         super::message_processor_tracing_tests::build_test_processor_with_thread_config_loader(
             config,
             auth,
             barrier.clone(),
+            Some(state_db),
         )
         .await;
     let first_id = ConnectionId(41);
@@ -589,9 +594,10 @@ async fn resolved_resume_journey() -> Result<()> {
         let _: InitializeResponse = read_response_from(&mut outgoing, first_id, 1).await;
         processor.connection_initialized(first_id, first.request_attestation()).await;
         send_request(&processor, first_id, &first, json!({"id":2,"method":"thread/start","params":{
-            "config":{"web_search":"disabled"}
+            "config":{"web_search":"disabled"},"historyMode":history_mode
         }})).await;
         let started: ThreadStartResponse = read_response_from(&mut outgoing, first_id, 2).await;
+        assert_eq!(serde_json::to_value(&started.thread.history_mode)?, json!(history_mode));
         let id = codex_protocol::ThreadId::from_string(&started.thread.id)?;
         send_request(&processor, first_id, &first, json!({"id":3,"method":"turn/start","params":{
             "threadId":started.thread.id,"input":[{"type":"text","text":"materialize once","text_elements":[]}]
@@ -637,6 +643,7 @@ async fn resolved_resume_journey() -> Result<()> {
             "threadId":started.thread.id,"excludeTurns":false,"config":{"web_search":"live"}
         }})).await;
         let resumed: codex_app_server_protocol::ThreadResumeResponse = read_response_from(&mut outgoing, third_id, 7).await;
+        assert_eq!(serde_json::to_value(&resumed.thread.history_mode)?, json!(history_mode));
         let changed = processor.thread_processor.thread_manager.get_thread(id).await?;
         assert!(!Arc::ptr_eq(&original, &changed));
         assert_eq!(resumed.thread.turns.len(), 1, "rebuild retains the original materialized turn");

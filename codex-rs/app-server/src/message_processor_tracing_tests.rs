@@ -246,6 +246,7 @@ pub(super) async fn build_test_processor(
         config,
         auth_manager,
         Arc::new(codex_config::NoopThreadConfigLoader),
+        None,
     )
     .await
 }
@@ -254,6 +255,7 @@ pub(super) async fn build_test_processor_with_thread_config_loader(
     config: Arc<Config>,
     auth_manager: Arc<AuthManager>,
     loader: Arc<dyn codex_config::ThreadConfigLoader>,
+    state_db: Option<codex_rollout::state_db::StateDbHandle>,
 ) -> (
     Arc<MessageProcessor>,
     mpsc::Receiver<crate::outgoing_message::OutgoingEnvelope>,
@@ -285,7 +287,7 @@ pub(super) async fn build_test_processor_with_thread_config_loader(
         environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
         feedback: CodexFeedback::new(),
         log_db: None,
-        state_db: None,
+        state_db,
         config_warnings: Vec::new(),
         session_source: SessionSource::VSCode,
         user_verification: Arc::new(crate::user_verification::Service::new(Arc::clone(
