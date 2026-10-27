@@ -472,7 +472,7 @@ impl Session {
             permit
         } else {
             let is_spawned_child = matches!(
-                self.state.lock().await.session_configuration.session_source,
+                self.thread_config_snapshot().await.session_source,
                 codex_protocol::protocol::SessionSource::SubAgent(
                     codex_protocol::protocol::SubAgentSource::ThreadSpawn { .. }
                 )
