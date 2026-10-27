@@ -50,8 +50,26 @@ not process exit or installation. A lost/expired response is unconfirmed. Never 
 an uncertain result. A fixed lease begins at socket receipt; enqueueing is bounded, and the receiver
 rejects expired or abandoned requests before arming maintenance. Queue delay can
 never create a fresh pending window after the observer expires. Preserve the exact snapshot and all
-uncertain originals. Package selection/restart is a separate operation only after
-confirmed old-process exit, using the supported complete local-package route.
+uncertain originals. Initial pinned local-package selection/restart is a separate
+operation only after confirmed old-process exit, using the supported complete
+local-package route.
+
+Scheduled automatic updates prepare/select the available complete package through
+the existing installer, but adopt it in the running daemon only after nonblocking
+maintenance and observed exit of the retained process generation. The updater
+releases the shared operation lock before waiting. Unsupported, deferred, lost or
+handoff-ready-without-exit outcomes leave the running process alone and return to
+the ordinary update schedule, without force or a tight retry loop. After exit it
+reacquires the lock and revalidates the selected package and absence of another
+receiver before starting a replacement; it preserves the recovery snapshot.
+After `handoffReady`, a private atomic journal retains the exact process,
+selected package and snapshot identity across bounded exit observations, lock
+contention and updater re-exec. Later scheduled passes resume that continuation
+without sending another maintenance request. Accepted handoffs use the existing
+updater loop at a one-second continuation cadence, before installer/updater
+adoption; pre-handoff deferral retains the ordinary update interval. Explicit Stop retires both recovery
+and the journal; changed/consumed recovery cancels automatic replacement.
+Explicit manual update, Stop and Restart retain their separate semantics.
 
 For the initial older receiver, retain a deployment gap until a supported safe
 handoff actually exists. Do not substitute a global pause or destructive shutdown.

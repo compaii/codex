@@ -203,6 +203,7 @@ pub struct RemoteControlOutput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RestartIfRunningOutcome {
     Busy,
+    Deferred,
     NotRunning,
     NotReady,
     AlreadyCurrent,
@@ -529,6 +530,7 @@ impl Daemon {
         &self,
         mode: RestartMode,
         managed_codex_bin: &Path,
+        nonblocking: bool,
     ) -> Result<RestartIfRunningOutcome> {
         let operation_lock = self.open_operation_lock_file().await?;
         if !try_lock_file(&operation_lock)? {
@@ -573,6 +575,17 @@ impl Daemon {
                 }
                 RestartDecision::AlreadyCurrent => RestartIfRunningOutcome::AlreadyCurrent,
                 RestartDecision::Restart => {
+                    if nonblocking {
+                        let Some(process) = backend.running_process().await? else {
+                            return Ok(RestartIfRunningOutcome::Deferred);
+                        };
+                        // A maintenance lease must never hold the shared CLI
+                        // operation lock while unrelated work is still running.
+                        drop(operation_lock);
+                        return self
+                            .restart_after_maintenance(process, managed_codex_bin)
+                            .await;
+                    }
                     #[cfg(windows)]
                     backend::windows::ensure_detached_launch(managed_codex_bin)?;
                     if let Err(err) = thread_recovery::discard_pending(self) {
@@ -625,6 +638,92 @@ impl Daemon {
             return Ok(RestartIfRunningOutcome::AlreadyCurrent);
         }
         Ok(outcome)
+    }
+
+    async fn restart_after_maintenance(
+        &self,
+        process: backend::RunningProcess,
+        managed_codex_bin: &Path,
+    ) -> Result<RestartIfRunningOutcome> {
+        let outcome =
+            match client::request_maintenance_for_process(&self.socket_path, process.pid()).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    diagnostics::event("maintenance_deferred", error.to_string());
+                    return Ok(RestartIfRunningOutcome::Deferred);
+                }
+            };
+        if outcome.outcome != "handoffReady" {
+            diagnostics::event("maintenance_deferred", outcome.outcome);
+            return Ok(RestartIfRunningOutcome::Deferred);
+        }
+        let recovery = self.recovery_file()?;
+        // Stop removes the snapshot. Never turn its absence into a cold start.
+        let Ok(metadata) = tokio::fs::metadata(&recovery).await else {
+            return Ok(RestartIfRunningOutcome::Deferred);
+        };
+        let pending = thread_recovery::PendingMaintenance {
+            process,
+            managed_bin: managed_codex_bin.to_path_buf(),
+            snapshot_identity: managed_install::executable_identity(&recovery).await?,
+            snapshot_modified: metadata.modified()?,
+        };
+        thread_recovery::save_maintenance(self, &pending)?;
+        Ok(self
+            .continue_pending_maintenance()
+            .await?
+            .unwrap_or(RestartIfRunningOutcome::Deferred))
+    }
+
+    async fn continue_pending_maintenance(&self) -> Result<Option<RestartIfRunningOutcome>> {
+        let Some(pending) = thread_recovery::load_maintenance(self)? else {
+            return Ok(None);
+        };
+        // A saved handoff is not proof of exit. Retain the exact continuation
+        // across bounded observations, updater re-exec and shared-lock contention.
+        let exited = tokio::time::timeout(Duration::from_secs(3), async {
+            while pending.process.is_active().await? {
+                sleep(Duration::from_millis(25)).await;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        if !matches!(exited, Ok(Ok(()))) {
+            return Ok(Some(RestartIfRunningOutcome::Deferred));
+        }
+        let operation_lock = self.open_operation_lock_file().await?;
+        if !try_lock_file(&operation_lock)? {
+            return Ok(Some(RestartIfRunningOutcome::Deferred));
+        }
+        let recovery = self.recovery_file()?;
+        let same_snapshot = match tokio::fs::metadata(&recovery).await {
+            Ok(metadata) if metadata.modified()? == pending.snapshot_modified => {
+                managed_install::executable_identity(&recovery).await? == pending.snapshot_identity
+            }
+            _ => false,
+        };
+        // Explicit Stop or another receiver consumes/replaces this handoff.
+        if !same_snapshot
+            || !self.is_stable_standalone_release()?
+            || managed_install::resolved_managed_codex_bin(&self.current_managed_codex_bin()?)
+                .await?
+                != pending.managed_bin
+        {
+            thread_recovery::discard_maintenance(self)?;
+            return Ok(Some(RestartIfRunningOutcome::Deferred));
+        }
+        let settings = self.load_settings().await?;
+        if self.running_backend_instance(&settings).await?.is_some()
+            || client::probe(&self.socket_path).await.is_ok()
+        {
+            thread_recovery::discard_maintenance(self)?;
+            return Ok(Some(RestartIfRunningOutcome::Deferred));
+        }
+        self.start_managed_backend_with_bin(&settings, &pending.managed_bin)
+            .await?;
+        self.wait_until_ready().await?;
+        thread_recovery::discard_maintenance(self)?;
+        Ok(Some(RestartIfRunningOutcome::Restarted))
     }
 
     async fn stop(&self) -> Result<LifecycleOutput> {

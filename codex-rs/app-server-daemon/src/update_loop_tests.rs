@@ -668,29 +668,145 @@ async fn unsupported_request_preserves_updater_schedule() {
 }
 
 #[cfg(unix)]
+#[derive(Clone)]
+struct TestMaintenance {
+    pid: u32,
+    outcome: &'static str,
+    lock_released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(unix)]
 async fn test_control_server(
     daemon: &Daemon,
     home: &std::path::Path,
 ) -> tokio::task::JoinHandle<()> {
+    test_control_server_with_maintenance(daemon, home, None).await
+}
+
+#[cfg(unix)]
+async fn test_control_server_with_maintenance(
+    daemon: &Daemon,
+    home: &std::path::Path,
+    maintenance: Option<TestMaintenance>,
+) -> tokio::task::JoinHandle<()> {
     use futures::SinkExt;
     use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
     std::fs::create_dir_all(daemon.socket_path.parent().expect("socket parent"))
         .expect("socket directory");
-    let mut listener = codex_uds::UnixListener::bind(&daemon.socket_path)
+    let socket_path = daemon.socket_path.clone();
+    let operation_lock = daemon.operation_lock_file.clone();
+    let pid_file = daemon.pid_file.clone();
+    let mut listener = codex_uds::UnixListener::bind(&socket_path)
         .await
         .expect("control listener");
     let codex_home = home.to_path_buf();
     tokio::spawn(async move {
         loop {
             let connection = listener.accept().await.expect("control connection");
-            let mut websocket = tokio_tungstenite::accept_async(connection)
-                .await
-                .expect("websocket handshake");
-            websocket
-                .next()
-                .await
-                .expect("initialize request")
-                .expect("frame");
+            let mut is_maintenance = false;
+            let mut websocket = tokio_tungstenite::accept_hdr_async(connection,
+                |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                 mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    is_maintenance = request.uri().path() == "/daemon/maintenance";
+                    if is_maintenance
+                        && let Some(test) = &maintenance
+                        && test.outcome != "unsupported"
+                    {
+                        response.headers_mut().insert(
+                            codex_app_server_transport::DAEMON_MAINTENANCE_CAPABILITY_HEADER,
+                            format!("v1:{}", test.pid).parse().unwrap(),
+                        );
+                    }
+                    Ok(response)
+                }).await.expect("websocket handshake");
+            if is_maintenance && let Some(test) = &maintenance {
+                test.requests
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let lock = tokio::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&operation_lock)
+                    .await
+                    .expect("existing operation lock");
+                test.lock_released.store(
+                    crate::try_lock_file(&lock).unwrap(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                drop(lock);
+            }
+            let Some(Ok(Message::Text(request))) = websocket.next().await else {
+                continue; // An older-receiver refusal sends no lifecycle frame.
+            };
+            if is_maintenance {
+                let test = maintenance.as_ref().expect("test maintenance contract");
+                assert_eq!(request.as_str(), test.pid.to_string());
+                if test.outcome == "missing" {
+                    continue; // A lost response must not trigger a force/retry.
+                }
+                let exiting = matches!(test.outcome, "exit" | "lateExit" | "busyExit" | "stopped");
+                let outcome = if exiting {
+                    "handoffReady"
+                } else {
+                    test.outcome
+                };
+                if outcome == "handoffReady" {
+                    codex_app_server_transport::daemon_recovery::write_candidates(
+                        &codex_app_server_transport::daemon_recovery_file_path(&codex_home),
+                        &std::collections::BTreeSet::new(),
+                    )
+                    .unwrap();
+                }
+                if exiting {
+                    let marker = codex_home.join(format!("exit-{}", test.pid));
+                    if test.outcome == "exit" {
+                        std::fs::write(marker, b"exit").unwrap();
+                    } else {
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_secs(4)).await;
+                            std::fs::write(marker, b"exit").unwrap();
+                        });
+                    }
+                }
+                websocket
+                    .send(Message::Text(
+                        serde_json::json!({
+                            "pid":test.pid,"outcome":outcome
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                if exiting {
+                    drop(websocket);
+                    drop(listener);
+                    std::fs::remove_file(&socket_path).unwrap();
+                    if test.outcome == "stopped" {
+                        return;
+                    }
+                    // Only a genuinely new process generation may provide readiness.
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            let next = std::fs::read(&pid_file)
+                                .ok()
+                                .and_then(|bytes| {
+                                    serde_json::from_slice::<serde_json::Value>(&bytes).ok()
+                                })
+                                .and_then(|value| value["pid"].as_u64());
+                            if next.is_some_and(|pid| pid != u64::from(test.pid)) {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("replacement process did not start");
+                    listener = codex_uds::UnixListener::bind(&socket_path).await.unwrap();
+                }
+                continue;
+            }
             let version = if std::fs::read_to_string(
                 crate::managed_install::package_root(&codex_home).join("auto-update-version"),
             )
@@ -701,7 +817,7 @@ async fn test_control_server(
             } else {
                 "1.0.0"
             };
-            websocket.send(tokio_tungstenite::tungstenite::Message::Text(
+            websocket.send(Message::Text(
                 serde_json::json!({"id": 1, "result": {
                     "userAgent": format!("codex_app_server_daemon/{version}"),
                     "codexHome": codex_home, "platformFamily": "unix", "platformOs": std::env::consts::OS,
@@ -757,17 +873,42 @@ async fn scheduled_no_op_preserves_daemon_and_hands_off_stale_updater() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn scheduled_resource_only_update_restarts_daemon() {
-    let home = TempDir::new().expect("home");
-    let (daemon, release) = manual_update_daemon(&home);
-    let settings = crate::settings::DaemonSettings::default();
-    let backend = crate::backend::pid_backend(daemon.backend_paths(&settings));
-    backend.start().await.expect("start daemon");
-    let server = test_control_server(&daemon, home.path()).await;
-    let previous_pid_record = std::fs::read(&daemon.pid_file).expect("daemon PID record");
-    let root = home.path().join("packages/standalone");
-    let next_release = release.replacen("1.0.0", "1.0.1", 1);
-    let installer = FakeInstallerHttp::new(InstallerResponse::Success(
+async fn scheduled_maintenance_keeps_work_and_restarts_only_after_observed_exit() {
+    for mode in [
+        "unsupported",
+        "deferred",
+        "missing",
+        "handoffReady",
+        "exit",
+        "lateExit",
+        "busyExit",
+        "stopped",
+    ] {
+        let home = TempDir::new().expect("home");
+        let (daemon, release) = manual_update_daemon(&home);
+        if matches!(mode, "exit" | "lateExit" | "busyExit" | "stopped") {
+            let script = format!(
+                "#!/bin/sh\nif [ \"$1\" = '--version' ]; then echo codex 1.0.0; elif [ \"$3\" = '--help' ]; then exit 0; else while [ ! -f '{}/exit-'$$ ]; do sleep 0.05; done; fi\n",
+                home.path().display(),
+            );
+            codex_utils_cargo_bin::write_executable(&daemon.managed_codex_bin, &script).unwrap();
+        }
+        let settings = crate::settings::DaemonSettings::default();
+        let backend = crate::backend::pid_backend(daemon.backend_paths(&settings));
+        backend.start().await.expect("start daemon");
+        let process = backend.running_process().await.unwrap().unwrap();
+        let test = TestMaintenance {
+            pid: process.pid(),
+            outcome: mode,
+            lock_released: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            requests: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let server =
+            test_control_server_with_maintenance(&daemon, home.path(), Some(test.clone())).await;
+        let previous_pid_record = std::fs::read(&daemon.pid_file).expect("daemon PID record");
+        let root = home.path().join("packages/standalone");
+        let next_release = release.replacen("1.0.0", "1.0.1", 1);
+        let installer = FakeInstallerHttp::new(InstallerResponse::Success(
         format!(
             "#!/bin/sh\n# CODEX_INSTALL_IF_LATEST\nmkdir -p '{root}/releases/{next_release}'\ncp '{root}/releases/{release}/codex' '{root}/releases/{next_release}/codex'\nln -sfn 'releases/{next_release}' '{root}/current'\nprintf '{next_release}' > '{root}/auto-update-version'\n",
             root = root.display(),
@@ -775,31 +916,102 @@ async fn scheduled_resource_only_update_restarts_daemon() {
         .into_bytes(),
     ));
 
-    let outcome = super::update_once(
-        &installer,
-        &daemon,
-        &executable_identity(&daemon.managed_codex_bin)
-            .await
-            .expect("updater identity"),
-        &mut test_terminate(),
-        super::UpdateTrigger::Scheduled,
-    )
-    .await
-    .expect("scheduled update");
-
-    assert!(matches!(
-        outcome,
-        (
-            super::UpdateLoopControl::Continue,
-            Some(RestartIfRunningOutcome::Restarted)
+        let outcome = super::update_once(
+            &installer,
+            &daemon,
+            &executable_identity(&daemon.managed_codex_bin)
+                .await
+                .expect("updater identity"),
+            &mut test_terminate(),
+            super::UpdateTrigger::Scheduled,
         )
-    ));
-    assert_ne!(
-        std::fs::read(&daemon.pid_file).expect("daemon PID record"),
-        previous_pid_record
-    );
-    backend.stop().await.expect("stop daemon");
-    server.abort();
+        .await
+        .expect("scheduled update");
+
+        let expected = if mode == "exit" {
+            RestartIfRunningOutcome::Restarted
+        } else {
+            RestartIfRunningOutcome::Deferred
+        };
+        assert!(
+            matches!(outcome, (super::UpdateLoopControl::Continue, Some(value)) if value == expected)
+        );
+        assert!(
+            test.lock_released.load(std::sync::atomic::Ordering::SeqCst),
+            "maintenance held operation lock"
+        );
+        assert_eq!(
+            test.requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "deferred maintenance retried"
+        );
+        if mode == "busyExit" {
+            let lock = daemon.open_operation_lock_file().await.unwrap();
+            assert!(crate::try_lock_file(&lock).unwrap());
+            assert_eq!(
+                daemon.continue_pending_maintenance().await.unwrap(),
+                Some(RestartIfRunningOutcome::Deferred)
+            );
+            drop(lock);
+        }
+        if mode == "lateExit" {
+            // Exercise actual updater recovery/scheduling, not a direct helper
+            // call: a retained handoff must resume before the default interval.
+            let current_identity =
+                executable_identity(&daemon.current_managed_codex_bin().unwrap())
+                    .await
+                    .unwrap();
+            let impossible_installer =
+                FakeInstallerHttp::new(InstallerResponse::Success(b"exit 99".to_vec()));
+            let updater =
+                super::run_with_http(&impossible_installer, &daemon, &current_identity, None);
+            tokio::pin!(updater);
+            tokio::select! {
+                result = &mut updater => panic!("updater exited during continuation: {result:?}"),
+                () = async {
+                    loop {
+                        if std::fs::read(&daemon.pid_file).is_ok_and(|bytes| bytes != previous_pid_record) {
+                            // Wait for readiness and durable journal retirement.
+                            if crate::thread_recovery::load_maintenance(&daemon).unwrap().is_none() { break; }
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                } => {}
+                () = tokio::time::sleep(Duration::from_secs(4)) => panic!("accepted handoff waited for ordinary update interval"),
+            }
+            assert!(impossible_installer.requested_urls().is_empty());
+            assert_eq!(test.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        } else if mode == "busyExit" {
+            assert_eq!(
+                daemon.continue_pending_maintenance().await.unwrap(),
+                Some(RestartIfRunningOutcome::Restarted)
+            );
+        } else if mode == "stopped" {
+            // Explicit Stop retires recovery even while this updater has a
+            // retained exact-process continuation. It must not cold-start later.
+            crate::thread_recovery::discard_pending(&daemon).unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(daemon.continue_pending_maintenance().await.unwrap(), None);
+            assert!(!process.is_active().await.unwrap());
+        } else if mode == "handoffReady" {
+            assert_eq!(
+                daemon.continue_pending_maintenance().await.unwrap(),
+                Some(RestartIfRunningOutcome::Deferred)
+            );
+            assert_eq!(test.requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+        let current = std::fs::read(&daemon.pid_file).expect("daemon PID record");
+        if matches!(mode, "exit" | "lateExit" | "busyExit") {
+            assert_ne!(current, previous_pid_record);
+        } else {
+            assert_eq!(current, previous_pid_record);
+            if mode != "stopped" {
+                assert!(process.is_active().await.unwrap());
+            }
+        }
+        backend.stop().await.expect("stop daemon");
+        server.abort();
+    }
 }
 
 #[cfg(unix)]

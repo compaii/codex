@@ -212,9 +212,24 @@ pub(crate) async fn request_maintenance(socket_path: &Path) -> Result<crate::Mai
     request_maintenance_with_timeout(socket_path, Duration::from_secs(133)).await
 }
 
+pub(crate) async fn request_maintenance_for_process(
+    socket_path: &Path,
+    expected_pid: u32,
+) -> Result<crate::MaintenanceOutput> {
+    request_maintenance_inner(socket_path, Duration::from_secs(133), Some(expected_pid)).await
+}
+
 async fn request_maintenance_with_timeout(
     socket_path: &Path,
     limit: Duration,
+) -> Result<crate::MaintenanceOutput> {
+    request_maintenance_inner(socket_path, limit, None).await
+}
+
+async fn request_maintenance_inner(
+    socket_path: &Path,
+    limit: Duration,
+    expected_pid: Option<u32>,
 ) -> Result<crate::MaintenanceOutput> {
     timeout(limit, async {
         let stream = UnixStream::connect(socket_path).await?;
@@ -232,6 +247,10 @@ async fn request_maintenance_with_timeout(
         let pid: u32 = capability
             .parse()
             .context("invalid maintenance receiver identity")?;
+        anyhow::ensure!(
+            expected_pid.is_none_or(|expected| expected == pid),
+            "maintenance receiver changed; no request was sent"
+        );
         websocket
             .send(Message::Text(pid.to_string().into()))
             .await?;
@@ -276,6 +295,33 @@ mod maintenance_tests {
         });
         let error = request_maintenance(&path).await.unwrap_err();
         assert!(error.to_string().contains("no request was sent"));
+        server.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn maintenance_refuses_changed_process_before_sending_any_request() -> Result<()> {
+        let home = tempfile::TempDir::new()?;
+        let path = home.path().join("server.sock");
+        let listener = tokio::net::UnixListener::bind(&path)?;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_hdr_async(stream,
+                |_request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                 mut response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    response.headers_mut().insert(codex_app_server_transport::DAEMON_MAINTENANCE_CAPABILITY_HEADER, "v1:43".parse().unwrap());
+                    Ok(response)
+                }).await.unwrap();
+            assert!(!matches!(ws.next().await, Some(Ok(Message::Text(_)))));
+        });
+        let error = request_maintenance_for_process(&path, 42)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("receiver changed; no request was sent")
+        );
         server.await?;
         Ok(())
     }

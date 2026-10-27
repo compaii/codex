@@ -58,6 +58,8 @@ jobs:
       - name: Nonforcing caller and managed transport contracts
         run: |
           cargo test --locked --profile dev-small -j 2 -p codex-app-server-daemon --lib maintenance -- --nocapture
+          cargo test --locked --profile dev-small -j 2 -p codex-app-server-daemon --lib scheduled_no_op -- --nocapture
+          cargo test --locked --profile dev-small -j 2 -p codex-app-server-daemon --lib manual_update_restarts -- --nocapture
           cargo test --locked --profile dev-small -j 2 -p codex-app-server-transport --lib maintenance -- --nocapture
       - name: Admission, maintenance timeout and explicit shutdown contracts
         run: |
@@ -68,13 +70,14 @@ jobs:
         run: |
           cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all connection_handling_websocket_unix -- --nocapture
           cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all daemon_update_recovery -- --nocapture
+      - name: Build the CLI required by Core remote-session fixtures
+        run: cargo build --locked --profile dev-small -j 2 -p codex-cli --bin codex
       - name: Core input and automatic-start admission contracts
         run: |
           cargo test --locked --profile dev-small -j 2 -p codex-core --lib session::input_queue -- --nocapture
           cargo test --locked --profile dev-small -j 2 -p codex-core --test all turn_input_submission -- --nocapture
       - name: Build the exact native package
         run: |
-          cargo build --locked --profile dev-small -j 2 -p codex-cli --bin codex
           cargo build --locked --profile dev-small -j 2 -p codex-code-mode-host --bin codex-code-mode-host
           target/dev-small/codex --version
           sha256sum target/dev-small/codex target/dev-small/codex-code-mode-host
