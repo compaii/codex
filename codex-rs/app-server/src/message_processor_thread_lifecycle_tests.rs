@@ -556,9 +556,15 @@ impl codex_config::ThreadConfigLoader for ResumeConfigBarrier {
 fn resolved_resume_reuses_identical_idle_runtime_and_rebuilds_changes(
     history_mode: &'static str,
 ) -> Result<()> {
-    super::message_processor_tracing_tests::run_current_thread_test_with_stack(
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter("codex_core::session::resume_equivalence=debug")
+        .with_test_writer()
+        .finish();
+    super::message_processor_tracing_tests::run_current_thread_test_with_stack_and_dispatch(
         "resolved-resume",
         async move { Box::pin(resolved_resume_journey(history_mode)).await },
+        Some(tracing::Dispatch::new(subscriber)),
     )
 }
 

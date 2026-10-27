@@ -2232,7 +2232,7 @@ impl Session {
         // Opaque host data still has no known equivalence.
         // A basic guardian can skip restrictions only on fresh startup. Cold
         // resume intentionally re-evaluates those history-dependent restrictions.
-        !initial.trusted_guardian_reviewer
+        let reusable = !initial.trusted_guardian_reviewer
             && !current.trusted_guardian_reviewer
             && candidate == input.as_ref()
             && current.original_config_do_not_use == initial.original_config_do_not_use
@@ -2251,7 +2251,33 @@ impl Session {
             && initial.windows_sandbox_level == current.windows_sandbox_level
             && initial.windows_sandbox_type == current.windows_sandbox_type
             && initial.base_instructions == current.base_instructions
-            && initial.developer_instructions == current.developer_instructions
+            && initial.developer_instructions == current.developer_instructions;
+        if !reusable {
+            // Values may contain private credentials or paths. Diagnose only
+            // equality categories, never the configurations themselves.
+            tracing::debug!(
+                target: "codex_core::session::resume_equivalence",
+                input_equal = candidate == input.as_ref(),
+                runtime_config_equal = current.original_config_do_not_use == initial.original_config_do_not_use,
+                settings_equal = initial.thread_settings_snapshot(&initial.environments) == current.thread_settings_snapshot(&current.environments),
+                environments_equal = initial.environments == current.environments,
+                permissions_equal = initial.permission_profile() == current.permission_profile(),
+                roots_equal = initial.permission_profile_state.profile_workspace_roots() == current.permission_profile_state.profile_workspace_roots(),
+                opaque_empty = initial.turn_extension_init.is_empty() && current.turn_extension_init.is_empty(),
+                trusted_guardian = initial.trusted_guardian_reviewer || current.trusted_guardian_reviewer,
+                input_layers_equal = candidate.config_layer_stack == input.config_layer_stack,
+                input_permissions_equal = candidate.permissions == input.permissions,
+                input_roots_equal = candidate.workspace_roots == input.workspace_roots && candidate.cwd == input.cwd,
+                input_model_equal = candidate.model == input.model && candidate.model_reasoning_effort == input.model_reasoning_effort,
+                input_provider_equal = candidate.model_provider == input.model_provider && candidate.model_provider_id == input.model_provider_id,
+                input_features_equal = candidate.features == input.features,
+                input_budget_equal = candidate.token_budget == input.token_budget && candidate.token_budget_startup_config == input.token_budget_startup_config,
+                input_auth_route_equal = candidate.application_auth_route_config == input.application_auth_route_config,
+                input_network_policy_equal = candidate.application_network_policy == input.application_network_policy,
+                "idle resume requires cold reconstruction"
+            );
+        }
+        reusable
     }
 
     pub(crate) async fn get_config(&self) -> std::sync::Arc<Config> {

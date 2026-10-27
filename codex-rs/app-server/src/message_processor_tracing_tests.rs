@@ -307,6 +307,17 @@ pub(super) fn run_current_thread_test_with_stack<F>(name: &str, future: F) -> Re
 where
     F: Future<Output = Result<()>> + Send + 'static,
 {
+    run_current_thread_test_with_stack_and_dispatch(name, future, None)
+}
+
+pub(super) fn run_current_thread_test_with_stack_and_dispatch<F>(
+    name: &str,
+    future: F,
+    dispatch: Option<tracing::Dispatch>,
+) -> Result<()>
+where
+    F: Future<Output = Result<()>> + Send + 'static,
+{
     const TEST_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
 
     let handle = std::thread::Builder::new()
@@ -316,7 +327,14 @@ where
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            runtime.block_on(Box::pin(future))
+            match dispatch {
+                // Scope the dispatcher to this dedicated thread, including tasks
+                // spawned on its current-thread runtime. Never replace globals.
+                Some(dispatch) => tracing::dispatcher::with_default(&dispatch, || {
+                    runtime.block_on(Box::pin(future))
+                }),
+                None => runtime.block_on(Box::pin(future)),
+            }
         })?;
 
     match handle.join() {
