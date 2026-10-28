@@ -178,6 +178,12 @@ impl FromStr for AppServerTransport {
 pub enum TransportEvent {
     /// Accepted on the managed local control socket, outside JSON-RPC.
     DaemonShutdown,
+    /// Nonforcing, bounded maintenance on the managed local control socket.
+    DaemonMaintenance {
+        expires_at: tokio::time::Instant,
+        reply: tokio::sync::oneshot::Sender<&'static str>,
+        flushed: tokio::sync::oneshot::Receiver<()>,
+    },
     ConnectionOpened {
         connection_id: ConnectionId,
         origin: ConnectionOrigin,

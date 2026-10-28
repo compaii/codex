@@ -56,6 +56,20 @@ struct PidRecord {
     executable_identity: Option<ExecutableIdentity>,
 }
 
+/// A retained process generation, independent of later PID-file replacement.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct RunningProcess(PidRecord);
+
+impl RunningProcess {
+    pub(crate) fn pid(&self) -> u32 {
+        self.0.pid
+    }
+
+    pub(crate) async fn is_active(&self) -> Result<bool> {
+        process_matches_record(&self.0).await
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PidLogTail {
     pub(crate) path: PathBuf,
@@ -90,6 +104,15 @@ enum PidCommandKind {
 }
 
 impl PidBackend {
+    pub(crate) async fn running_process(&self) -> Result<Option<RunningProcess>> {
+        match self.read_pid_file_state().await? {
+            PidFileState::Running(record) if self.record_is_active(&record).await? => {
+                Ok(Some(RunningProcess(record)))
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub(crate) async fn running_executable_identity(&self) -> Result<Option<ExecutableIdentity>> {
         match self.read_pid_file_state().await? {
             PidFileState::Running(record) if self.record_is_active(&record).await? => {

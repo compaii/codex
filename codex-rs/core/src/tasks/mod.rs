@@ -290,6 +290,7 @@ impl Session {
         input: Vec<TurnInput>,
         task: T,
     ) {
+        let host_running_guard = self.services.extensions.track_running_turn();
         self.activate_plugin_selection(&turn_context).await;
         // Inherited or recovered roots are applied before task start. Otherwise this
         // task owns its turn, including background work. Later mail cannot change it.
@@ -368,7 +369,9 @@ impl Session {
             codex.turn.token_usage.total_tokens = field::Empty,
         );
         let storage_originator = AuthStorageOriginator::from_client_name(&turn_context.originator);
+        let future_running_guard = Arc::clone(&host_running_guard);
         let task_future = async move {
+            let _host_running_guard = future_running_guard;
             let ctx_for_finish = Arc::clone(&ctx);
             let task_result = task_for_run
                 .run(
@@ -412,6 +415,7 @@ impl Session {
             .start_timer(TURN_E2E_DURATION_METRIC, &[])
             .ok();
         let running_task = RunningTask {
+            _host_running_guard: host_running_guard,
             done,
             handle: AbortOnDropHandle::new(handle),
             kind: task_kind,
@@ -462,6 +466,29 @@ impl Session {
             return;
         }
 
+        let ordinary = self.services.extensions.admit_turn_start();
+        let mut delegated_parent = None;
+        let _admission = if let Some(permit) = ordinary {
+            permit
+        } else {
+            let is_spawned_child = matches!(
+                self.thread_config_snapshot().await.session_source,
+                codex_protocol::protocol::SessionSource::SubAgent(
+                    codex_protocol::protocol::SubAgentSource::ThreadSpawn { .. }
+                )
+            );
+            if !is_spawned_child {
+                return;
+            }
+            delegated_parent = self.input_queue.pending_delegated_parent().await;
+            if delegated_parent.is_none() {
+                return;
+            }
+            let Some(permit) = self.services.extensions.admit_delegated_turn_start() else {
+                return;
+            };
+            permit
+        };
         let Some((turn_state, previous_options)) = self.reserve_pending_work_turn().await else {
             return;
         };
@@ -480,8 +507,14 @@ impl Session {
         {
             return;
         }
-        let (input, mut start_options) =
-            self.input_queue.get_pending_input(&self.active_turn).await;
+        let Some((input, mut start_options)) = self
+            .input_queue
+            .get_pending_input_for_parent(&self.active_turn, delegated_parent.as_deref())
+            .await
+        else {
+            self.clear_reserved_idle_turn(&turn_state).await;
+            return;
+        };
         if !input.iter().any(
             |item| matches!(item, TurnInput::InterAgentCommunication(mail) if mail.trigger_turn),
         ) {

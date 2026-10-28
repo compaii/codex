@@ -37,6 +37,8 @@ const MAX_UNFRAGMENTED_MESSAGE_BYTES_HEADER: &str =
 #[derive(Clone, Copy)]
 pub enum DaemonShutdownAccess {
     Disabled,
+    /// A managed receiver with nonblocking maintenance, without socket shutdown.
+    MaintenanceOnly,
     Managed,
 }
 
@@ -165,6 +167,7 @@ async fn run_control_socket_acceptor(
         let transport_event_tx = transport_event_tx.clone();
         tokio::spawn(async move {
             let mut shutdown_request = false;
+            let mut maintenance_request = false;
             let websocket_config = WebSocketConfig::default();
             let max_unfragmented_message_bytes = [
                 websocket_config.max_frame_size,
@@ -177,6 +180,19 @@ async fn run_control_socket_acceptor(
                 stream,
                 |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
                  mut response: HandshakeResponse| {
+                    if request.uri().path() == "/daemon/maintenance" {
+                        if matches!(daemon_shutdown_access, DaemonShutdownAccess::Disabled) {
+                            let mut rejection = Response::new(Some("unmanaged server".to_string()));
+                            *rejection.status_mut() = StatusCode::FORBIDDEN;
+                            return Err(rejection);
+                        }
+                        maintenance_request = true;
+                        response.headers_mut().insert(
+                            crate::DAEMON_MAINTENANCE_CAPABILITY_HEADER,
+                            HeaderValue::from_str(&format!("v1:{}", std::process::id()))
+                                .expect("process id header"),
+                        );
+                    }
                     if request.uri().path() == "/daemon/shutdown" {
                         if !matches!(daemon_shutdown_access, DaemonShutdownAccess::Managed) {
                             let mut rejection = Response::new(Some("unmanaged server".to_string()));
@@ -203,6 +219,10 @@ async fn run_control_socket_acceptor(
                     return;
                 }
             };
+            if maintenance_request {
+                run_daemon_maintenance(websocket_stream, transport_event_tx).await;
+                return;
+            }
             if shutdown_request {
                 run_daemon_shutdown(websocket_stream, transport_event_tx).await;
                 return;
@@ -212,6 +232,47 @@ async fn run_control_socket_acceptor(
         });
     }
     info!("control socket acceptor shutting down");
+}
+
+async fn run_daemon_maintenance(
+    mut websocket: tokio_tungstenite::WebSocketStream<UnixStream>,
+    transport_event_tx: mpsc::Sender<TransportEvent>,
+) {
+    let pid = std::process::id().to_string();
+    let request = tokio::time::timeout(Duration::from_secs(2), websocket.next()).await;
+    if !matches!(request, Ok(Some(Ok(Message::Text(request)))) if request == pid) {
+        return;
+    }
+    // The lease begins at socket receipt, not after a possibly stalled queue.
+    let expires_at = tokio::time::Instant::now() + Duration::from_secs(120);
+    let (reply, outcome) = tokio::sync::oneshot::channel();
+    let (flushed, flush_complete) = tokio::sync::oneshot::channel();
+    if !matches!(
+        tokio::time::timeout_at(
+            expires_at,
+            transport_event_tx.send(TransportEvent::DaemonMaintenance {
+                expires_at,
+                reply,
+                flushed: flush_complete
+            })
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
+        return;
+    }
+    if let Ok(Ok(outcome)) =
+        tokio::time::timeout_at(expires_at + Duration::from_secs(7), outcome).await
+    {
+        let payload = serde_json::json!({"pid":std::process::id(),"outcome":outcome});
+        if websocket
+            .send(Message::Text(payload.to_string().into()))
+            .await
+            .is_ok()
+        {
+            let _ = flushed.send(());
+        }
+    }
 }
 
 async fn run_daemon_shutdown(

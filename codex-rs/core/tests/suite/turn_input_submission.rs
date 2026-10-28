@@ -328,6 +328,29 @@ async fn host_drain_allows_spawned_agent_input_but_not_automatic_work() -> anyho
             .single_request()
             .body_contains_text("delegated input")
     );
+    let mailbox =
+        responses::mount_sse_once(&server, responses::sse_completed("delegated mailbox")).await;
+    child
+        .submit(Op::InterAgentCommunication {
+            communication: InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::root(),
+                Vec::new(),
+                "delegated child mail".into(),
+                true,
+            ),
+            start_options: TurnStartOptions {
+                parent_turn_id: Some("parent-turn".into()),
+                ..Default::default()
+            },
+        })
+        .await?;
+    wait_for_event(&child, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    assert!(
+        mailbox
+            .single_request()
+            .body_contains_text("delegated child mail")
+    );
     Ok(())
 }
 
@@ -482,16 +505,17 @@ async fn host_drain_closes_realtime_after_handoff_error() -> anyhow::Result<()> 
 }
 
 #[tokio::test]
-async fn host_drain_allows_mailbox_work_to_start_a_turn() -> anyhow::Result<()> {
+async fn host_drain_retains_root_mailbox_work_until_admission_reopens() -> anyhow::Result<()> {
     let server = responses::start_mock_server().await;
     let response = responses::mount_sse_once(&server, responses::sse_completed("mailbox")).await;
     let mut extensions = ExtensionRegistryBuilder::new();
-    extensions.turn_start_admission(Arc::new(TestAdmission(AtomicBool::new(true))));
+    let admission = Arc::new(TestAdmission(AtomicBool::new(true)));
+    extensions.turn_start_admission(admission.clone());
     let test = test_codex()
         .with_extensions(Arc::new(extensions.build()))
         .build_with_auto_env(&server)
         .await?;
-    // Mailbox input is memory-only and must be processed before the host exits.
+    // Root mailbox work must remain queued while maintenance owns the idle boundary.
     test.codex
         .submit(Op::InterAgentCommunication {
             communication: InterAgentCommunication::new(
@@ -500,6 +524,36 @@ async fn host_drain_allows_mailbox_work_to_start_a_turn() -> anyhow::Result<()> 
                 Vec::new(),
                 "mail while draining".to_string(),
                 /*trigger_turn*/ true,
+            ),
+            start_options: Default::default(),
+        })
+        .await?;
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if matches!(
+                test.codex
+                    .start_turn_if_idle(TurnInputRequest::user_input(Vec::new()))
+                    .await?,
+                StartIfIdleSubmission::NotSubmitted {
+                    reason: NotSubmittedReason::PendingTriggerTurn
+                }
+            ) {
+                return Ok::<(), anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    assert!(response.requests().is_empty());
+    admission.0.store(false, Ordering::SeqCst);
+    test.codex
+        .submit(Op::InterAgentCommunication {
+            communication: InterAgentCommunication::new(
+                AgentPath::root(),
+                AgentPath::root(),
+                Vec::new(),
+                "wake after maintenance".into(),
+                true,
             ),
             start_options: Default::default(),
         })
@@ -1696,5 +1750,84 @@ async fn tool_output_retention_is_submission_metadata() -> anyhow::Result<()> {
         }
     }
     server.shutdown().await;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct LifetimeAdmission(Arc<std::sync::atomic::AtomicUsize>);
+
+struct LifetimeGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for LifetimeGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl TurnStartAdmission for LifetimeAdmission {
+    fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
+        Some(Box::new(()))
+    }
+    fn track_running_turn(&self) -> Arc<dyn Send + Sync> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Arc::new(LifetimeGuard(Arc::clone(&self.0)))
+    }
+}
+
+struct DelayTerminalLifecycle {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl codex_extension_api::TurnLifecycleContributor for DelayTerminalLifecycle {
+    fn on_turn_stop<'a>(
+        &'a self,
+        _input: codex_extension_api::TurnStopInput<'a>,
+    ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            self.entered.notify_one();
+            self.release.notified().await;
+        })
+    }
+}
+
+#[tokio::test]
+async fn host_running_guard_survives_delayed_terminal_and_unconsumed_host_events()
+-> anyhow::Result<()> {
+    let server = responses::start_mock_server().await;
+    responses::mount_sse_once(&server, responses::sse_completed("done")).await;
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let lifecycle = Arc::new(DelayTerminalLifecycle {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let mut extensions = ExtensionRegistryBuilder::new();
+    extensions.turn_start_admission(Arc::new(LifetimeAdmission(Arc::clone(&active))));
+    extensions.turn_lifecycle_contributor(lifecycle.clone());
+    let test = test_codex()
+        .with_extensions(Arc::new(extensions.build()))
+        .build_with_auto_env(&server)
+        .await?;
+    test.codex
+        .start_turn_if_idle(user_message_request("held terminal"))
+        .await?;
+    // Do not consume any lifecycle events: the host still reports no running turn.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        lifecycle.entered.notified(),
+    )
+    .await?;
+    assert_eq!(active.load(Ordering::SeqCst), 1);
+    lifecycle.release.notify_one();
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while active.load(Ordering::SeqCst) != 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
     Ok(())
 }

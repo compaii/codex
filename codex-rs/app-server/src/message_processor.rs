@@ -769,8 +769,11 @@ impl MessageProcessor {
 
     pub(crate) async fn daemon_recovery_snapshot(
         &self,
-    ) -> codex_app_server_transport::daemon_recovery::RecoverySnapshot {
-        self.thread_processor.daemon_recovery_snapshot().await
+        maintenance: bool,
+    ) -> std::io::Result<codex_app_server_transport::daemon_recovery::RecoverySnapshot> {
+        self.thread_processor
+            .daemon_recovery_snapshot(maintenance)
+            .await
     }
 
     pub(crate) async fn restore_daemon_threads(

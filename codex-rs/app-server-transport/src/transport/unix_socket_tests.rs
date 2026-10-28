@@ -528,3 +528,69 @@ fn assert_socket_path_removed(_socket_path: &Path) {
     // uds_windows uses a regular filesystem path as its rendezvous point,
     // but there is no Unix socket filesystem node to assert on.
 }
+
+#[tokio::test]
+async fn maintenance_control_requires_managed_receiver_and_returns_bounded_outcome() {
+    for access in [
+        DaemonShutdownAccess::Disabled,
+        DaemonShutdownAccess::MaintenanceOnly,
+        DaemonShutdownAccess::Managed,
+    ] {
+        let home = tempfile::TempDir::new().unwrap();
+        let socket = test_socket_path(home.path());
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let shutdown = CancellationToken::new();
+        let acceptor = start_control_socket_acceptor(socket.clone(), tx, shutdown.clone(), access)
+            .await
+            .unwrap();
+        if matches!(access, DaemonShutdownAccess::MaintenanceOnly) {
+            let stream = connect_to_socket(socket.as_path()).await.unwrap();
+            assert!(
+                client_async("ws://localhost/daemon/shutdown", stream)
+                    .await
+                    .is_err()
+            );
+            assert!(rx.try_recv().is_err());
+        }
+        let stream = connect_to_socket(socket.as_path()).await.unwrap();
+        let upgraded = client_async("ws://localhost/daemon/maintenance", stream).await;
+        if matches!(access, DaemonShutdownAccess::Disabled) {
+            assert!(upgraded.is_err());
+            assert!(rx.try_recv().is_err());
+        } else {
+            let (mut ws, response) = upgraded.unwrap();
+            let identity = format!("v1:{}", std::process::id());
+            assert_eq!(
+                response.headers()[crate::DAEMON_MAINTENANCE_CAPABILITY_HEADER]
+                    .to_str()
+                    .unwrap(),
+                identity
+            );
+            ws.send(WebSocketMessage::Text(
+                std::process::id().to_string().into(),
+            ))
+            .await
+            .unwrap();
+            let event = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let TransportEvent::DaemonMaintenance { reply, flushed, .. } = event else {
+                panic!("maintenance must never become stop")
+            };
+            reply.send("deferred").unwrap();
+            let frame = ws.next().await.unwrap().unwrap();
+            let WebSocketMessage::Text(frame) = frame else {
+                panic!("expected outcome")
+            };
+            let result: serde_json::Value = serde_json::from_str(&frame).unwrap();
+            assert_eq!(result["outcome"], "deferred");
+            timeout(Duration::from_secs(2), flushed)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        shutdown.cancel();
+        acceptor.await.unwrap();
+    }
+}

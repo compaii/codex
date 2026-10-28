@@ -240,8 +240,9 @@ impl InputQueue {
         pending.drain(..).collect()
     }
 
-    pub(crate) async fn drain_mailbox_input_items(&self) -> (Vec<TurnInput>, TurnStartOptions) {
-        let pending_mails = self.drain_mailbox().await;
+    fn mailbox_start_options(
+        pending_mails: &VecDeque<PendingMailboxCommunication>,
+    ) -> TurnStartOptions {
         // A later follow-up supersedes the earlier choice, including an omitted choice.
         let mut start_options = pending_mails
             .iter()
@@ -267,8 +268,21 @@ impl InputQueue {
                     .filter(|id| !id.trim().is_empty())
             })
             .map(str::to_string);
-        let items = pending_mails
-            .into_iter()
+        start_options
+    }
+
+    pub(crate) async fn pending_delegated_parent(&self) -> Option<String> {
+        let mut pending = self.mailbox_pending_mails.lock().await;
+        self.read_mailbox(&mut pending);
+        Self::mailbox_start_options(&pending).parent_turn_id
+    }
+
+    pub(crate) async fn drain_mailbox_input_items(&self) -> (Vec<TurnInput>, TurnStartOptions) {
+        let mut pending = self.mailbox_pending_mails.lock().await;
+        self.read_mailbox(&mut pending);
+        let start_options = Self::mailbox_start_options(&pending);
+        let items = pending
+            .drain(..)
             .map(|mail| TurnInput::InterAgentCommunication(mail.communication))
             .collect();
         (items, start_options)
@@ -393,42 +407,62 @@ impl InputQueue {
         turn_state.lock().await.pending_input.items.split_off(0)
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "active turn checks and turn state updates must remain atomic"
-    )]
     pub(crate) async fn get_pending_input(
         &self,
         active_turn: &Mutex<Option<ActiveTurn>>,
     ) -> (Vec<TurnInput>, TurnStartOptions) {
-        let (pending_input, accepts_mailbox_delivery) = {
-            let mut active = active_turn.lock().await;
-            match active.as_mut() {
-                Some(active_turn) => {
-                    let mut turn_state = active_turn.turn_state.lock().await;
-                    let accepts_mailbox_delivery =
-                        turn_state.accepts_mailbox_delivery_for_current_turn();
-                    let pending_input = if accepts_mailbox_delivery {
-                        turn_state.pending_input.items.split_off(0)
-                    } else {
-                        Vec::new()
-                    };
-                    (pending_input, accepts_mailbox_delivery)
-                }
-                None => (Vec::new(), true),
-            }
+        self.get_pending_input_for_parent(active_turn, None)
+            .await
+            .expect("unfiltered selection")
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "validate delegated lineage and consume the same frozen queue atomically"
+    )]
+    pub(crate) async fn get_pending_input_for_parent(
+        &self,
+        active_turn: &Mutex<Option<ActiveTurn>>,
+        expected_parent: Option<&str>,
+    ) -> Option<(Vec<TurnInput>, TurnStartOptions)> {
+        let mut active = active_turn.lock().await;
+        // Preserve the existing active-turn -> turn-state lock order before
+        // freezing the mailbox; a failed parent check consumes neither source.
+        let mut turn_state = match active.as_mut() {
+            Some(turn) => Some(turn.turn_state.lock().await),
+            None => None,
         };
-        if !accepts_mailbox_delivery {
-            return (pending_input, TurnStartOptions::default());
+        let mut mails = self.mailbox_pending_mails.lock().await;
+        self.read_mailbox(&mut mails);
+        let start_options = Self::mailbox_start_options(&mails);
+        if expected_parent.is_some() && start_options.parent_turn_id.as_deref() != expected_parent {
+            return None; // retain every message and pending input after a stale peek
         }
-        let (mailbox_items, start_options) = self.drain_mailbox_input_items().await;
-        if pending_input.is_empty() {
-            (mailbox_items, start_options)
-        } else {
-            let mut pending_input = pending_input;
-            pending_input.extend(mailbox_items);
-            (pending_input, start_options)
+        let (mut pending_input, accepts) = match turn_state.as_mut() {
+            Some(state) => {
+                let accepts = state.accepts_mailbox_delivery_for_current_turn();
+                let input = if accepts {
+                    state.pending_input.items.split_off(0)
+                } else {
+                    Vec::new()
+                };
+                (input, accepts)
+            }
+            None => (Vec::new(), true),
+        };
+        if !accepts {
+            return if expected_parent.is_some() {
+                None
+            } else {
+                Some((pending_input, TurnStartOptions::default()))
+            };
         }
+        pending_input.extend(
+            mails
+                .drain(..)
+                .map(|mail| TurnInput::InterAgentCommunication(mail.communication)),
+        );
+        Some((pending_input, start_options))
     }
 
     #[expect(
@@ -706,6 +740,44 @@ mod tests {
             ]
         );
         assert!(!input_queue.has_pending_mailbox_items().await);
+    }
+
+    #[tokio::test]
+    async fn delegated_mailbox_selection_rechecks_lineage_without_consuming_new_input() {
+        let queue = InputQueue::new();
+        queue
+            .enqueue_mailbox_communication(
+                make_mail(AgentPath::root(), AgentPath::root(), "delegated", true),
+                crate::TurnStartOptions {
+                    parent_turn_id: Some("parent".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(
+            queue.pending_delegated_parent().await.as_deref(),
+            Some("parent")
+        );
+        queue
+            .enqueue_mailbox_communication(
+                make_mail(
+                    AgentPath::root(),
+                    AgentPath::root(),
+                    "later unrelated",
+                    true,
+                ),
+                Default::default(),
+            )
+            .await;
+        let active = tokio::sync::Mutex::new(None);
+        assert!(
+            queue
+                .get_pending_input_for_parent(&active, Some("parent"))
+                .await
+                .is_none()
+        );
+        assert!(queue.pending_delegated_parent().await.is_none());
+        assert_eq!(queue.get_pending_input(&active).await.0.len(), 2);
     }
 
     #[tokio::test]

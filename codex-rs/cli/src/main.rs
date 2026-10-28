@@ -657,6 +657,9 @@ enum AppServerDaemonSubcommand {
     /// Start the local app server daemon if it is not already running.
     Start,
 
+    /// Request a nonforcing idle handoff; unsupported receivers remain serving.
+    Maintenance,
+
     /// Restart the local app server daemon.
     Restart,
 
@@ -1305,6 +1308,10 @@ async fn cli_main(
                                 remote_control_enabled: bootstrap_cli.remote_control,
                             })
                             .await?;
+                        println!("{}", serde_json::to_string(&output)?);
+                    }
+                    AppServerDaemonSubcommand::Maintenance => {
+                        let output = codex_app_server_daemon::maintenance().await?;
                         println!("{}", serde_json::to_string(&output)?);
                     }
                     AppServerDaemonSubcommand::Restart => {
@@ -2329,6 +2336,7 @@ fn app_server_subcommand_name(subcommand: Option<&AppServerSubcommand>) -> &'sta
         Some(AppServerSubcommand::Daemon(daemon)) => match daemon.subcommand {
             AppServerDaemonSubcommand::Bootstrap(_) => "app-server daemon bootstrap",
             AppServerDaemonSubcommand::Start => "app-server daemon start",
+            AppServerDaemonSubcommand::Maintenance => "app-server daemon maintenance",
             AppServerDaemonSubcommand::Restart => "app-server daemon restart",
             AppServerDaemonSubcommand::Update { .. } => "app-server daemon update",
             AppServerDaemonSubcommand::EnableRemoteControl => {
