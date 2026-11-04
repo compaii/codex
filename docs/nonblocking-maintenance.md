@@ -12,8 +12,26 @@ while another session was genuinely working. A separate diagnostic loaded an
 entire large rollout into memory and triggered OOM; previous-package fallback
 restored availability. Neither event proves candidate adoption or graceful exit.
 
-The correction keeps maintenance pending with admission open for at most120s.
-It claims an idle boundary only with no preparing starts, no Core task lifetime
+The correction keeps maintenance pending with human admission open for at most120s.
+During that existing bounded lease, the same admission mutex withholds fresh
+internally generated goal continuations. A goal reservation already acquired may
+finish submitting; its permit prevents an idle claim. Active steering and human
+starts remain available, and required delegated work retains its existing path.
+This does not pause a goal, change an objective/status/budget or alter accounting.
+
+On timeout/defer/snapshot failure the gate releases one callback per withheld
+thread, outside its lock. Callbacks hold weak runtime references and perform one
+idle-start attempt after checking the exact goal snapshot revision under the
+existing goal-state semaphore. Later pause/clear/replacement/config changes win;
+Core still checks actual idle state and higher-priority pending trigger input.
+Resumption is bounded to one callback/attempt per withheld thread, not a poller or
+new maintenance lease. It serializes with ordinary goal control; no timeout
+cancels an in-flight control operation or a submitted turn. Existing persistent
+storage stalls remain an operational limitation, not permission to force work.
+Explicit Stop discards withheld callbacks. Successful handoff uses existing
+snapshot/startup recovery, not synthetic user originals or goal rewrites.
+
+The receiver claims an idle boundary only with no preparing starts, no Core task lifetime
 guards and no host-reported running turns. Shared guards cover both the task
 future and its abort owner through terminal persistence; delayed lifecycle events
 cannot manufacture idle. Mailbox/durable-sleep starts acquire admission before

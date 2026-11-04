@@ -580,6 +580,30 @@ impl GoalRuntimeHandle {
     }
 
     pub(crate) async fn continue_if_idle(&self) -> Result<(), String> {
+        self.continue_if_idle_matching(None).await
+    }
+
+    // The boxed boundary keeps resumption out of the async continuation's type.
+    // One callback, one revalidation attempt; no polling or periodic rearm.
+    fn resume_after_maintenance(
+        runtime: Weak<GoalRuntimeInner>,
+        revision: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(async move {
+            let Some(inner) = runtime.upgrade() else {
+                return;
+            };
+            let runtime = Self { inner };
+            if let Err(error) = runtime.continue_if_idle_matching(Some(&revision)).await {
+                tracing::warn!(%error, "failed to revalidate withheld goal continuation");
+            }
+        })
+    }
+
+    async fn continue_if_idle_matching(
+        &self,
+        expected_revision: Option<&str>,
+    ) -> Result<(), String> {
         if !self.tools_available() {
             self.inner.accounting_state.clear_active_goal();
             return Ok(());
@@ -608,14 +632,17 @@ impl GoalRuntimeHandle {
             return Ok(());
         };
 
-        let Some(goal) = self
+        let snapshot = self
             .inner
             .state_dbs
             .thread_goals()
-            .get_thread_goal(self.thread_id())
+            .snapshot_thread_goal(self.thread_id())
             .await
-            .map_err(|err| err.to_string())?
-        else {
+            .map_err(|err| err.to_string())?;
+        if expected_revision.is_some_and(|expected| expected != snapshot.revision) {
+            return Ok(());
+        }
+        let Some(goal) = snapshot.goal else {
             self.inner.accounting_state.clear_active_goal();
             return Ok(());
         };
@@ -623,6 +650,13 @@ impl GoalRuntimeHandle {
             self.inner.accounting_state.clear_active_goal();
             return Ok(());
         }
+        let runtime = Arc::downgrade(&self.inner);
+        let revision = snapshot.revision;
+        let Some(_admission) = thread.admit_goal_continuation(Box::new(move || {
+            tokio::spawn(Self::resume_after_maintenance(runtime, revision));
+        })) else {
+            return Ok(());
+        };
         let start_options = thread
             .thread_extension_data()
             .get::<TurnStartOptions>()

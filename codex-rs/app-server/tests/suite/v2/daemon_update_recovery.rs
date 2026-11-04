@@ -98,6 +98,233 @@ async fn managed_maintenance_keeps_admitting_while_a_turn_runs_then_saves_idle_r
 }
 
 #[cfg(unix)]
+#[test_case::test_case("pause")]
+#[test_case::test_case("clear")]
+#[test_case::test_case("replace")]
+#[tokio::test]
+async fn managed_maintenance_retry_respects_later_goal_control(change: &str) -> Result<()> {
+    let home = TempDir::new()?;
+    let (release_goal, goal_gate) = oneshot::channel();
+    let (release_human, human_gate) = oneshot::channel();
+    let (mock, _) = start_streaming_sse_server(vec![
+        vec![stream_chunk(Some(goal_gate), "Useful goal progress")?],
+        vec![stream_chunk(Some(human_gate), "Human work finished")?],
+    ])
+    .await;
+    create_config_toml(home.path(), mock.uri(), "never")?;
+    let config = home.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "{}\n[features]\ngoals = true\n",
+            std::fs::read_to_string(&config)?
+        ),
+    )?;
+    let socket = home.path().join("control/server.sock");
+    let mut server = spawn_server(home.path(), &socket)?;
+    let mut client = connect_daemon_client(
+        &socket,
+        InitializeCapabilities {
+            experimental_api: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let goal = start_thread(&mut client, 2, json!({})).await?.thread.id;
+    request(
+        &mut client,
+        3,
+        "thread/goal/set",
+        json!({"threadId":goal,"objective":"Original objective"}),
+    )
+    .await?;
+    wait_for_requests(&mock, 1).await?;
+    let human = start_thread(&mut client, 4, json!({})).await?.thread.id;
+    start_turn(&mut client, 5, &human).await?;
+    wait_for_requests(&mock, 2).await?;
+    let recovery = daemon_recovery_file_path(home.path());
+    std::fs::create_dir_all(&recovery)?;
+    let mut maintenance = begin_maintenance(&socket).await?;
+    assert_still_running(&mut server, "maintenance must not interrupt either turn").await;
+    release_goal.send(()).expect("goal response waiting");
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let Message::Text(text) = client.next().await.context("socket closed")?? else {
+                continue;
+            };
+            let message: serde_json::Value = serde_json::from_str(&text)?;
+            if message["method"] == "turn/completed" && message["params"]["threadId"] == goal {
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    })
+    .await??;
+    match change {
+        "pause" => {
+            request(
+                &mut client,
+                6,
+                "thread/goal/set",
+                json!({"threadId":goal,"status":"paused"}),
+            )
+            .await?;
+        }
+        "clear" | "replace" => {
+            request(
+                &mut client,
+                6,
+                "thread/goal/clear",
+                json!({"threadId":goal}),
+            )
+            .await?;
+            if change == "replace" {
+                request(
+                    &mut client,
+                    7,
+                    "thread/goal/set",
+                    json!({"threadId":goal,"objective":"Replacement objective","status":"paused"}),
+                )
+                .await?;
+            }
+        }
+        _ => unreachable!(),
+    }
+    let expected = request(&mut client, 8, "thread/goal/get", json!({"threadId":goal})).await?;
+    release_human.send(()).expect("human response waiting");
+    assert_eq!(
+        maintenance_outcome(&mut maintenance)
+            .await
+            .with_context(|| diagnostic_tail(home.path()))?,
+        "deferred"
+    );
+    assert_still_running(&mut server, "defer keeps human service available").await;
+    assert_eq!(
+        mock.requests().await.len(),
+        2,
+        "superseded goal must not resume"
+    );
+    let actual = request(&mut client, 9, "thread/goal/get", json!({"threadId":goal})).await?;
+    assert_eq!(
+        actual, expected,
+        "later control and accounting remain exact"
+    );
+    std::fs::remove_dir(&recovery)?;
+    request_shutdown(&server, &socket).await?;
+    wait_success(&mut server).await?;
+    Ok(())
+}
+
+// Actual goal extension + Core + managed maintenance, using loopback SSE only.
+#[cfg(unix)]
+#[test_case::test_case(false; "handoff")]
+#[test_case::test_case(true; "snapshot_failure_resumes_once")]
+#[tokio::test]
+async fn managed_maintenance_withholds_goal_continuation(snapshot_failure: bool) -> Result<()> {
+    let home = TempDir::new()?;
+    let (release, gate) = oneshot::channel();
+    let (release_retry, retry_gate) = oneshot::channel();
+    let (mock, _completions) = start_streaming_sse_server(vec![
+        vec![stream_chunk(Some(gate), "Useful first progress")?],
+        vec![stream_chunk(Some(retry_gate), "Useful resumed progress")?],
+    ])
+    .await;
+    create_config_toml(home.path(), mock.uri(), "never")?;
+    let config = home.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "{}\n[features]\ngoals = true\n",
+            std::fs::read_to_string(&config)?
+        ),
+    )?;
+    let socket = home.path().join("control/server.sock");
+    let mut server = spawn_server(home.path(), &socket)?;
+    let mut client = connect_daemon_client(
+        &socket,
+        InitializeCapabilities {
+            experimental_api: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let thread = start_thread(&mut client, 2, json!({})).await?.thread.id;
+    request(
+        &mut client,
+        3,
+        "thread/goal/set",
+        json!({
+            "threadId":thread, "objective":"Keep making useful progress", "tokenBudget":100000
+        }),
+    )
+    .await?;
+    wait_for_requests(&mock, 1).await?;
+    let recovery = daemon_recovery_file_path(home.path());
+    if snapshot_failure {
+        std::fs::create_dir_all(&recovery)?;
+    }
+    let mut maintenance = begin_maintenance(&socket).await?;
+    assert_still_running(&mut server, "must finish the admitted turn").await;
+    // Human metadata admission is still open while maintenance is pending.
+    let before = request(
+        &mut client,
+        4,
+        "thread/goal/get",
+        json!({"threadId":thread}),
+    )
+    .await?;
+    release.send(()).expect("initial goal turn is waiting");
+    let outcome = maintenance_outcome(&mut maintenance)
+        .await
+        .with_context(|| diagnostic_tail(home.path()))?;
+    if snapshot_failure {
+        assert_eq!(outcome, "deferred");
+        wait_for_requests(&mock, 2)
+            .await
+            .with_context(|| diagnostic_tail(home.path()))?;
+        let after = request(
+            &mut client,
+            5,
+            "thread/goal/get",
+            json!({"threadId":thread}),
+        )
+        .await?;
+        for field in ["objective", "status", "tokenBudget", "createdAt"] {
+            assert_eq!(
+                before["goal"][field], after["goal"][field],
+                "goal field {field}"
+            );
+        }
+        request(
+            &mut client,
+            6,
+            "thread/goal/set",
+            json!({"threadId":thread,"status":"paused"}),
+        )
+        .await?;
+        release_retry.send(()).expect("resumed turn is waiting");
+        assert_still_running(&mut server, "deferred receiver remains available").await;
+        assert_eq!(
+            mock.requests().await.len(),
+            2,
+            "one retry, no duplicate continuation"
+        );
+        std::fs::remove_dir(&recovery)?;
+        request_shutdown(&server, &socket).await?;
+    } else {
+        assert_eq!(outcome, "handoffReady");
+        assert_eq!(
+            mock.requests().await.len(),
+            1,
+            "no fresh goal work before handoff"
+        );
+    }
+    wait_success(&mut server)
+        .await
+        .with_context(|| diagnostic_tail(home.path()))?;
+    Ok(())
+}
+
+#[cfg(unix)]
 #[test_case::test_case("publish")]
 #[test_case::test_case("root")]
 #[tokio::test]

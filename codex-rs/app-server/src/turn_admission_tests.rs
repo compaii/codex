@@ -88,3 +88,101 @@ fn explicit_drain_finishes_delegated_work_but_idle_maintenance_cannot_be_bypasse
     assert!(admission.begin_idle_drain(&running));
     assert!(admission.admit_delegated_turn_start().is_none());
 }
+
+#[test]
+fn maintenance_withholds_only_goals_and_resumes_latest_observation_once() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    let admission = TurnAdmission::default();
+    let thread = codex_protocol::ThreadId::new();
+    let resumed = Arc::new(AtomicUsize::new(0));
+    let admitted_before = admission
+        .admit_goal_continuation(thread, Box::new(|| {}))
+        .unwrap();
+    admission.defer_goal_continuations();
+    for value in [1, 10] {
+        let resumed = Arc::clone(&resumed);
+        assert!(
+            admission
+                .admit_goal_continuation(
+                    thread,
+                    Box::new(move || {
+                        resumed.fetch_add(value, Ordering::SeqCst);
+                    })
+                )
+                .is_none()
+        );
+    }
+    assert!(admission.admit().is_ok(), "human starts remain available");
+    let parent = admission.track_running_turn();
+    assert!(admission.admit_delegated_turn_start().is_some());
+    let (_, running) = tokio::sync::watch::channel(0);
+    drop(parent);
+    assert!(
+        !admission.begin_idle_drain(&running),
+        "pre-admitted goal still preparing"
+    );
+    drop(admitted_before);
+    assert!(admission.begin_idle_drain(&running));
+    assert_eq!(resumed.load(Ordering::SeqCst), 0);
+    admission.cancel_drain();
+    admission.cancel_drain();
+    assert_eq!(resumed.load(Ordering::SeqCst), 10);
+    assert!(
+        admission
+            .admit_goal_continuation(thread, Box::new(|| {}))
+            .is_some()
+    );
+}
+
+#[test]
+fn explicit_stop_discards_maintenance_retries() {
+    let admission = TurnAdmission::default();
+    admission.defer_goal_continuations();
+    assert!(
+        admission
+            .admit_goal_continuation(
+                codex_protocol::ThreadId::new(),
+                Box::new(|| panic!("explicit stop must not restart withheld work"))
+            )
+            .is_none()
+    );
+    admission.begin_drain();
+    admission.cancel_drain();
+}
+
+#[test]
+fn maintenance_and_goal_reservation_have_one_atomic_order() {
+    use std::sync::Arc;
+    use std::sync::Barrier;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    // Check both possible scheduler orders repeatedly, without sleeps.
+    for _ in 0..64 {
+        let admission = TurnAdmission::default();
+        let barrier = Arc::new(Barrier::new(2));
+        let resumed = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let admission = admission.clone();
+            let barrier = Arc::clone(&barrier);
+            let resumed = Arc::clone(&resumed);
+            std::thread::spawn(move || {
+                barrier.wait();
+                admission.admit_goal_continuation(
+                    codex_protocol::ThreadId::new(),
+                    Box::new(move || {
+                        resumed.store(true, Ordering::SeqCst);
+                    }),
+                )
+            })
+        };
+        barrier.wait();
+        admission.defer_goal_continuations();
+        let permit = worker.join().unwrap();
+        let (_, running) = tokio::sync::watch::channel(0);
+        assert_eq!(admission.begin_idle_drain(&running), permit.is_none());
+        admission.cancel_drain();
+        assert_eq!(resumed.load(Ordering::SeqCst), permit.is_none());
+    }
+}

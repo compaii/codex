@@ -57,6 +57,12 @@ jobs:
         uses: ./.github/actions/setup-rusty-v8
         with:
           target: x86_64-unknown-linux-gnu
+      - name: Maintenance goal admission and revalidated defer recovery
+        run: |
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server --lib turn_admission -- --nocapture
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server --lib maintenance -- --nocapture
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-goal-extension --test goal_extension_backend
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all daemon_update_recovery -- --nocapture
       - name: Resolved idle resume reuse and configuration boundaries
         run: |
           cargo test --locked --profile dev-small -j 2 -p codex-core -p codex-app-server --lib resolved_resume -- --list > "$RUNNER_TEMP/resume-tests.txt"
@@ -106,7 +112,6 @@ jobs:
       - name: Bounded turn admission, lifecycle and unrelated goal isolation
         run: |
           RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-core --lib -- session::turn_input::tests::bounded session::async_compaction::tests::bounded turn_inference::tests::refuses guardian::tests::bounded_approval_review_defers_before_any_contributor
-          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-goal-extension --test goal_extension_backend bounded_turn_lifecycle_preserves_existing_goal_and_accounting
           RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-guardian-v2 --lib -- bounded_attention_invalidates_cached_scores_without_classification contributor_accounts_for_parent_checkpoint
       - name: Shared inference allowance and no-replay transport regressions
         run: |

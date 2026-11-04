@@ -272,13 +272,14 @@ impl ShutdownState {
         expires_at: tokio::time::Instant,
         reply: oneshot::Sender<&'static str>,
         flushed: oneshot::Receiver<()>,
-        _turn_admission: &turn_admission::TurnAdmission,
+        turn_admission: &turn_admission::TurnAdmission,
     ) {
         if reply.is_closed() || tokio::time::Instant::now() >= expires_at {
             let _ = reply.send("deferred");
         } else if self.requested() {
             let _ = reply.send("alreadyPending");
         } else {
+            turn_admission.defer_goal_continuations();
             self.requested = true;
             self.maintenance = true;
             self.draining = false;
@@ -322,6 +323,7 @@ impl ShutdownState {
         }
         self.requested = true;
         if self.maintenance {
+            turn_admission.defer_goal_continuations();
             // A maintenance caller must have a bounded deferred outcome, not a
             // permanent pending request that exits unexpectedly hours later.
             self.maintenance_deadline =
@@ -1716,9 +1718,11 @@ mod tests {
     use super::turn_admission::TurnAdmission;
     #[cfg(debug_assertions)]
     use codex_config::LoaderOverrides;
+    use codex_extension_api::TurnStartAdmission;
     #[cfg(debug_assertions)]
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
+    use std::sync::Arc;
     use tokio::sync::oneshot;
     use tokio::sync::watch;
 
@@ -1801,6 +1805,18 @@ mod tests {
         ));
         assert!(admission.admit().is_err());
         // A stalled snapshot must never leave the shared server closed.
+        let resumed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = Arc::clone(&resumed);
+        assert!(
+            admission
+                .admit_goal_continuation(
+                    codex_protocol::ThreadId::new(),
+                    Box::new(move || {
+                        observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    })
+                )
+                .is_none()
+        );
         shutdown.maintenance_deadline = Some(tokio::time::Instant::now());
         assert!(matches!(
             shutdown.update(&running, 0, 1, &admission),
@@ -1808,6 +1824,7 @@ mod tests {
         ));
         assert!(!shutdown.requested());
         assert!(admission.admit().is_ok());
+        assert!(resumed.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]
@@ -1833,6 +1850,11 @@ mod tests {
         let received_expiry = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
         shutdown.on_maintenance_request(received_expiry, reply, flush_complete, &admission);
         assert_eq!(shutdown.maintenance_deadline, Some(received_expiry));
+        assert!(
+            admission
+                .admit_goal_continuation(codex_protocol::ThreadId::new(), Box::new(|| {}))
+                .is_none()
+        );
     }
 
     #[cfg(unix)]
@@ -1843,6 +1865,18 @@ mod tests {
         let mut shutdown = ShutdownState::default();
         shutdown.on_signal(ShutdownSignal::GracefulOnly, 1, 1, &admission);
         assert!(!shutdown.draining);
+        let resumed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = Arc::clone(&resumed);
+        assert!(
+            admission
+                .admit_goal_continuation(
+                    codex_protocol::ThreadId::new(),
+                    Box::new(move || {
+                        observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    })
+                )
+                .is_none()
+        );
         shutdown.maintenance_deadline = Some(tokio::time::Instant::now());
         assert!(matches!(
             shutdown.update(&running, 0, 1, &admission),
@@ -1850,6 +1884,7 @@ mod tests {
         ));
         assert!(!shutdown.requested());
         assert!(admission.admit().is_ok());
+        assert!(resumed.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[cfg(unix)]

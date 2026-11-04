@@ -2,23 +2,35 @@
 
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_extension_api::TurnStartAdmission;
+use codex_protocol::ThreadId;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::watch;
 
 use crate::error_code::server_draining_error;
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct AdmissionState {
     closed: bool,
     active: usize,
     running: usize,
+    maintenance_pending: bool,
+    // At most one callback per live goal runtime, retained only for the existing
+    // bounded maintenance request. Callbacks capture weak runtime references.
+    withheld_goals: BTreeMap<String, Box<dyn FnOnce() + Send>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct TurnAdmission {
     state: Arc<Mutex<AdmissionState>>,
     active_tx: watch::Sender<usize>,
+}
+
+impl std::fmt::Debug for TurnAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TurnAdmission").finish_non_exhaustive()
+    }
 }
 
 impl Default for TurnAdmission {
@@ -34,10 +46,20 @@ pub(crate) struct TurnPermit(TurnAdmission);
 
 impl TurnAdmission {
     pub(crate) fn begin_drain(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.closed = true;
+        state.maintenance_pending = false;
+        state.withheld_goals.clear();
+    }
+
+    pub(crate) fn defer_goal_continuations(&self) {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .closed = true;
+            .maintenance_pending = true;
     }
 
     // Core's task-lifetime guard bridges submission to actual task
@@ -56,10 +78,19 @@ impl TurnAdmission {
     }
 
     pub(crate) fn cancel_drain(&self) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .closed = false;
+        let withheld = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.closed = false;
+            state.maintenance_pending = false;
+            std::mem::take(&mut state.withheld_goals)
+        };
+        // Never invoke runtime code while holding the admission lock.
+        for resume in withheld.into_values() {
+            resume();
+        }
     }
 
     fn track_started_turn(&self) -> RunningTurnPermit {
@@ -102,6 +133,31 @@ impl TurnStartAdmission for TurnAdmission {
     fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
         self.try_admit()
             .map(|permit| Box::new(permit) as Box<dyn Send>)
+    }
+
+    fn admit_goal_continuation(
+        &self,
+        thread_id: ThreadId,
+        on_deferred: Box<dyn FnOnce() + Send>,
+    ) -> Option<Box<dyn Send>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.maintenance_pending {
+            // Replace an older idle observation for this same runtime. Later
+            // human work/goal changes must not be resumed using stale context.
+            state
+                .withheld_goals
+                .insert(thread_id.to_string(), on_deferred);
+            return None;
+        }
+        if state.closed {
+            return None;
+        }
+        state.active += 1;
+        self.active_tx.send_replace(state.active);
+        Some(Box::new(TurnPermit(self.clone())))
     }
 
     fn admit_delegated_turn_start(&self) -> Option<Box<dyn Send>> {
