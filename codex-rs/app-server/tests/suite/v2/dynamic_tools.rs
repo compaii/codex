@@ -582,11 +582,17 @@ struct PendingDynamicToolCall {
 }
 
 async fn start_function_dynamic_tool_call(call_id: &str) -> Result<PendingDynamicToolCall> {
+    start_function_dynamic_tool_call_with_responses(call_id, Vec::new()).await
+}
+async fn start_function_dynamic_tool_call_with_responses(
+    call_id: &str,
+    extra_responses: Vec<String>,
+) -> Result<PendingDynamicToolCall> {
     let tool_name = "demo_tool";
     let tool_args = json!({ "city": "Paris" });
     let tool_call_arguments = serde_json::to_string(&tool_args)?;
 
-    let response_sequence = vec![
+    let mut response_sequence = vec![
         responses::sse(vec![
             responses::ev_response_created("resp-1"),
             responses::ev_function_call(call_id, tool_name, &tool_call_arguments),
@@ -594,6 +600,7 @@ async fn start_function_dynamic_tool_call(call_id: &str) -> Result<PendingDynami
         ]),
         create_final_assistant_message_sse_response("Done")?,
     ];
+    response_sequence.extend(extra_responses);
     let server = create_mock_responses_server_sequence_unchecked(response_sequence).await;
 
     let codex_home = TempDir::new()?;
@@ -1002,4 +1009,103 @@ async fn wait_for_dynamic_tool_completed(
             return Ok(completed);
         }
     }
+}
+
+/// The native admission, not a prior idle read, decides whether internal work may start.
+#[tokio::test]
+async fn idle_only_turn_refuses_busy_without_recording_then_starts_internal_context() -> Result<()>
+{
+    let PendingDynamicToolCall {
+        mut mcp,
+        server,
+        request_id,
+        params,
+    } = start_function_dynamic_tool_call_with_responses(
+        "human-held-tool",
+        vec![create_final_assistant_message_sse_response(
+            "Heartbeat reviewed",
+        )?],
+    )
+    .await?;
+    let marker = "Exact heartbeat context: not a human utterance";
+    let heartbeat = TurnStartParams {
+        thread_id: params.thread_id.clone(),
+        input: Vec::new(),
+        tool_output: Some(Box::new(codex_app_server_protocol::TurnToolOutput {
+            name: "heartbeat_attention".into(),
+            namespace: None,
+            retain: true,
+            output: codex_protocol::models::FunctionCallOutputBody::Text(marker.into()),
+        })),
+        ..Default::default()
+    };
+    let busy = mcp
+        .send_request("turn/startIfIdle", Some(serde_json::to_value(&heartbeat)?))
+        .await?;
+    let error = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(busy)),
+    )
+    .await??;
+    assert_eq!(error.error.code, -32600);
+    assert_eq!(
+        error.error.data,
+        Some(json!({"reason":"notIdle","submitted":false}))
+    );
+    assert_eq!(
+        responses_bodies(&server).await?.len(),
+        1,
+        "Busy refusal must not call the model"
+    );
+    mcp.send_response(
+        request_id,
+        serde_json::to_value(DynamicToolCallResponse {
+            content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                text: "Human tool completed".into(),
+            }],
+            success: true,
+        })?,
+    )
+    .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    let before = responses_bodies(&server).await?;
+    assert_eq!(before.len(), 2);
+    assert!(
+        !serde_json::to_string(&before)?.contains(marker),
+        "Refused input must not be queued or enter human context"
+    );
+    let idle = mcp
+        .send_request("turn/startIfIdle", Some(serde_json::to_value(&heartbeat)?))
+        .await?;
+    let TurnStartResponse { turn } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(idle)).await??;
+    assert_ne!(turn.id, params.turn_id);
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    let bodies = responses_bodies(&server).await?;
+    assert_eq!(bodies.len(), 3);
+    let input = bodies[2]["input"]
+        .as_array()
+        .context("Model input missing")?;
+    assert!(
+        input
+            .iter()
+            .any(|item| item["type"] == "function_call_output"
+                && item["name"] == "heartbeat_attention"
+                && item["output"] == marker)
+    );
+    assert!(
+        !input
+            .iter()
+            .any(|item| item["role"] == "user" && item.to_string().contains(marker)),
+        "Internal context must not impersonate human input"
+    );
+    Ok(())
 }

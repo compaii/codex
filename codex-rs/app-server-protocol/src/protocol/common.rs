@@ -1080,6 +1080,14 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::TurnStartResponse,
     },
+    /// Start a new turn only while idle; never steer or enqueue into another writer.
+    TurnStartIfIdle => "turn/startIfIdle" {
+        params: v2::TurnStartParams,
+        inspect_params: true,
+        serialization: thread_id(params.thread_id),
+        manual_payload_conversion: manual,
+        response: v2::TurnStartResponse,
+    },
     #[experimental("turn/settings/update")]
     TurnSettingsUpdate => "turn/settings/update" {
         params: v2::TurnSettingsUpdateParams,
@@ -2313,6 +2321,23 @@ mod tests {
             .is_err()
         );
         Ok(())
+    }
+
+    #[test]
+    fn idle_only_start_uses_existing_typed_params_and_thread_serialization() {
+        let value = serde_json::json!({"id":7,"method":"turn/startIfIdle","params":{"threadId":"selected-thread","input":[]}});
+        let request: ClientRequest = serde_json::from_value(value.clone()).unwrap();
+        assert!(matches!(&request, ClientRequest::TurnStartIfIdle { .. }));
+        assert_eq!(request.method_name(), "turn/startIfIdle");
+        assert_eq!(
+            request.serialization_scope(),
+            Some(ClientRequestSerializationScope::Thread {
+                thread_id: "selected-thread".into()
+            })
+        );
+        let roundtrip = serde_json::to_value(request).unwrap();
+        assert_eq!(roundtrip["method"], value["method"]);
+        assert_eq!(roundtrip["params"]["threadId"], value["params"]["threadId"]);
     }
 
     #[test]

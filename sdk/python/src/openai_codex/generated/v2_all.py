@@ -12934,6 +12934,15 @@ class TurnStartRequest(BaseModel):
     params: TurnStartParams
 
 
+class TurnStartIfIdleRequest(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    id: RequestId
+    method: Annotated[Literal["turn/startIfIdle"], Field(title="Turn/startIfIdleRequestMethod")]
+    params: TurnStartParams
+
+
 class ExternalAgentConfigImportRequest(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -13028,6 +13037,7 @@ class ClientRequest(
         | PluginInstallRequest
         | PluginUninstallRequest
         | TurnStartRequest
+        | TurnStartIfIdleRequest
         | TurnSteerRequest
         | TurnInterruptRequest
         | ReviewStartRequest
@@ -13143,6 +13153,7 @@ class ClientRequest(
         | PluginInstallRequest
         | PluginUninstallRequest
         | TurnStartRequest
+        | TurnStartIfIdleRequest
         | TurnSteerRequest
         | TurnInterruptRequest
         | ReviewStartRequest

@@ -94,6 +94,12 @@ jobs:
           cat "$RUNNER_TEMP/goal-tests.txt"
           test "$(grep -c 'conditional_goal_controls_reject_stale_selection_without_recording.*: test' "$RUNNER_TEMP/goal-tests.txt")" = 2
           cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all guardian_v2::goals -- --nocapture
+      - name: Atomic idle-only App Server admission and permission compatibility
+        run: |
+          cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all idle_only_turn_refuses_busy_without_recording_then_starts_internal_context -- --list > "$RUNNER_TEMP/idle-turn-tests.txt"
+          test "$(grep -c 'idle_only_turn_refuses_busy_without_recording_then_starts_internal_context: test' "$RUNNER_TEMP/idle-turn-tests.txt")" = 1
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all idle_only_turn_refuses_busy_without_recording_then_starts_internal_context -- --nocapture
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all legacy_permission_profile_requests_fail_closed -- --nocapture
       - name: Build the native CLI and its required tool host
         id: native-build
         run: |
