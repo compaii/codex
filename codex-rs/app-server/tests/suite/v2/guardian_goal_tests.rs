@@ -530,8 +530,11 @@ async fn bounded_attention_preserves_human_goal_and_independent_continuation(
                 responses::ev_function_call("goal-progress-read", "get_goal", "{}"),
                 responses::ev_completed_with_tokens("goal-work", 10),
             ]),
-            // Account useful progress before the next request completes the goal.
-            // Usage arriving after completion follows the existing terminal policy.
+            // Account useful progress in the preceding response. Give this
+            // completion frame no usage: its tool and token callbacks can race,
+            // and existing terminal accounting deliberately excludes late usage.
+            // The nonzero independent response still proves goal accounting,
+            // while both nonzero bounded responses must remain excluded.
             event_stream(vec![
                 responses::ev_response_created("goal-completion"),
                 responses::ev_function_call(
@@ -539,7 +542,7 @@ async fn bounded_attention_preserves_human_goal_and_independent_continuation(
                     "update_goal",
                     r#"{"status":"complete"}"#,
                 ),
-                responses::ev_completed_with_tokens("goal-completion", 10),
+                responses::ev_completed_with_tokens("goal-completion", 0),
             ]),
             event_stream(vec![
                 responses::ev_assistant_message("goal-final", "Authorized work finished."),
