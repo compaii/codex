@@ -37,6 +37,7 @@ pub struct HttpClientBuilder {
     http2_prior_knowledge: bool,
     pub(crate) default_headers: Option<HeaderMap>,
     follow_redirects: bool,
+    pub(crate) single_attempt: bool,
     pub(crate) redirect_observed: Option<Arc<AtomicBool>>,
     connect_timeout: Option<Duration>,
     chatgpt_cloudflare_cookie_store: bool,
@@ -116,6 +117,14 @@ impl HttpClientBuilder {
         self
     }
 
+    /// Disable redirects and transparent protocol retries for metered requests.
+    /// Route-aware clients also disable TLS replay when this option is selected.
+    pub fn without_replays(mut self) -> Self {
+        self.follow_redirects = false;
+        self.single_attempt = true;
+        self
+    }
+
     pub fn without_redirects(mut self) -> Self {
         self.follow_redirects = false;
         self
@@ -185,13 +194,13 @@ impl HttpClientBuilder {
             .into_client());
         }
         self.chatgpt_cookie_store = http_client_factory.chatgpt_cookie_store();
+        let single_attempt = self.single_attempt;
         let (builder, request_logging, default_headers) = self.into_reqwest_parts();
         let inner = http_client_factory.build_reqwest_client(builder, request_url, route_class)?;
-        Ok(HttpClient::from_parts(
-            inner,
-            request_logging,
-            default_headers,
-        ))
+        Ok(
+            HttpClient::from_parts(inner, request_logging, default_headers)
+                .with_single_attempt(single_attempt),
+        )
     }
 
     /// Builds a client for a route that was already resolved by a route-aware caller.
@@ -203,6 +212,7 @@ impl HttpClientBuilder {
     ) -> Result<TransportClient, BuildRouteAwareHttpClientError> {
         self.chatgpt_cookie_store = http_client_factory.chatgpt_cookie_store();
         let explicit_roots = self.tls.root_certificate.is_some();
+        let single_attempt = self.single_attempt;
         let (builder, request_logging, default_headers) = self.into_reqwest_parts();
         let builder = crate::outbound_proxy::configure_builder_for_resolved_route(
             builder,
@@ -216,11 +226,10 @@ impl HttpClientBuilder {
         } else {
             build_reqwest_client_with_custom_ca(builder)?
         };
-        Ok(TransportClient::new(
-            inner,
-            request_logging,
-            default_headers,
-        ))
+        Ok(
+            TransportClient::new(inner, request_logging, default_headers)
+                .with_single_attempt(single_attempt),
+        )
     }
 
     /// Builds a client using the transport's default proxy behavior.
@@ -291,10 +300,13 @@ impl HttpClientBuilder {
         mut self,
         proxy_routing: ProxyRouting,
     ) -> Result<HttpClient, BuildCustomCaTransportError> {
+        let single_attempt = self.single_attempt;
         let request_logging = self.request_logging;
         let default_headers = self.default_headers.take().unwrap_or_default();
-        build_reqwest_client_with_custom_ca(self.reqwest_builder(proxy_routing))
-            .map(|inner| HttpClient::from_parts(inner, request_logging, default_headers))
+        build_reqwest_client_with_custom_ca(self.reqwest_builder(proxy_routing)).map(|inner| {
+            HttpClient::from_parts(inner, request_logging, default_headers)
+                .with_single_attempt(single_attempt)
+        })
     }
 
     pub(crate) fn build_with_custom_ca_fallback(
@@ -314,6 +326,7 @@ impl HttpClientBuilder {
     ) -> TransportClient {
         let request_logging = self.request_logging;
         let default_headers = self.default_headers.take().unwrap_or_default();
+        let mut single_attempt = self.single_attempt;
         let inner = match build_with_custom_ca(self.clone().reqwest_builder(proxy_routing)) {
             Ok(inner) => inner,
             Err(error) => {
@@ -331,11 +344,13 @@ impl HttpClientBuilder {
                             error = %fallback_error,
                             "failed to build fallback HTTP client"
                         );
+                        single_attempt = false;
                         reqwest::Client::new()
                     })
             }
         };
         TransportClient::new(inner, request_logging, default_headers)
+            .with_single_attempt(single_attempt)
     }
 
     fn into_reqwest_parts(mut self) -> (reqwest::ClientBuilder, RequestLogging, HeaderMap) {
@@ -358,6 +373,9 @@ impl HttpClientBuilder {
 
     fn base_reqwest_builder(self) -> reqwest::ClientBuilder {
         let mut builder = reqwest::Client::builder();
+        if self.single_attempt {
+            builder = builder.retry(reqwest::retry::never());
+        }
         if self.http2_prior_knowledge {
             builder = builder.http2_prior_knowledge();
         }
@@ -400,6 +418,7 @@ impl Default for HttpClientBuilder {
             http2_prior_knowledge: false,
             default_headers: None,
             follow_redirects: true,
+            single_attempt: false,
             redirect_observed: None,
             connect_timeout: None,
             chatgpt_cloudflare_cookie_store: false,

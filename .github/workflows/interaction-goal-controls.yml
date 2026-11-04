@@ -100,6 +100,10 @@ jobs:
           test "$(grep -c 'idle_only_turn_refuses_busy_without_recording_then_starts_internal_context: test' "$RUNNER_TEMP/idle-turn-tests.txt")" = 1
           RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all idle_only_turn_refuses_busy_without_recording_then_starts_internal_context -- --nocapture
           RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all legacy_permission_profile_requests_fail_closed -- --nocapture
+      - name: Shared inference allowance and no-replay transport regressions
+        run: |
+          cargo test --locked --profile dev-small -j 2 -p codex-api
+          cargo test --locked --profile dev-small -j 2 -p codex-http-client --lib single_attempt_pool_rejects_a_legacy_client_that_lost_its_contract
       - name: Build the native CLI and its required tool host
         id: native-build
         run: |

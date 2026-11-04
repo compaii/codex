@@ -268,6 +268,21 @@ pub fn create_client_for_route(
     create_client_for_route_with_builder(http_client_factory, request_url, route_class, builder)
 }
 
+/// Build a metered inference transport using the same proxy, cookies and CA policy,
+/// with redirects and transparent protocol/TLS replay disabled.
+pub fn create_single_attempt_client_for_route(
+    http_client_factory: &HttpClientFactory,
+    request_url: &str,
+    route_class: ClientRouteClass,
+) -> Result<HttpClient, BuildRouteAwareHttpClientError> {
+    create_client_for_route_with_builder(
+        http_client_factory,
+        request_url,
+        route_class,
+        default_http_client_builder().without_replays(),
+    )
+}
+
 fn create_client_for_route_with_builder(
     http_client_factory: &HttpClientFactory,
     request_url: &str,
