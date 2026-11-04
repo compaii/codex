@@ -551,26 +551,22 @@ async fn start_if_idle(
                 reason: NotSubmittedReason::NotIdle,
             });
         }
-        if let Some(expected) = expected_previous_turn_id
-            && session.state.lock().await.last_started_turn_id.as_ref() != Some(&expected)
-        {
-            return Ok(TurnInputSubmission::NotSubmitted {
-                reason: NotSubmittedReason::Superseded,
-            });
-        }
-        if kind != TurnStartKind::User
-            && start.inference_allowance.is_none()
-            && session
-                .state
-                .lock()
-                .await
-                .turn_attribution
-                .as_ref()
-                .is_some_and(|prior| prior.inference_allowance.is_some())
-        {
-            return Err(CodexErr::InvalidRequest(
-                "automatic successor of bounded execution requires fresh reserved admission".into(),
-            ));
+        if let Some(expected) = expected_previous_turn_id {
+            let state = session.state.lock().await;
+            if state.last_started_turn_id.as_ref() != Some(&expected) {
+                return Ok(TurnInputSubmission::NotSubmitted {
+                    reason: NotSubmittedReason::Superseded,
+                });
+            }
+            if start.inference_allowance.is_none()
+                && state.turn_attribution.as_ref().is_some_and(|prior| {
+                    prior.turn_id == expected && prior.inference_allowance.is_some()
+                })
+            {
+                return Err(CodexErr::InvalidRequest(
+                    "continuation of bounded execution requires fresh reserved admission".into(),
+                ));
+            }
         }
         let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
         Arc::clone(&active_turn.turn_state)
@@ -754,17 +750,6 @@ impl Session {
     ) -> Option<(Arc<tokio::sync::Mutex<TurnState>>, TurnStartOptions)> {
         let mut active_turn = self.active_turn.lock().await;
         if active_turn.is_some() {
-            return None;
-        }
-        if self
-            .state
-            .lock()
-            .await
-            .turn_attribution
-            .as_ref()
-            .is_some_and(|prior| prior.inference_allowance.is_some())
-        {
-            // Trigger mail is retained for fresh admission, not an unmetered wakeup.
             return None;
         }
         let needs_new_turn = self.input_queue.has_trigger_turn_mailbox_items().await;

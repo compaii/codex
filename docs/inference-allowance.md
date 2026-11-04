@@ -25,15 +25,23 @@ The regular-task lifetime is bounded by the same deadline and closes the
 allocation on exit. Human steering does not erase the running turn's limits;
 a subsequent independent ordinary turn inherits no allocation. Bounded
 attribution is retained through history/compaction only to refuse reconstruction
-on recovery. Automatic daemon recovery, unreserved automatic successors and durable-sleep continuation cannot
-manufacture a fresh allocation for that interrupted bounded turn.
+on recovery. Automatic daemon recovery, direct `ContinueIfIdle` of that exact
+bounded predecessor and queue-only durable-sleep restoration cannot manufacture
+a fresh allocation. Independent `StartIfIdle` and explicit trigger-mail work keep
+their existing authority; a previous bounded turn does not prohibit unrelated
+persisted goal continuation. Chronological adjacency is not causal ownership.
 
 These are source changes under qualification, not receiving deployment or a
 working heartbeat. Durable parent accounting is owned by DaimonApp#452/PR590.
 Native descendant/reviewer inference, external tools, actual recovery and
-cancellation journeys, schema/client exports and the producer-to-native binding
-still require qualification before enabling a heartbeat producer. Bounded lifecycle callbacks leave the existing thread goal and its accounting
-untouched; independent human turns remain ordinary admissions. No account,
+cancellation journeys and the finite producer still require qualification before
+enabling a heartbeat producer. Schema/client exports and the durable
+producer-to-native allocation binding have focused source qualification, not
+receiving acceptance. Bounded lifecycle callbacks leave the existing thread goal
+and its accounting untouched. The existing extension-tool execution boundary
+rejects bounded `create_goal` and `update_goal`, while retaining `get_goal` and
+authenticated human goal controls. An independently authorized goal may resume
+while attention is busy and continue afterward with its own authority. No account,
 model attention or periodic producer is activated by this component.
 
 For HTTP, build the existing configured client with

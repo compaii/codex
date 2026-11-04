@@ -1165,7 +1165,7 @@ async fn bounded_recovery_refuses_instead_of_replenishing_spent_attempts() {
 }
 
 #[tokio::test]
-async fn bounded_predecessor_refuses_an_unreserved_automatic_successor() {
+async fn bounded_predecessor_refuses_an_unreserved_direct_continuation() {
     let (session, _) = make_session_and_context().await;
     let session = Arc::new(session);
     session.state.lock().await.turn_attribution = Some(codex_history::TurnAttribution {
@@ -1182,7 +1182,7 @@ async fn bounded_predecessor_refuses_an_unreserved_automatic_successor() {
         initiating_agent_path: None,
         root_turn_id: None,
     });
-    assert!(session.reserve_pending_work_turn().await.is_none());
+    session.state.lock().await.last_started_turn_id = Some("bounded-predecessor".into());
     let input = TurnInputRequest::new(SubmittedTurnInput::ResponseItem(
         ResponseItem::FunctionCallOutput {
             id: None,
@@ -1200,7 +1200,9 @@ async fn bounded_predecessor_refuses_an_unreserved_automatic_successor() {
         handle(
             &session,
             input,
-            TurnInputMode::StartIfIdle,
+            TurnInputMode::ContinueIfIdle {
+                expected_previous_turn_id: "bounded-predecessor".into(),
+            },
             "unreserved-successor".into()
         )
         .await
