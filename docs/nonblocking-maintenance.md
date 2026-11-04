@@ -56,6 +56,38 @@ uncertain originals. Initial pinned local-package selection/restart is a separat
 operation only after confirmed old-process exit, using the supported complete
 local-package route.
 
+### Pinned local packages
+
+Use the existing confirmed-handoff sequence for a complete local package:
+
+```text
+codex app-server daemon maintenance
+# Require handoffReady, actual old-process exit and the saved idle snapshot.
+PACKAGE/bin/codex app-server daemon update --from-cli --if-stopped --yes
+PACKAGE/bin/codex app-server daemon restart --if-stopped
+```
+
+The first command retains its existing private control/133second observation.
+Unsupported, busy, lost or unconfirmed handoffs leave work serving; never proceed
+to package selection from an unconfirmed outcome. Observe actual process exit,
+not just a stale PID file, failed probe, elapsed timeout or saved snapshot.
+
+`update --from-cli --if-stopped` uses the existing complete-package installer,
+confirmation and operation-lock recheck. It refuses a running receiver even with
+`--yes`; a receiver that appears after confirmation also prevents replacement.
+`restart --if-stopped` takes the existing lifecycle lock, refuses any serving or
+starting receiver, and requires a stored parseable native snapshot within64MiB
+with no recorded interrupted turns. It uses the existing stopped restart route,
+preserving recovery; missing/consumed/invalid/interrupted snapshots never become
+a fresh start. The flags leave ordinary explicit update/restart semantics intact.
+
+Run the finite receiving coordinator through its existing independent managed
+launcher/checkpoint. Verify the actual launch and replacement cgroups: detaching
+a process/session does not move it out of a service scheduled to stop. Do not put
+the replacement daemon in a transient build unit whose completion will kill its
+children. Keep the previous selected code and current native state; no historical
+machine archive, input replay or new model attention is required.
+
 Scheduled automatic updates prepare/select the available complete package through
 the existing installer, but adopt it in the running daemon only after nonblocking
 maintenance and observed exit of the retained process generation. The updater

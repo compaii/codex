@@ -121,6 +121,10 @@ jobs:
           test -x target/dev-small/codex-code-mode-host
           sha256sum target/dev-small/codex target/dev-small/codex-code-mode-host
           git rev-parse HEAD > target/dev-small/interaction-source.txt
+      - name: Confirmed maintenance and stopped-only local package guards
+        run: |
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server-daemon --lib
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-cli --bin codex daemon_
       - name: Foreground control notices without agent input
         run: cargo test --locked --profile dev-small -j 2 -p codex-tui --lib foreground_notices -- --nocapture
       - name: Exercise the actual core-to-tool-host connection
