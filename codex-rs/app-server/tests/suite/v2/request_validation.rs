@@ -68,6 +68,11 @@ async fn legacy_permission_profile_requests_fail_closed() -> Result<()> {
             }),
         ),
         (
+            "turn/startBoundedIfIdle",
+            json!({"turn":{"threadId":"missing-thread","input":[],"permissionProfile":legacy_permission_profile.clone()},
+                "allowance":{"maxProviderAttempts":1,"maxRequestBytes":1024,"deadlineUnixMs":42}}),
+        ),
+        (
             "turn/startIfIdle",
             json!({"threadId":"missing-thread","input":[],"permissionProfile":legacy_permission_profile.clone()}),
         ),

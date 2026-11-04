@@ -202,6 +202,17 @@ impl<C: Sync> ExtensionRegistry<C> {
         }
     }
 
+    pub fn admit_goal_continuation(
+        &self,
+        thread_id: codex_protocol::ThreadId,
+        on_deferred: Box<dyn FnOnce() + Send>,
+    ) -> Option<Box<dyn Send>> {
+        match &self.turn_start_admission {
+            Some(admission) => admission.admit_goal_continuation(thread_id, on_deferred),
+            None => Some(Box::new(())),
+        }
+    }
+
     /// Admit only already-delegated child work, distinct from automatic starts.
     pub fn admit_delegated_turn_start(&self) -> Option<Box<dyn Send>> {
         match &self.turn_start_admission {

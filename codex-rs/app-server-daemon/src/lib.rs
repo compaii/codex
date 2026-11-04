@@ -63,6 +63,8 @@ const STATE_DIR_NAME: &str = "app-server-daemon";
 pub enum LifecycleCommand {
     Start,
     Restart,
+    /// Restore a confirmed maintenance snapshot only if no receiver is serving.
+    RestoreIfStopped,
     Stop,
     Version,
 }
@@ -244,7 +246,10 @@ pub async fn maintenance() -> Result<MaintenanceOutput> {
 pub async fn run(command: LifecycleCommand) -> Result<LifecycleOutput> {
     ensure_supported_platform()?;
     #[cfg(windows)]
-    if matches!(command, LifecycleCommand::Start | LifecycleCommand::Restart) {
+    if matches!(
+        command,
+        LifecycleCommand::Start | LifecycleCommand::Restart | LifecycleCommand::RestoreIfStopped
+    ) {
         backend::windows::ensure_not_elevated()?;
     }
     // Keep daemon package preparation off callers' async stack frames.
@@ -411,6 +416,7 @@ impl Daemon {
         match command {
             LifecycleCommand::Start => selected.start(&BTreeMap::new()).await,
             LifecycleCommand::Restart => selected.restart().await,
+            LifecycleCommand::RestoreIfStopped => selected.restore_if_stopped().await,
             LifecycleCommand::Stop => {
                 let output = selected.stop().await?;
                 if let Err(err) = thread_recovery::discard_pending(&selected) {
@@ -523,6 +529,30 @@ impl Daemon {
                 Some(info.app_server_version),
             )
             .await)
+    }
+
+    /// Called under the existing lifecycle lock. Never stop another receiver or
+    /// treat a missing/consumed/interrupted snapshot as a fresh start.
+    async fn restore_if_stopped(&self) -> Result<LifecycleOutput> {
+        let settings = self.load_settings().await?;
+        anyhow::ensure!(
+            self.running_backend_instance(&settings).await?.is_none()
+                && client::probe(&self.socket_path).await.is_err(),
+            "a receiver is serving or starting; maintenance restore left it unchanged"
+        );
+        let path = self.recovery_file()?;
+        let metadata =
+            std::fs::metadata(&path).context("confirmed maintenance snapshot is required")?;
+        anyhow::ensure!(
+            metadata.is_file() && metadata.len() <= 64 * 1024 * 1024,
+            "maintenance snapshot exceeds the native64MiB bound"
+        );
+        let snapshot = codex_app_server_transport::daemon_recovery::read_snapshot(&path)?;
+        anyhow::ensure!(
+            snapshot.interrupted.is_empty(),
+            "interrupted native work is not a confirmed idle-maintenance snapshot"
+        );
+        self.restart_with_settings(settings).await
     }
 
     #[cfg(any(unix, windows))]
@@ -1488,12 +1518,56 @@ mod tests {
             LifecycleStatus::NotRunning
         );
         assert!(!daemon.recovery_file().expect("recovery path").exists());
+        daemon
+            .run(super::LifecycleCommand::RestoreIfStopped)
+            .await
+            .expect_err("restore cannot turn a missing snapshot into a cold start");
         // Simulate an older stop client leaving a snapshot behind.
         std::fs::write(
             daemon.recovery_file().expect("recovery path"),
             r#"["thread"]"#,
         )
         .expect("legacy saved threads");
+        daemon
+            .run(super::LifecycleCommand::RestoreIfStopped)
+            .await
+            .expect_err("missing complete backend package");
+        assert_eq!(
+            std::fs::read_to_string(daemon.recovery_file().unwrap()).unwrap(),
+            r#"["thread"]"#
+        );
+        let snapshot = codex_app_server_transport::daemon_recovery::RecoverySnapshot {
+            loaded: ["thread".to_string()].into_iter().collect(),
+            interrupted: [(
+                "thread".to_string(),
+                codex_app_server_transport::daemon_recovery::InterruptedTurn {
+                    turn_id: "incomplete".into(),
+                    output_schema: None,
+                    service_tier: None,
+                    cyber_access_program: None,
+                    local_environment: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        codex_app_server_transport::daemon_recovery::write_snapshot(
+            &daemon.recovery_file().unwrap(),
+            &snapshot,
+        )
+        .unwrap();
+        let error = daemon
+            .run(super::LifecycleCommand::RestoreIfStopped)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("interrupted native work"));
+        assert_eq!(
+            codex_app_server_transport::daemon_recovery::read_snapshot(
+                &daemon.recovery_file().unwrap()
+            )
+            .unwrap(),
+            snapshot
+        );
         daemon
             .run(super::LifecycleCommand::Start)
             .await
@@ -1536,6 +1610,18 @@ mod tests {
         let backend = crate::backend::pid_backend(daemon.backend_paths(&settings));
         backend.start().await.expect("start local backend");
         let bootstrapped = daemon.is_bootstrapped(&settings).await;
+        let pid_record = std::fs::read(&daemon.pid_file).unwrap();
+        let guard = daemon.acquire_operation_lock().await.unwrap();
+        let result = daemon.restore_if_stopped().await;
+        drop(guard);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("receiver is serving")
+        );
+        assert_eq!(std::fs::read(&daemon.pid_file).unwrap(), pid_record);
+        assert!(backend.is_starting_or_running().await.unwrap());
         backend.stop().await.expect("stop local backend");
         assert!(bootstrapped.expect("managed local backend"));
     }

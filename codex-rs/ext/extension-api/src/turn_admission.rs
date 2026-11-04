@@ -10,6 +10,19 @@
 pub trait TurnStartAdmission: std::fmt::Debug + Send + Sync {
     fn admit_turn_start(&self) -> Option<Box<dyn Send>>;
 
+    /// Reserve an internally generated goal continuation. A maintenance host may
+    /// retain one revalidation callback per thread until its bounded request is
+    /// abandoned. Explicit shutdown never resumes withheld work.
+    fn admit_goal_continuation(
+        &self,
+        _thread_id: codex_protocol::ThreadId,
+        _on_deferred: Box<dyn FnOnce() + Send>,
+    ) -> Option<Box<dyn Send>> {
+        // Core still checks ordinary admission at actual submission. Hosts
+        // without maintenance support must not acquire an extra quota permit.
+        Some(Box::new(()))
+    }
+
     /// Admission for explicit parent-delegated child work. Ungated hosts retain
     /// the historical exception; a draining host can require a live parent task.
     fn admit_delegated_turn_start(&self) -> Option<Box<dyn Send>> {

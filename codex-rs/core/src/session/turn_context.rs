@@ -531,6 +531,10 @@ impl TurnContext {
 
     pub(crate) fn attribution(&self) -> codex_history::TurnAttribution {
         codex_history::TurnAttribution {
+            inference_allowance: self
+                .extension_data
+                .get::<codex_protocol::turn_input::TurnInferenceAllowance>()
+                .map(|spec| Box::new(spec.as_ref().clone())),
             turn_id: self.sub_id.clone(),
             turn_trigger: self.turn_metadata_state.current_turn_trigger(),
             parent_turn_id: self.turn_metadata_state.parent_turn_id(),

@@ -55,6 +55,12 @@ jobs:
         uses: ./.github/actions/setup-rusty-v8
         with:
           target: x86_64-unknown-linux-gnu
+      - name: Qualify maintenance continuation correction before package builds
+        run: |
+          cargo test --locked --profile dev-small -j 2 -p codex-app-server --lib turn_admission -- --nocapture
+          cargo test --locked --profile dev-small -j 2 -p codex-app-server --lib maintenance -- --nocapture
+          cargo test --locked --profile dev-small -j 2 -p codex-goal-extension --test goal_extension_backend
+          cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all daemon_update_recovery -- --nocapture
       - name: Build the CLI required by Core remote-session fixtures
         run: |
           cargo build --locked --profile dev-small -j 2 -p codex-cli --bin codex
@@ -75,19 +81,13 @@ jobs:
           cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all guardian_v2::goals -- --nocapture
       - name: Nonforcing caller and managed transport contracts
         run: |
-          cargo test --locked --profile dev-small -j 2 -p codex-app-server-daemon --lib maintenance -- --nocapture
-          cargo test --locked --profile dev-small -j 2 -p codex-app-server-daemon --lib scheduled_no_op -- --nocapture
-          cargo test --locked --profile dev-small -j 2 -p codex-app-server-daemon --lib manual_update_restarts -- --nocapture
+          cargo test --locked --profile dev-small -j 2 -p codex-app-server-daemon --lib -- --nocapture
+          cargo test --locked --profile dev-small -j 2 -p codex-cli --bin codex daemon_ -- --nocapture
           cargo test --locked --profile dev-small -j 2 -p codex-app-server-transport --lib maintenance -- --nocapture
-      - name: Admission, maintenance timeout and explicit shutdown contracts
-        run: |
-          cargo test --locked --profile dev-small -j 2 -p codex-app-server --lib maintenance -- --nocapture
-          cargo test --locked --profile dev-small -j 2 -p codex-app-server --lib shutdown_waits -- --nocapture
-          cargo test --locked --profile dev-small -j 2 -p codex-app-server --lib turn_admission -- --nocapture
-      - name: Signal-driven process and managed failure regressions
-        run: |
-          cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all connection_handling_websocket_unix -- --nocapture
-          cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all daemon_update_recovery -- --nocapture
+      - name: Explicit shutdown contracts
+        run: cargo test --locked --profile dev-small -j 2 -p codex-app-server --lib shutdown_waits -- --nocapture
+      - name: Signal-driven process regressions
+        run: cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all connection_handling_websocket_unix -- --nocapture
       - name: Core input and automatic-start admission contracts
         run: |
           cargo test --locked --profile dev-small -j 2 -p codex-core --lib session::input_queue -- --nocapture

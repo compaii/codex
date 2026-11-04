@@ -94,6 +94,11 @@ impl RouteAwareClientPool {
                 let (current_route, mut client, selected_tls_backend) = self
                     .client_for_url_with_resolver(current_url.as_str(), &resolve_route)
                     .await?;
+                if self.client_builder.single_attempt && !client.single_attempt {
+                    return Err(RouteAwareRequestError::Build(
+                        "resolved HTTP client lost the single-attempt contract".into(),
+                    ));
+                }
                 client.request_logging = self.client_builder.request_logging;
                 if let Some(headers) = draft_headers.take() {
                     request = RequestDraft { request, headers }.build(&client)?;

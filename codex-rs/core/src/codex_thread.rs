@@ -422,6 +422,18 @@ impl CodexThread {
             .await
     }
 
+    /// Reserve an internal goal continuation through submission. This is not a
+    /// user input or a goal mutation. A deferred callback must revalidate state.
+    pub fn admit_goal_continuation(
+        &self,
+        on_deferred: Box<dyn FnOnce() + Send>,
+    ) -> Option<Box<dyn Send>> {
+        self.session
+            .services
+            .extensions
+            .admit_goal_continuation(self.session.thread_id, on_deferred)
+    }
+
     /// Starts a regular turn only when the thread is idle.
     ///
     /// Core declines the input without recording or enqueueing it when idle

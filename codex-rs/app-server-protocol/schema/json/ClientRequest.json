@@ -5881,6 +5881,32 @@
       ],
       "type": "object"
     },
+    "TurnInferenceAllowance": {
+      "additionalProperties": false,
+      "description": "A durably reserved allocation for one physical execution. This is not an account grant. Never reconstruct it to recover accepted or uncertain work.",
+      "properties": {
+        "deadlineUnixMs": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "maxProviderAttempts": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "maxRequestBytes": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "deadlineUnixMs",
+        "maxProviderAttempts",
+        "maxRequestBytes"
+      ],
+      "type": "object"
+    },
     "TurnInterruptParams": {
       "properties": {
         "threadId": {
@@ -5920,6 +5946,23 @@
           "type": "string"
         }
       ]
+    },
+    "TurnStartBoundedIfIdleParams": {
+      "additionalProperties": false,
+      "description": "Mandatory bounded idle-only admission. An older server must reject this method rather than ignore an optional field on ordinary turn/start.",
+      "properties": {
+        "allowance": {
+          "$ref": "#/definitions/TurnInferenceAllowance"
+        },
+        "turn": {
+          "$ref": "#/definitions/TurnStartParams"
+        }
+      },
+      "required": [
+        "allowance",
+        "turn"
+      ],
+      "type": "object"
     },
     "TurnStartParams": {
       "properties": {
@@ -8029,6 +8072,31 @@
         "params"
       ],
       "title": "Turn/startIfIdleRequest",
+      "type": "object"
+    },
+    {
+      "description": "Idle-only admission with mandatory physical-execution limits.",
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "turn/startBoundedIfIdle"
+          ],
+          "title": "Turn/startBoundedIfIdleRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/TurnStartBoundedIfIdleParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Turn/startBoundedIfIdleRequest",
       "type": "object"
     },
     {

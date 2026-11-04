@@ -57,6 +57,12 @@ jobs:
         uses: ./.github/actions/setup-rusty-v8
         with:
           target: x86_64-unknown-linux-gnu
+      - name: Maintenance goal admission and revalidated defer recovery
+        run: |
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server --lib turn_admission -- --nocapture
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server --lib maintenance -- --nocapture
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-goal-extension --test goal_extension_backend
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all daemon_update_recovery -- --nocapture
       - name: Resolved idle resume reuse and configuration boundaries
         run: |
           cargo test --locked --profile dev-small -j 2 -p codex-core -p codex-app-server --lib resolved_resume -- --list > "$RUNNER_TEMP/resume-tests.txt"
@@ -100,6 +106,17 @@ jobs:
           test "$(grep -c 'idle_only_turn_refuses_busy_without_recording_then_starts_internal_context: test' "$RUNNER_TEMP/idle-turn-tests.txt")" = 1
           RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all idle_only_turn_refuses_busy_without_recording_then_starts_internal_context -- --nocapture
           RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all legacy_permission_profile_requests_fail_closed -- --nocapture
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all bounded_idle_turn_refuses_busy_then_starts_with_required_allocation -- --nocapture
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all bounded_attention_preserves_human_goal_and_independent_continuation -- --nocapture
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all multi_agent_v2_tools_emit_collaborator_analytics -- --nocapture
+      - name: Bounded turn admission, lifecycle and unrelated goal isolation
+        run: |
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-core --lib -- session::turn_input::tests::bounded session::async_compaction::tests::bounded turn_inference::tests::refuses guardian::tests::bounded_approval_review_defers_before_any_contributor
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-guardian-v2 --lib -- bounded_attention_invalidates_cached_scores_without_classification contributor_accounts_for_parent_checkpoint
+      - name: Shared inference allowance and no-replay transport regressions
+        run: |
+          cargo test --locked --profile dev-small -j 2 -p codex-api
+          cargo test --locked --profile dev-small -j 2 -p codex-http-client --lib single_attempt_pool_rejects_a_legacy_client_that_lost_its_contract
       - name: Build the native CLI and its required tool host
         id: native-build
         run: |
@@ -109,6 +126,10 @@ jobs:
           test -x target/dev-small/codex-code-mode-host
           sha256sum target/dev-small/codex target/dev-small/codex-code-mode-host
           git rev-parse HEAD > target/dev-small/interaction-source.txt
+      - name: Confirmed maintenance and stopped-only local package guards
+        run: |
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server-daemon --lib
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-cli --bin codex daemon_
       - name: Foreground control notices without agent input
         run: cargo test --locked --profile dev-small -j 2 -p codex-tui --lib foreground_notices -- --nocapture
       - name: Exercise the actual core-to-tool-host connection

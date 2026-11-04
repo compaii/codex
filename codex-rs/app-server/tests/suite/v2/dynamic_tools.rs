@@ -1015,18 +1015,30 @@ async fn wait_for_dynamic_tool_completed(
 #[tokio::test]
 async fn idle_only_turn_refuses_busy_without_recording_then_starts_internal_context() -> Result<()>
 {
+    exercise_idle_only_turn(false).await
+}
+
+#[tokio::test]
+async fn bounded_idle_turn_refuses_busy_then_starts_with_required_allocation() -> Result<()> {
+    exercise_idle_only_turn(true).await
+}
+
+async fn exercise_idle_only_turn(bounded: bool) -> Result<()> {
+    let reply = if bounded {
+        responses::sse(vec![
+            responses::ev_response_created("bounded-reply"),
+            responses::ev_function_call("bounded-tool", "demo_tool", r#"{"city":"Paris"}"#),
+            responses::ev_completed("bounded-reply"),
+        ])
+    } else {
+        create_final_assistant_message_sse_response("Heartbeat reviewed")?
+    };
     let PendingDynamicToolCall {
         mut mcp,
         server,
         request_id,
         params,
-    } = start_function_dynamic_tool_call_with_responses(
-        "human-held-tool",
-        vec![create_final_assistant_message_sse_response(
-            "Heartbeat reviewed",
-        )?],
-    )
-    .await?;
+    } = start_function_dynamic_tool_call_with_responses("human-held-tool", vec![reply]).await?;
     let marker = "Exact heartbeat context: not a human utterance";
     let heartbeat = TurnStartParams {
         thread_id: params.thread_id.clone(),
@@ -1037,11 +1049,31 @@ async fn idle_only_turn_refuses_busy_without_recording_then_starts_internal_cont
             retain: true,
             output: codex_protocol::models::FunctionCallOutputBody::Text(marker.into()),
         })),
+        additional_context: if bounded {
+            Some(serde_json::from_value(json!({
+                "heartbeat.context": {"kind":"application", "value":"Exact bounded application context revision"}
+            }))?)
+        } else {
+            None
+        },
         ..Default::default()
     };
-    let busy = mcp
-        .send_request("turn/startIfIdle", Some(serde_json::to_value(&heartbeat)?))
-        .await?;
+    let (method, payload) = if bounded {
+        (
+            "turn/startBoundedIfIdle",
+            json!({
+                "turn":heartbeat,
+                "allowance":{
+                    "maxProviderAttempts":1,
+                    "maxRequestBytes":1024*1024,
+                    "deadlineUnixMs":chrono::Utc::now().timestamp_millis()+30_000
+                }
+            }),
+        )
+    } else {
+        ("turn/startIfIdle", serde_json::to_value(&heartbeat)?)
+    };
+    let busy = mcp.send_request(method, Some(payload.clone())).await?;
     let error = timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_error_message(RequestId::Integer(busy)),
@@ -1078,17 +1110,52 @@ async fn idle_only_turn_refuses_busy_without_recording_then_starts_internal_cont
         !serde_json::to_string(&before)?.contains(marker),
         "Refused input must not be queued or enter human context"
     );
-    let idle = mcp
-        .send_request("turn/startIfIdle", Some(serde_json::to_value(&heartbeat)?))
-        .await?;
+    let idle = mcp.send_request(method, Some(payload)).await?;
     let TurnStartResponse { turn } =
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(idle)).await??;
     assert_ne!(turn.id, params.turn_id);
-    timeout(
+    if bounded {
+        wait_for_dynamic_tool_started(&mut mcp, "bounded-tool").await?;
+        let request = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_request_message(),
+        )
+        .await??;
+        let ServerRequest::DynamicToolCall {
+            request_id,
+            params: tool,
+        } = request
+        else {
+            anyhow::bail!("expected bounded dynamic tool request");
+        };
+        assert_eq!(tool.turn_id, turn.id);
+        mcp.send_response(
+            request_id,
+            serde_json::to_value(DynamicToolCallResponse {
+                content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                    text: "bounded tool completed".into(),
+                }],
+                success: true,
+            })?,
+        )
+        .await?;
+    }
+    let completed = timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
+    if bounded {
+        assert_eq!(
+            completed
+                .params
+                .as_ref()
+                .and_then(|params| params.pointer("/turn/status"))
+                .and_then(Value::as_str),
+            Some("failed"),
+            "the second inference must fail locally without another provider request"
+        );
+    }
     let bodies = responses_bodies(&server).await?;
     assert_eq!(bodies.len(), 3);
     let input = bodies[2]["input"]

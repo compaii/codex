@@ -1,3 +1,4 @@
+use crate::InferenceAllowance;
 use crate::auth::SharedAuthProvider;
 use crate::common::ResponseEvent;
 use crate::common::ResponseInterrupt;
@@ -59,6 +60,7 @@ enum WsCommand {
     Send {
         message: Message,
         tx_result: oneshot::Sender<Result<(), WsError>>,
+        inference_allowance: Option<Arc<InferenceAllowance>>,
     },
 }
 
@@ -76,8 +78,18 @@ impl WsStream {
                             break;
                         };
                         match command {
-                            WsCommand::Send { message, tx_result } => {
-                                let result = inner.send(message).await;
+                            WsCommand::Send { message, tx_result, inference_allowance } => {
+                                // The queue/pump is the physical write boundary. An
+                                // expired queued command must not acquire a fresh lease.
+                                let result = if let Some(allowance) = inference_allowance {
+                                    match allowance.claim_attempt() {
+                                        Ok(remaining) => tokio::time::timeout(remaining, inner.send(message)).await
+                                            .unwrap_or_else(|_| Err(WsError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "native inference allowance deadline expired")))),
+                                        Err(error) => Err(WsError::Io(std::io::Error::other(error.to_string()))),
+                                    }
+                                } else {
+                                    inner.send(message).await
+                                };
                                 let should_break = result.is_err();
                                 let _ = tx_result.send(result);
                                 if should_break {
@@ -143,9 +155,17 @@ impl WsStream {
         Err(WsError::ConnectionClosed)
     }
 
-    async fn send(&mut self, message: Message) -> Result<(), WsError> {
-        self.request(|tx_result| WsCommand::Send { message, tx_result })
-            .await
+    async fn send_with_allowance(
+        &mut self,
+        message: Message,
+        inference_allowance: Option<Arc<InferenceAllowance>>,
+    ) -> Result<(), WsError> {
+        self.request(|tx_result| WsCommand::Send {
+            message,
+            tx_result,
+            inference_allowance,
+        })
+        .await
     }
 
     async fn next(&mut self) -> Option<Result<Message, WsError>> {
@@ -245,6 +265,36 @@ impl ResponsesWebsocketConnection {
         connection_reused: bool,
         turn_state: Option<Arc<OnceLock<String>>>,
     ) -> Result<ResponseStream, ApiError> {
+        self.stream_request_inner(request, connection_reused, turn_state, None)
+            .await
+    }
+
+    /// The owner supplies the size of the COMPLETE logical request before
+    /// incremental WebSocket encoding, not just this delta's wire bytes.
+    pub async fn stream_request_with_allowance(
+        &self,
+        request: ResponsesWsRequest<'_>,
+        connection_reused: bool,
+        turn_state: Option<Arc<OnceLock<String>>>,
+        complete_request_bytes: usize,
+        allowance: Arc<InferenceAllowance>,
+    ) -> Result<ResponseStream, ApiError> {
+        self.stream_request_inner(
+            request,
+            connection_reused,
+            turn_state,
+            Some((allowance, complete_request_bytes)),
+        )
+        .await
+    }
+
+    async fn stream_request_inner(
+        &self,
+        request: ResponsesWsRequest<'_>,
+        connection_reused: bool,
+        turn_state: Option<Arc<OnceLock<String>>>,
+        allowance: Option<(Arc<InferenceAllowance>, usize)>,
+    ) -> Result<ResponseStream, ApiError> {
         let (tx_event, rx_event) =
             mpsc::channel::<std::result::Result<ResponseEvent, ApiError>>(1600);
         let (tx_interrupt, rx_interrupt) = oneshot::channel();
@@ -279,6 +329,14 @@ impl ResponsesWebsocketConnection {
             connection_reused,
         };
         let request_text = serialize_websocket_request(&request)?;
+        if let Some((allowance, complete_bytes)) = &allowance {
+            allowance
+                .validate_request((*complete_bytes).max(request_text.len()))
+                .map_err(|error| ApiError::InvalidRequest {
+                    message: error.to_string(),
+                })?;
+        }
+        let inference_allowance = allowance.map(|(allowance, _)| allowance);
 
         let current_span = Span::current();
         tokio::spawn(
@@ -312,6 +370,14 @@ impl ResponsesWebsocketConnection {
                     }
                 };
                 tokio::pin!(interrupt_timeout);
+                let allowance_deadline = async {
+                    if let Some(allowance) = &inference_allowance {
+                        tokio::time::sleep_until(allowance.deadline()).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                };
+                tokio::pin!(allowance_deadline);
                 let mut guard = tokio::select! {
                     biased;
                     _ = tx_event.closed() => return,
@@ -319,6 +385,10 @@ impl ResponsesWebsocketConnection {
                         let _ = tx_event.send(Err(ApiError::Stream(
                             "timed out draining interrupted response".into(),
                         ))).await;
+                        return;
+                    }
+                    () = &mut allowance_deadline => {
+                        let _ = tx_event.send(Err(ApiError::InvalidRequest { message: "native inference allowance deadline expired".into() })).await;
                         return;
                     }
                     guard = stream.lock() => guard,
@@ -349,7 +419,9 @@ impl ResponsesWebsocketConnection {
                             &timing_log_context,
                             interrupt.clone(),
                             &mut completion,
+                            inference_allowance.clone(),
                         ) => result,
+                        () = &mut allowance_deadline => Err(ApiError::InvalidRequest { message: "native inference allowance deadline expired".into() }),
                         () = &mut interrupt_timeout => Err(ApiError::Stream(
                             "timed out draining interrupted response".into(),
                         )),
@@ -716,6 +788,7 @@ async fn run_websocket_response_stream(
     timing_log_context: &ResponsesWebsocketTimingLogContext,
     interrupt: impl Future<Output = ResponseInterrupt> + Clone + Unpin,
     completion: &mut Option<ResponseEvent>,
+    inference_allowance: Option<Arc<InferenceAllowance>>,
 ) -> Result<(), ApiError> {
     let mut last_server_model: Option<String> = None;
     let mut safety_buffering_treatment = SafetyBufferingTreatment::default();
@@ -726,12 +799,13 @@ async fn run_websocket_response_stream(
         // No request reached the backend, so this socket is still reusable.
         return Ok(());
     }
-    send_websocket_request(
+    send_websocket_request_with_allowance(
         ws_stream,
         request_text,
         idle_timeout,
         telemetry.as_ref(),
         timing_log_context.connection_reused,
+        inference_allowance,
     )
     .await?;
 
@@ -1004,10 +1078,29 @@ async fn send_websocket_request(
     telemetry: Option<&Arc<dyn WebsocketTelemetry>>,
     connection_reused: bool,
 ) -> Result<(), ApiError> {
+    send_websocket_request_with_allowance(
+        ws_stream,
+        request_text,
+        idle_timeout,
+        telemetry,
+        connection_reused,
+        None,
+    )
+    .await
+}
+
+async fn send_websocket_request_with_allowance(
+    ws_stream: &mut WsStream,
+    request_text: String,
+    idle_timeout: Duration,
+    telemetry: Option<&Arc<dyn WebsocketTelemetry>>,
+    connection_reused: bool,
+    inference_allowance: Option<Arc<InferenceAllowance>>,
+) -> Result<(), ApiError> {
     let request_start = Instant::now();
     let result = tokio::time::timeout(
         idle_timeout,
-        ws_stream.send(Message::Text(request_text.into())),
+        ws_stream.send_with_allowance(Message::Text(request_text.into()), inference_allowance),
     )
     .await
     .map_err(|_| ApiError::Stream("idle timeout sending websocket request".into()))

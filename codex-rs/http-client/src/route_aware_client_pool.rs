@@ -310,11 +310,14 @@ impl RouteAwareClientPool {
 
     /// Retries recognized TLS protocol-negotiation failures once using rustls.
     ///
+    /// A builder configured with `without_replays()` keeps TLS replay disabled.
     /// Successful fallback is remembered for each HTTPS origin and resolved outbound route.
     /// Rustls clients are reused across fallback destinations that share a route, while other
     /// destinations retain the existing transport-default backend.
     pub fn with_tls_backend_fallback(mut self) -> Self {
-        self.rustls_clients = Some(RustlsClientCache::default());
+        if !self.client_builder.single_attempt {
+            self.rustls_clients = Some(RustlsClientCache::default());
+        }
         self
     }
 
@@ -543,6 +546,12 @@ impl RouteAwareClientPool {
         .await
         .map_err(RouteAwareClientPoolError::BuildTask)??;
         Ok((route, client, SelectedTlsBackend::TransportDefault))
+    }
+
+    pub(crate) fn supports_single_attempt(&self) -> bool {
+        self.client_builder.single_attempt
+            && !self.client_builder.follows_redirects()
+            && self.rustls_clients.is_none()
     }
 
     fn follows_redirects_manually(&self) -> bool {

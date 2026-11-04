@@ -661,7 +661,11 @@ enum AppServerDaemonSubcommand {
     Maintenance,
 
     /// Restart the local app server daemon.
-    Restart,
+    Restart {
+        /// Restore saved maintenance only if the daemon is still stopped.
+        #[arg(long)]
+        if_stopped: bool,
+    },
 
     /// Update the daemon package (may interrupt running work).
     Update {
@@ -671,6 +675,9 @@ enum AppServerDaemonSubcommand {
         /// Confirm replacing the daemon package without an interactive prompt.
         #[arg(short = 'y', long, requires = "from_cli")]
         yes: bool,
+        /// Refuse replacement if a receiver is serving or appears during preparation.
+        #[arg(long, requires = "from_cli")]
+        if_stopped: bool,
     },
 
     /// Enable remote control for future starts and a currently running managed daemon.
@@ -1314,15 +1321,25 @@ async fn cli_main(
                         let output = codex_app_server_daemon::maintenance().await?;
                         println!("{}", serde_json::to_string(&output)?);
                     }
-                    AppServerDaemonSubcommand::Restart => {
-                        print_app_server_daemon_output(AppServerLifecycleCommand::Restart).await?;
+                    AppServerDaemonSubcommand::Restart { if_stopped } => {
+                        print_app_server_daemon_output(if if_stopped {
+                            AppServerLifecycleCommand::RestoreIfStopped
+                        } else {
+                            AppServerLifecycleCommand::Restart
+                        })
+                        .await?;
                     }
                     AppServerDaemonSubcommand::Update {
                         from_cli: true,
                         yes,
+                        if_stopped,
                     } => {
                         let result = codex_app_server_daemon::update_from_cli(|request| {
-                            daemon_install::confirm_install(request, yes)
+                            if if_stopped {
+                                daemon_install::confirm_install_if_stopped(request, yes)
+                            } else {
+                                daemon_install::confirm_install(request, yes)
+                            }
                         })
                         .await;
                         daemon_telemetry::record_command(
@@ -2337,7 +2354,7 @@ fn app_server_subcommand_name(subcommand: Option<&AppServerSubcommand>) -> &'sta
             AppServerDaemonSubcommand::Bootstrap(_) => "app-server daemon bootstrap",
             AppServerDaemonSubcommand::Start => "app-server daemon start",
             AppServerDaemonSubcommand::Maintenance => "app-server daemon maintenance",
-            AppServerDaemonSubcommand::Restart => "app-server daemon restart",
+            AppServerDaemonSubcommand::Restart { .. } => "app-server daemon restart",
             AppServerDaemonSubcommand::Update { .. } => "app-server daemon update",
             AppServerDaemonSubcommand::EnableRemoteControl => {
                 "app-server daemon enable-remote-control"
@@ -4710,6 +4727,37 @@ enabled = true
     fn app_server_daemon_subcommands_parse() {
         assert!(matches!(
             app_server_from_args(
+                ["codex", "app-server", "daemon", "restart", "--if-stopped"].as_ref()
+            )
+            .subcommand,
+            Some(AppServerSubcommand::Daemon(AppServerDaemonCommand {
+                subcommand: AppServerDaemonSubcommand::Restart { if_stopped: true }
+            }))
+        ));
+        assert!(matches!(
+            app_server_from_args(
+                [
+                    "codex",
+                    "app-server",
+                    "daemon",
+                    "update",
+                    "--from-cli",
+                    "--if-stopped",
+                    "--yes"
+                ]
+                .as_ref()
+            )
+            .subcommand,
+            Some(AppServerSubcommand::Daemon(AppServerDaemonCommand {
+                subcommand: AppServerDaemonSubcommand::Update {
+                    from_cli: true,
+                    yes: true,
+                    if_stopped: true
+                }
+            }))
+        ));
+        assert!(matches!(
+            app_server_from_args(
                 [
                     "codex",
                     "app-server",
@@ -4735,7 +4783,7 @@ enabled = true
         assert!(matches!(
             app_server_from_args(["codex", "app-server", "daemon", "restart"].as_ref()).subcommand,
             Some(AppServerSubcommand::Daemon(AppServerDaemonCommand {
-                subcommand: AppServerDaemonSubcommand::Restart
+                subcommand: AppServerDaemonSubcommand::Restart { if_stopped: false }
             }))
         ));
         assert!(matches!(

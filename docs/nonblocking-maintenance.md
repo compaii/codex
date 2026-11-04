@@ -12,8 +12,26 @@ while another session was genuinely working. A separate diagnostic loaded an
 entire large rollout into memory and triggered OOM; previous-package fallback
 restored availability. Neither event proves candidate adoption or graceful exit.
 
-The correction keeps maintenance pending with admission open for at most120s.
-It claims an idle boundary only with no preparing starts, no Core task lifetime
+The correction keeps maintenance pending with human admission open for at most120s.
+During that existing bounded lease, the same admission mutex withholds fresh
+internally generated goal continuations. A goal reservation already acquired may
+finish submitting; its permit prevents an idle claim. Active steering and human
+starts remain available, and required delegated work retains its existing path.
+This does not pause a goal, change an objective/status/budget or alter accounting.
+
+On timeout/defer/snapshot failure the gate releases one callback per withheld
+thread, outside its lock. Callbacks hold weak runtime references and perform one
+idle-start attempt after checking the exact goal snapshot revision under the
+existing goal-state semaphore. Later pause/clear/replacement/config changes win;
+Core still checks actual idle state and higher-priority pending trigger input.
+Resumption is bounded to one callback/attempt per withheld thread, not a poller or
+new maintenance lease. It serializes with ordinary goal control; no timeout
+cancels an in-flight control operation or a submitted turn. Existing persistent
+storage stalls remain an operational limitation, not permission to force work.
+Explicit Stop discards withheld callbacks. Successful handoff uses existing
+snapshot/startup recovery, not synthetic user originals or goal rewrites.
+
+The receiver claims an idle boundary only with no preparing starts, no Core task lifetime
 guards and no host-reported running turns. Shared guards cover both the task
 future and its abort owner through terminal persistence; delayed lifecycle events
 cannot manufacture idle. Mailbox/durable-sleep starts acquire admission before
@@ -29,6 +47,13 @@ prevent late abandoned writers from publishing startup recovery. Explicit stop
 retains its separate best-effort semantics; repeated maintenance is never force.
 The final atomic rename is a local filesystem commit: no application watchdog can
 guarantee progress if the operating system itself blocks that syscall.
+
+The goal-withholding behavior is a successor to source `15c365f19`. The existing
+v1 control capability proves nonblocking maintenance, not that an older serving
+binary contains this correction. Qualify and identify the actual selected source.
+An unselected package cannot retrofit suppression into its running predecessor;
+initial adoption still needs its supported idle handoff. An expired waiter must
+not be rearmed as a workaround.
 
 ## Receiving operation
 
@@ -55,6 +80,38 @@ never create a fresh pending window after the observer expires. Preserve the exa
 uncertain originals. Initial pinned local-package selection/restart is a separate
 operation only after confirmed old-process exit, using the supported complete
 local-package route.
+
+### Pinned local packages
+
+Use the existing confirmed-handoff sequence for a complete local package:
+
+```text
+codex app-server daemon maintenance
+# Require handoffReady, actual old-process exit and the saved idle snapshot.
+PACKAGE/bin/codex app-server daemon update --from-cli --if-stopped --yes
+PACKAGE/bin/codex app-server daemon restart --if-stopped
+```
+
+The first command retains its existing private control/133second observation.
+Unsupported, busy, lost or unconfirmed handoffs leave work serving; never proceed
+to package selection from an unconfirmed outcome. Observe actual process exit,
+not just a stale PID file, failed probe, elapsed timeout or saved snapshot.
+
+`update --from-cli --if-stopped` uses the existing complete-package installer,
+confirmation and operation-lock recheck. It refuses a running receiver even with
+`--yes`; a receiver that appears after confirmation also prevents replacement.
+`restart --if-stopped` takes the existing lifecycle lock, refuses any serving or
+starting receiver, and requires a stored parseable native snapshot within64MiB
+with no recorded interrupted turns. It uses the existing stopped restart route,
+preserving recovery; missing/consumed/invalid/interrupted snapshots never become
+a fresh start. The flags leave ordinary explicit update/restart semantics intact.
+
+Run the finite receiving coordinator through its existing independent managed
+launcher/checkpoint. Verify the actual launch and replacement cgroups: detaching
+a process/session does not move it out of a service scheduled to stop. Do not put
+the replacement daemon in a transient build unit whose completion will kill its
+children. Keep the previous selected code and current native state; no historical
+machine archive, input replay or new model attention is required.
 
 Scheduled automatic updates prepare/select the available complete package through
 the existing installer, but adopt it in the running daemon only after nonblocking

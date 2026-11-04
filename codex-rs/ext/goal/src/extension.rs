@@ -237,6 +237,13 @@ where
 {
     fn on_turn_start<'a>(&'a self, input: TurnStartInput<'a>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
+            if input
+                .turn_store
+                .get::<codex_protocol::turn_input::TurnInferenceAllowance>()
+                .is_some()
+            {
+                return;
+            }
             let Some(runtime) = goal_runtime_handle(input.thread_store) else {
                 return;
             };
@@ -301,6 +308,12 @@ where
         item: &'a TurnItem,
     ) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
+            if turn_store
+                .get::<codex_protocol::turn_input::TurnInferenceAllowance>()
+                .is_some()
+            {
+                return;
+            }
             if let Some(runtime) = goal_runtime_handle(thread_store)
                 && runtime.is_enabled()
             {
@@ -313,6 +326,13 @@ where
 
     fn on_turn_stop<'a>(&'a self, input: TurnStopInput<'a>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
+            if input
+                .turn_store
+                .get::<codex_protocol::turn_input::TurnInferenceAllowance>()
+                .is_some()
+            {
+                return;
+            }
             let Some(runtime) = goal_runtime_handle(input.thread_store) else {
                 return;
             };
@@ -379,6 +399,13 @@ where
 
     fn on_turn_abort<'a>(&'a self, input: TurnAbortInput<'a>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
+            if input
+                .turn_store
+                .get::<codex_protocol::turn_input::TurnInferenceAllowance>()
+                .is_some()
+            {
+                return;
+            }
             let Some(runtime) = goal_runtime_handle(input.thread_store) else {
                 return;
             };
@@ -422,6 +449,13 @@ where
 
     fn on_turn_error<'a>(&'a self, input: TurnErrorInput<'a>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
+            if input
+                .turn_store
+                .get::<codex_protocol::turn_input::TurnInferenceAllowance>()
+                .is_some()
+            {
+                return;
+            }
             let Some(runtime) = goal_runtime_handle(input.thread_store) else {
                 return;
             };
@@ -459,6 +493,12 @@ where
         token_usage: &'a TokenUsageInfo,
     ) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
+            if turn_store
+                .get::<codex_protocol::turn_input::TurnInferenceAllowance>()
+                .is_some()
+            {
+                return;
+            }
             let Some(runtime) = goal_runtime_handle(thread_store) else {
                 return;
             };
@@ -482,6 +522,13 @@ where
 {
     fn on_tool_finish<'a>(&'a self, input: ToolFinishInput<'a>) -> ToolLifecycleFuture<'a> {
         Box::pin(async move {
+            if input
+                .turn_store
+                .get::<codex_protocol::turn_input::TurnInferenceAllowance>()
+                .is_some()
+            {
+                return;
+            }
             let Some(runtime) = goal_runtime_handle(input.thread_store) else {
                 return;
             };

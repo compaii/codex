@@ -5,6 +5,7 @@ use codex_async_utils::THREAD_STACK_SIZE_BYTES;
 use codex_protocol::protocol::ReviewDecision;
 use std::sync::Arc;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 use super::ApprovalRequestReasons;
 use super::GuardianApprovalRequest;
@@ -51,6 +52,21 @@ pub(crate) async fn decide_approval(
     mut options: GuardianReviewOptions,
 ) -> Option<ReviewDecision> {
     let context = context.into();
+    if crate::turn_inference::allowance(context.turn()).is_some() {
+        return Some(
+            if options
+                .external_cancel
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                ReviewDecision::Abort
+            } else {
+                ReviewDecision::denied(
+                    "Bounded attention requires separately reserved approval review; the action was not approved.",
+                )
+            },
+        );
+    }
     let request = request.into();
     let (_, history_reset) = session.history_reset().await;
     let cancellation = match options.external_cancel.take() {

@@ -86,6 +86,7 @@ export type { ThreadId } from "./ThreadId";
 export type { ThreadMemoryMode } from "./ThreadMemoryMode";
 export type { Tool } from "./Tool";
 export type { ToolExposureSurface } from "./ToolExposureSurface";
+export type { TurnInferenceAllowance } from "./TurnInferenceAllowance";
 export type { Verbosity } from "./Verbosity";
 export type { WebSearchAction } from "./WebSearchAction";
 export type { WebSearchContextSize } from "./WebSearchContextSize";
