@@ -4309,7 +4309,8 @@ async fn review_approval_request(
 
 #[tokio::test]
 async fn bounded_approval_review_defers_before_any_contributor() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     struct CountReviews(Arc<AtomicUsize>);
     impl codex_extension_api::ApprovalReviewContributor for CountReviews {
         fn decide<'a>(
