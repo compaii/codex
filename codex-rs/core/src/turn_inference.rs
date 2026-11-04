@@ -44,6 +44,20 @@ pub(crate) fn allowance(ctx: &TurnContext) -> Option<Arc<InferenceAllowance>> {
         .map(|value| Arc::clone(value.as_ref()))
 }
 
+/// Agent starts need an owner-reserved child admission, not a copied root cap.
+/// Until that admission exists, refuse before loading or sending to a recipient.
+pub(crate) fn require_agent_admission(
+    ctx: &TurnContext,
+) -> std::result::Result<(), codex_tools::FunctionCallError> {
+    if allowance(ctx).is_some() {
+        return Err(codex_tools::FunctionCallError::RespondToModel(
+            "Bounded attention requires separately reserved agent admission; no agent work was submitted."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn bind(client: ModelClientSession, ctx: &TurnContext) -> ModelClientSession {
     match allowance(ctx) {
         Some(allowance) => client.with_inference_allowance(allowance),

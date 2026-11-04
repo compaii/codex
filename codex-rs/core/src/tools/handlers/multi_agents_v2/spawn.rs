@@ -102,6 +102,7 @@ async fn handle_spawn_agent(
     ),
     FunctionCallError,
 > {
+    crate::turn_inference::require_agent_admission(&invocation.turn)?;
     let ToolInvocation {
         session,
         step_context,

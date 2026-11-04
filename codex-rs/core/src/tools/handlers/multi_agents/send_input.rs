@@ -37,6 +37,7 @@ impl Handler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
+        crate::turn_inference::require_agent_admission(&invocation.turn)?;
         let ToolInvocation {
             session,
             turn,

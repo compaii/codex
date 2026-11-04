@@ -41,7 +41,13 @@ receiving acceptance. Bounded lifecycle callbacks leave the existing thread goal
 and its accounting untouched. The existing extension-tool execution boundary
 rejects bounded `create_goal` and `update_goal`, while retaining `get_goal` and
 authenticated human goal controls. An independently authorized goal may resume
-while attention is busy and continue afterward with its own authority. No account,
+while attention is busy and continue afterward with its own authority. Native agent-tool entry points also refuse a bounded spawn,
+resume or turn-triggering input before recipient loading/submission until an
+owner-reserved child admission can carry the allocation. V2 queue-only mail keeps
+its existing non-starting behavior. This refusal covers both direct and Code Mode
+execution; it is not a separately allocated delegation implementation. Independent
+ordinary agent work is unchanged. Synchronous/async reviewer and external routed
+admission remain separate unfinished boundaries. No account,
 model attention or periodic producer is activated by this component.
 
 For HTTP, build the existing configured client with

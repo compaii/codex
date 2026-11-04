@@ -469,8 +469,12 @@ async fn conditional_activation_steers_the_existing_useful_turn() -> Result<()> 
 }
 
 /// A bounded attention turn is not the authority for an independent persisted goal.
+#[test_case(false; "legacy agent tools")]
+#[test_case(true; "v2 agent tools")]
 #[tokio::test]
-async fn bounded_attention_preserves_human_goal_and_independent_continuation() -> Result<()> {
+async fn bounded_attention_preserves_human_goal_and_independent_continuation(
+    v2: bool,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = responses::start_mock_server().await;
     let event_stream = |events| {
@@ -494,6 +498,26 @@ async fn bounded_attention_preserves_human_goal_and_independent_continuation() -
                     r#"{"objective":"Unauthorized replacement"}"#,
                 ),
                 responses::ev_function_call("allowed-read", "get_goal", "{}"),
+                responses::ev_function_call_with_namespace(
+                    "unreserved-spawn",
+                    if v2 {
+                        "collaboration"
+                    } else {
+                        "multi_agent_v1"
+                    },
+                    "spawn_agent",
+                    r#"{"task_name":"unreserved","message":"Do not start this unreserved work"}"#,
+                ),
+                responses::ev_function_call_with_namespace(
+                    "unreserved-followup",
+                    if v2 {
+                        "collaboration"
+                    } else {
+                        "multi_agent_v1"
+                    },
+                    if v2 { "followup_task" } else { "send_input" },
+                    r#"{"target":"unreserved","message":"Do not wake this target"}"#,
+                ),
                 responses::ev_completed_with_tokens("attention-tools", 123),
             ]),
             event_stream(vec![
@@ -525,11 +549,17 @@ async fn bounded_attention_preserves_human_goal_and_independent_continuation() -
     )
     .await;
     let home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri())
+    let config = MockResponsesConfig::new(&server.uri())
         .with_provider_config("supports_websockets = false")
         .enable_feature(Feature::Goals)
-        .disable_feature(Feature::EnableRequestCompression)
-        .write(home.path())?;
+        .enable_feature(Feature::Collab)
+        .disable_feature(Feature::EnableRequestCompression);
+    let config = if v2 {
+        config.enable_feature(Feature::MultiAgentV2)
+    } else {
+        config.disable_feature(Feature::MultiAgentV2)
+    };
+    config.write(home.path())?;
     let mut app = TestAppServer::builder()
         .with_codex_home(home.path())
         .without_managed_config()
@@ -572,6 +602,12 @@ async fn bounded_attention_preserves_human_goal_and_independent_continuation() -
     assert_eq!(
         second_input
             .matches("Bounded attention cannot create or modify goals")
+            .count(),
+        2
+    );
+    assert_eq!(
+        second_input
+            .matches("Bounded attention requires separately reserved agent admission")
             .count(),
         2
     );

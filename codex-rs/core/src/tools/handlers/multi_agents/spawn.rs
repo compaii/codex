@@ -53,6 +53,7 @@ impl ToolExecutor<ToolInvocation> for Handler {
 async fn handle_spawn_agent(
     invocation: ToolInvocation,
 ) -> Result<SpawnAgentResult, FunctionCallError> {
+    crate::turn_inference::require_agent_admission(&invocation.turn)?;
     let ToolInvocation {
         session,
         step_context,

@@ -46,6 +46,9 @@ pub(super) async fn handle_message_string_tool(
     message: String,
     analytics: &mut ToolCallAnalytics,
 ) -> Result<FunctionToolOutput, FunctionCallError> {
+    if mode == MessageDeliveryMode::TriggerTurn {
+        crate::turn_inference::require_agent_admission(&invocation.turn)?;
+    }
     let message = message_content(message)?;
     let ToolInvocation {
         session,
