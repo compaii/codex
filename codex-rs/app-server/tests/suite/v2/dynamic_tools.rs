@@ -1049,6 +1049,13 @@ async fn exercise_idle_only_turn(bounded: bool) -> Result<()> {
             retain: true,
             output: codex_protocol::models::FunctionCallOutputBody::Text(marker.into()),
         })),
+        additional_context: if bounded {
+            Some(serde_json::from_value(json!({
+                "heartbeat.context": {"kind":"application", "value":"Exact bounded application context revision"}
+            }))?)
+        } else {
+            None
+        },
         ..Default::default()
     };
     let (method, payload) = if bounded {

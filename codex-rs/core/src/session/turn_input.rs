@@ -503,6 +503,7 @@ async fn start_if_idle(
         responsesapi_client_metadata,
         ..
     } = request;
+    let bounded_input = start.inference_allowance.is_some();
     let origin = UserInputOrigin::from_turn_trigger(start.turn_trigger.as_deref());
     if session.input_queue.has_trigger_turn_mailbox_items().await {
         return Ok(TurnInputSubmission::NotSubmitted {
@@ -643,22 +644,26 @@ async fn start_if_idle(
         TurnStartKind::Automatic | TurnStartKind::Recovery => {
             // Empty automatic user input resumes sampling without a new message.
             if !matches!(&input, SubmittedTurnInput::UserInput { .. }) {
-                session
-                    .input_queue
-                    .extend_pending_input_for_turn_state(
-                        turn_state.as_ref(),
-                        vec![
-                            pending_turn_input(
-                                session,
-                                input,
-                                sender_messages.as_ref(),
-                                &turn_context.sub_id,
-                                origin,
-                            )
-                            .await,
-                        ],
-                    )
-                    .await;
+                let input = pending_turn_input(
+                    session,
+                    input,
+                    sender_messages.as_ref(),
+                    &turn_context.sub_id,
+                    origin,
+                )
+                .await;
+                if bounded_input && kind == TurnStartKind::Automatic {
+                    // Additional application context already makes task_input
+                    // nonempty. Queueing the explicit bounded input separately
+                    // would sample that context first, spending an allowance
+                    // attempt before delivering the work that owns it.
+                    task_input.push(input);
+                } else {
+                    session
+                        .input_queue
+                        .extend_pending_input_for_turn_state(turn_state.as_ref(), vec![input])
+                        .await;
+                }
             }
         }
     }
