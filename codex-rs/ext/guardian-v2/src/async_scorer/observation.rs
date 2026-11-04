@@ -51,6 +51,19 @@ impl GuardianV2Extension {
         )
     )]
     pub(super) async fn score_tool(&self, input: ToolStartInput<'_>) {
+        if input
+            .turn_store
+            .get::<codex_protocol::turn_input::TurnInferenceAllowance>()
+            .is_some()
+        {
+            // This action cannot reuse an older score or start an unreserved classifier.
+            // Core refuses any approval review for it before consulting contributors.
+            if let Some(progress) = input.thread_store.get::<GuardianV2ScoreProgress>() {
+                let index = progress.observe(&input);
+                progress.invalidate(index);
+            }
+            return;
+        }
         // Polling a code cell does not introduce another action or age its score.
         if input.tool_name.is_default_namespace() && input.tool_name.name == "wait" {
             return;

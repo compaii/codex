@@ -105,8 +105,9 @@ jobs:
           RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all multi_agent_v2_tools_emit_collaborator_analytics -- --nocapture
       - name: Bounded turn admission, lifecycle and unrelated goal isolation
         run: |
-          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-core --lib -- session::turn_input::tests::bounded session::async_compaction::tests::bounded turn_inference::tests::refuses
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-core --lib -- session::turn_input::tests::bounded session::async_compaction::tests::bounded turn_inference::tests::refuses guardian::tests::bounded_approval_review_defers_before_any_contributor
           RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-goal-extension --test goal_extension_backend bounded_turn_lifecycle_preserves_existing_goal_and_accounting
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-guardian-v2 --lib -- bounded_attention_invalidates_cached_scores_without_classification contributor_accounts_for_parent_checkpoint
       - name: Shared inference allowance and no-replay transport regressions
         run: |
           cargo test --locked --profile dev-small -j 2 -p codex-api

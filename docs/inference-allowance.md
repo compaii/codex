@@ -46,8 +46,12 @@ resume or turn-triggering input before recipient loading/submission until an
 owner-reserved child admission can carry the allocation. V2 queue-only mail keeps
 its existing non-starting behavior. This refusal covers both direct and Code Mode
 execution; it is not a separately allocated delegation implementation. Independent
-ordinary agent work is unchanged. Synchronous/async reviewer and external routed
-admission remain separate unfinished boundaries. No account,
+ordinary agent work is unchanged. The synchronous approval entry refuses bounded
+actions before consulting cached or model contributors; an explicitly cancelled request remains an abort. The
+async classifier invalidates old score coverage and returns before preparing
+permissions, reserving a classification slot or launching model work. No approval
+is inferred from the absent classifier. Positive reserved reviewer and external
+routed admission remain unfinished. No account,
 model attention or periodic producer is activated by this component.
 
 For HTTP, build the existing configured client with
