@@ -124,7 +124,7 @@ fn reject_obsolete_request_fields(request: &JSONRPCRequest) -> Result<(), JSONRP
 fn reject_removed_permission_profile(request: &JSONRPCRequest) -> Result<(), JSONRPCErrorError> {
     if matches!(
         request.method.as_str(),
-        "thread/start" | "thread/resume" | "thread/fork" | "turn/start"
+        "thread/start" | "thread/resume" | "thread/fork" | "turn/start" | "turn/startIfIdle"
     ) && request
         .params
         .as_ref()
@@ -999,6 +999,7 @@ impl MessageProcessor {
             | ClientRequest::ThreadDelete { .. }
             | ClientRequest::ThreadArchive { .. } => (Some(self.turn_admission.admit()?), false),
             ClientRequest::TurnStart { .. }
+            | ClientRequest::TurnStartIfIdle { .. }
             | ClientRequest::TurnSteer { .. }
             | ClientRequest::ReviewStart { .. }
             | ClientRequest::ThreadCompactStart { .. }
@@ -1670,6 +1671,18 @@ impl MessageProcessor {
                         params,
                         app_server_client_name.clone(),
                         client_version.clone(),
+                        false,
+                    )
+                    .await
+            }
+            ClientRequest::TurnStartIfIdle { params, .. } => {
+                self.turn_processor
+                    .turn_start(
+                        request_id.clone(),
+                        params,
+                        app_server_client_name.clone(),
+                        client_version.clone(),
+                        true,
                     )
                     .await
             }

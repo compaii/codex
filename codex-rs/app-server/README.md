@@ -616,3 +616,33 @@ and out-of-scope item IDs return invalid params (`-32602`) with
 Omitted or null cursors preserve normal first-page behavior. Continue anchored
 pages with the returned opaque string `nextCursor`; response fields and
 `backwardsCursor` semantics are unchanged.
+
+### Strict idle-only turn admission
+
+`turn/startIfIdle` accepts the same `TurnStartParams` and returns the same
+`TurnStartResponse` as `turn/start`, but uses Core's atomic start-if-idle path.
+It never steers or queues its input into an existing turn. Busy/pending-trigger
+refusal returns an invalid-request error without recording the submitted input
+or calling the model. Existing direct-input authority, model/provider admission,
+maintenance/drain, settings and automatic-input/Plan-mode rules still apply.
+The normal `turn/start` start-or-steer behavior is unchanged. Idle-only requests
+preserve the thread's existing client identity and MCP elicitation policy rather
+than applying the requesting connection's metadata before busy admission. The
+removed `permissionProfile` input is rejected consistently for both methods.
+Idle-admission refusal error data includes `submitted: false` with a stable `reason` such as
+`notIdle`, `pendingTriggerTurn` or `planMode`; lost acknowledgments remain uncertain.
+
+For internally attributed application context, supply `input: []` with the
+existing named `toolOutput`; do not fabricate a user utterance. For example:
+
+```json
+{"id":7,"method":"turn/startIfIdle","params":{"threadId":"selected-thread","input":[],"toolOutput":{"name":"application_attention","output":"Attributed source evidence","retain":true}}}
+```
+
+An accepted response identifies a newly started physical turn, allowing the
+application to retain its execution ownership separately from human publication.
+The application still owns generation, pause, budget and takeover controls; this
+method installs no scheduler and grants no automatic attention or extra funding.
+A caller requiring exclusivity must not fall back to `turn/start` after an
+unsupported-method response from an older server. Submission uncertainty keeps
+its original identity and must not be retried as another input.

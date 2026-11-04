@@ -68,6 +68,10 @@ async fn legacy_permission_profile_requests_fail_closed() -> Result<()> {
             }),
         ),
         (
+            "turn/startIfIdle",
+            json!({"threadId":"missing-thread","input":[],"permissionProfile":legacy_permission_profile.clone()}),
+        ),
+        (
             "turn/start",
             json!({
                 "threadId": "missing-thread",
