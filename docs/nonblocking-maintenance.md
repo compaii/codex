@@ -48,6 +48,13 @@ retains its separate best-effort semantics; repeated maintenance is never force.
 The final atomic rename is a local filesystem commit: no application watchdog can
 guarantee progress if the operating system itself blocks that syscall.
 
+The goal-withholding behavior is a successor to source `15c365f19`. The existing
+v1 control capability proves nonblocking maintenance, not that an older serving
+binary contains this correction. Qualify and identify the actual selected source.
+An unselected package cannot retrofit suppression into its running predecessor;
+initial adoption still needs its supported idle handoff. An expired waiter must
+not be rearmed as a workaround.
+
 ## Receiving operation
 
 Do not use the older SIGHUP path to close admission while unrelated work is live.

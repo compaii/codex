@@ -18,7 +18,9 @@ pub trait TurnStartAdmission: std::fmt::Debug + Send + Sync {
         _thread_id: codex_protocol::ThreadId,
         _on_deferred: Box<dyn FnOnce() + Send>,
     ) -> Option<Box<dyn Send>> {
-        self.admit_turn_start()
+        // Core still checks ordinary admission at actual submission. Hosts
+        // without maintenance support must not acquire an extra quota permit.
+        Some(Box::new(()))
     }
 
     /// Admission for explicit parent-delegated child work. Ungated hosts retain

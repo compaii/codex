@@ -186,3 +186,21 @@ fn maintenance_and_goal_reservation_have_one_atomic_order() {
         assert_eq!(resumed.load(Ordering::SeqCst), permit.is_none());
     }
 }
+
+#[test]
+fn legacy_hosts_do_not_acquire_an_extra_goal_quota_permit() {
+    #[derive(Debug, Default)]
+    struct Legacy(std::sync::atomic::AtomicUsize);
+    impl TurnStartAdmission for Legacy {
+        fn admit_turn_start(&self) -> Option<Box<dyn Send>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(Box::new(()))
+        }
+    }
+    let host = Legacy::default();
+    let _reservation =
+        host.admit_goal_continuation(codex_protocol::ThreadId::new(), Box::new(|| {}));
+    assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let _submission = host.admit_turn_start();
+    assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
