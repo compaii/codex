@@ -1696,14 +1696,15 @@ impl MessageProcessor {
                     .await
             }
             ClientRequest::TurnStartBoundedIfIdle { params, .. } => {
-                self.turn_processor
-                    .turn_start_bounded_if_idle(
-                        request_id.clone(),
-                        params,
-                        app_server_client_name.clone(),
-                        client_version.clone(),
-                    )
-                    .await
+                // Keep this additional handler out of the already large
+                // dispatch frame, including while another request cold-resumes.
+                Box::pin(self.turn_processor.turn_start_bounded_if_idle(
+                    request_id.clone(),
+                    params,
+                    app_server_client_name.clone(),
+                    client_version.clone(),
+                ))
+                .await
             }
             ClientRequest::ThreadInjectItems { params, .. } => {
                 self.turn_processor
