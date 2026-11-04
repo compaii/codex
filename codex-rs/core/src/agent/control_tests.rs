@@ -2656,6 +2656,7 @@ async fn spawn_agent_fork_sanitizes_inherited_compaction_metadata() {
         multi_agent_version: Some(MultiAgentVersion::V2),
         last_started_turn_id: Some("parent-turn".to_string()),
         turn_attribution: Some(codex_history::TurnAttribution {
+            inference_allowance: None,
             turn_id: "parent-turn".to_string(),
             turn_trigger: Some("automation".to_string()),
             parent_turn_id: Some("initiating-turn".to_string()),

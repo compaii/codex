@@ -165,3 +165,28 @@ async fn cancelled_turn_skips_launch_but_preserves_existing_work(trigger: Compac
     assert_eq!(request.requests().len(), 1);
     shutdown(&sess).await;
 }
+
+#[tokio::test]
+async fn bounded_turn_suppresses_session_owned_speculation() {
+    let (_session, turn, _events) =
+        crate::session::tests::make_session_and_context_with_auth_and_config_and_rx(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+            Vec::new(),
+            |config| {
+                config.model = Some("gpt-5.2".to_string());
+                config.features.enable(Feature::AsyncCompaction).unwrap();
+                config.features.disable(Feature::TokenBudget).unwrap();
+            },
+        )
+        .await;
+    assert!(enabled(&turn));
+    turn.extension_data.insert(
+        crate::turn_inference::prepare(&codex_protocol::turn_input::TurnInferenceAllowance {
+            max_provider_attempts: 1,
+            max_request_bytes: 1024,
+            deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+        })
+        .unwrap(),
+    );
+    assert!(!enabled(&turn));
+}

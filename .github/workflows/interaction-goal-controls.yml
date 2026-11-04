@@ -100,6 +100,11 @@ jobs:
           test "$(grep -c 'idle_only_turn_refuses_busy_without_recording_then_starts_internal_context: test' "$RUNNER_TEMP/idle-turn-tests.txt")" = 1
           RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all idle_only_turn_refuses_busy_without_recording_then_starts_internal_context -- --nocapture
           RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all legacy_permission_profile_requests_fail_closed -- --nocapture
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all bounded_idle_turn_refuses_busy_then_starts_with_required_allocation -- --nocapture
+      - name: Bounded turn admission, lifecycle and unrelated goal isolation
+        run: |
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-core --lib -- session::turn_input::tests::bounded session::async_compaction::tests::bounded turn_inference::tests::refuses
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-goal-extension --test goal_extension_backend bounded_turn_lifecycle_preserves_existing_goal_and_accounting
       - name: Shared inference allowance and no-replay transport regressions
         run: |
           cargo test --locked --profile dev-small -j 2 -p codex-api

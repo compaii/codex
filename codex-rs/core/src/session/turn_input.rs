@@ -95,6 +95,7 @@ impl TurnStartKind {
 struct PreparedTurnInputSettings {
     thread_settings_update: Option<SessionSettingsUpdate>,
     start_options: TurnStartOptions,
+    inference_allowance: Option<Arc<codex_api::InferenceAllowance>>,
 }
 
 impl PreparedTurnInputSettings {
@@ -105,6 +106,11 @@ impl PreparedTurnInputSettings {
         thread_settings: impl Into<WithTurnExtensionData<ThreadSettingsOverrides>>,
         start_options: TurnStartOptions,
     ) -> CodexResult<Self> {
+        let inference_allowance = start_options
+            .inference_allowance
+            .as_ref()
+            .map(crate::turn_inference::prepare)
+            .transpose()?;
         let thread_settings = thread_settings.into();
         let thread_settings_update = if thread_settings.request
             == ThreadSettingsOverrides::default()
@@ -125,6 +131,7 @@ impl PreparedTurnInputSettings {
         Ok(Self {
             thread_settings_update,
             start_options,
+            inference_allowance,
         })
     }
 
@@ -142,6 +149,7 @@ impl PreparedTurnInputSettings {
         kind: TurnStartKind,
     ) -> CodexResult<Option<Arc<TurnContext>>> {
         let TurnStartOptions {
+            inference_allowance: inference_spec,
             turn_trigger,
             final_output_json_schema,
             service_tier,
@@ -183,6 +191,12 @@ impl PreparedTurnInputSettings {
         let Some((turn_context, settings_snapshot)) = turn_context else {
             return Ok(None);
         };
+        if let Some(spec) = inference_spec {
+            turn_context.extension_data.insert(spec);
+        }
+        if let Some(allowance) = self.inference_allowance {
+            turn_context.extension_data.insert(allowance);
+        }
         if let Some(turn_trigger) = turn_trigger {
             turn_context
                 .turn_metadata_state
@@ -234,6 +248,13 @@ pub(super) async fn handle(
     submission_id: String,
 ) -> CodexResult<TurnInputSubmission> {
     let request = request.into();
+    if request.request.start.inference_allowance.is_some()
+        && !matches!(mode, TurnInputMode::StartIfIdle)
+    {
+        return Err(CodexErr::InvalidRequest(
+            "bounded inference requires fresh idle-only admission".into(),
+        ));
+    }
     let result = match mode {
         TurnInputMode::StartOrSteer => start_or_steer(session, request, submission_id).await,
         TurnInputMode::StartIfIdle => {
@@ -301,6 +322,11 @@ pub(super) async fn handle_recovery(
     start_options: TurnStartOptions,
     submission_id: String,
 ) -> CodexResult<TurnInputSubmission> {
+    if start_options.inference_allowance.is_some() {
+        return Err(CodexErr::InvalidRequest(
+            "bounded execution cannot recover by reconstructing its allocation".into(),
+        ));
+    }
     let WithTurnExtensionData {
         request: thread_settings,
         turn_extension_init,
@@ -532,6 +558,20 @@ async fn start_if_idle(
                 reason: NotSubmittedReason::Superseded,
             });
         }
+        if kind != TurnStartKind::User
+            && start.inference_allowance.is_none()
+            && session
+                .state
+                .lock()
+                .await
+                .turn_attribution
+                .as_ref()
+                .is_some_and(|prior| prior.inference_allowance.is_some())
+        {
+            return Err(CodexErr::InvalidRequest(
+                "automatic successor of bounded execution requires fresh reserved admission".into(),
+            ));
+        }
         let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
         Arc::clone(&active_turn.turn_state)
     };
@@ -716,11 +756,21 @@ impl Session {
         if active_turn.is_some() {
             return None;
         }
+        if self
+            .state
+            .lock()
+            .await
+            .turn_attribution
+            .as_ref()
+            .is_some_and(|prior| prior.inference_allowance.is_some())
+        {
+            // Trigger mail is retained for fresh admission, not an unmetered wakeup.
+            return None;
+        }
         let needs_new_turn = self.input_queue.has_trigger_turn_mailbox_items().await;
         if !needs_new_turn && !self.has_outstanding_durable_sleep() {
             return None;
         }
-        let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
         let previous_options = if needs_new_turn {
             Default::default()
         } else {
@@ -732,6 +782,10 @@ impl Session {
                 .map(codex_history::TurnAttribution::start_options)
                 .unwrap_or_default()
         };
+        if previous_options.inference_allowance.is_some() {
+            return None;
+        }
+        let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
         Some((Arc::clone(&active_turn.turn_state), previous_options))
     }
 

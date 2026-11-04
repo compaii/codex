@@ -29,6 +29,10 @@ impl Session {
             return None;
         }
         let context = &task.turn_context;
+        // An interrupted bounded allocation is retained uncertain, never auto-refilled.
+        if crate::turn_inference::allowance(context).is_some() {
+            return None;
+        }
         context.extension_data.get::<RecordedTurnInput>()?;
         let settings = context.next_step_settings.load();
         let environments = self.services.turn_environments.snapshot_now();

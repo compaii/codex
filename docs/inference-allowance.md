@@ -8,12 +8,33 @@ exists. Lost acknowledgments still consume their claim. A fresh allowance is not
 recovery of an accepted or uncertain execution.
 
 The execution owner must durably reserve its allocation before constructing this
-value. The current library increment does not expose a new native turn parameter,
-reserve a heartbeat budget or activate attention. `ModelClientSession` accepts an
-already-reserved allowance through its explicit builder; ordinary sessions remain
-unchanged. Durable parent/descendant accounting, compaction/reviewer inheritance,
-external tools, restart recovery and native admission still require their owning
-integration before a heartbeat producer can use this contract.
+value. The native integration under development adds mandatory
+`turn/startBoundedIfIdle` with nested `turn` and required `allowance` fields.
+An old server rejects the method; callers must never fall back to ordinary
+`turn/start` or discard the allowance. The allowance specifies positive
+`maxProviderAttempts`, complete `maxRequestBytes` within64MiB and a future
+`deadlineUnixMs` within600seconds. The existing idle-only admission controls
+busy refusal; ordinary turn methods retain their behavior.
+
+Core prepares one shared allocation before settings are accepted, attaches it to
+that physical turn rather than a sticky thread setting, and binds its sampling,
+local compaction and foreground remote compaction clients to it. Speculative
+compaction is suppressed for bounded turns because its ordinary lifetime is
+session-owned; ordinary speculative compaction remains unchanged.
+The regular-task lifetime is bounded by the same deadline and closes the
+allocation on exit. Human steering does not erase the running turn's limits;
+a subsequent independent ordinary turn inherits no allocation. Bounded
+attribution is retained through history/compaction only to refuse reconstruction
+on recovery. Automatic daemon recovery, unreserved automatic successors and durable-sleep continuation cannot
+manufacture a fresh allocation for that interrupted bounded turn.
+
+These are source changes under qualification, not receiving deployment or a
+working heartbeat. Durable parent accounting is owned by DaimonApp#452/PR590.
+Native descendant/reviewer inference, external tools, actual recovery and
+cancellation journeys, schema/client exports and the producer-to-native binding
+still require qualification before enabling a heartbeat producer. Bounded lifecycle callbacks leave the existing thread goal and its accounting
+untouched; independent human turns remain ordinary admissions. No account,
+model attention or periodic producer is activated by this component.
 
 For HTTP, build the existing configured client with
 `HttpClientBuilder::without_replays()`. It disables redirects and transparent

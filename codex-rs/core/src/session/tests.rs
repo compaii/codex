@@ -6214,6 +6214,7 @@ async fn compaction_persists_resume_metadata_and_companion_records() {
         multi_agent_version: Some(MultiAgentVersion::V2),
         last_started_turn_id: Some(turn_context.sub_id.clone()),
         turn_attribution: Some(codex_history::TurnAttribution {
+            inference_allowance: None,
             turn_id: turn_context.sub_id.clone(),
             turn_trigger: Some("automation".to_string()),
             parent_turn_id: Some("parent-turn".to_string()),

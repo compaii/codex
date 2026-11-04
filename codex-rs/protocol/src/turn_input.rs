@@ -73,6 +73,9 @@ pub struct TurnInputRequest {
 /// Attribution retained across recovery, sleep, and model-context compaction.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct TurnAttribution {
+    /// Retained only to prevent recovery from reconstructing a spent allocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference_allowance: Option<Box<TurnInferenceAllowance>>,
     pub turn_id: String,
     pub turn_trigger: Option<String>,
     pub parent_turn_id: Option<String>,
@@ -84,6 +87,7 @@ impl TurnAttribution {
     /// Restores provenance without changing the thread's execution settings.
     pub fn start_options(&self) -> TurnStartOptions {
         TurnStartOptions {
+            inference_allowance: self.inference_allowance.as_deref().cloned(),
             turn_trigger: self.turn_trigger.clone(),
             parent_turn_id: self.parent_turn_id.clone(),
             initiating_agent_path: self.initiating_agent_path.clone(),
@@ -194,6 +198,16 @@ pub enum CyberAccessProgram {
     DaybreakRed,
 }
 
+/// A durably reserved allocation for one physical execution. This is not an
+/// account grant. Never reconstruct it to recover accepted or uncertain work.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TurnInferenceAllowance {
+    pub max_provider_attempts: u32,
+    pub max_request_bytes: u32,
+    pub deadline_unix_ms: i64,
+}
+
 /// Options for the new-turn branch of a submission.
 ///
 /// Core only records these options when input starts a turn. When input steers,
@@ -202,6 +216,8 @@ pub enum CyberAccessProgram {
 /// child input, Core also compares root lineage to detect ambiguity.
 #[derive(Clone, Debug, Default)]
 pub struct TurnStartOptions {
+    /// Finite already-reserved inference limits for this physical execution only.
+    pub inference_allowance: Option<TurnInferenceAllowance>,
     /// Source classification for this request. Recorded on new turns and captured
     /// as input provenance when steering, without changing the active turn's trigger.
     pub turn_trigger: Option<String>,

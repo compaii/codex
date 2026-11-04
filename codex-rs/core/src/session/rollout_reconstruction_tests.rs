@@ -1867,6 +1867,7 @@ async fn completed_turn_suffix_after_compaction_overrides_resume_metadata(
     newer_context.model = "newer-model".to_string();
     newer_context.comp_hash = Some("newer-hash".to_string());
     let checkpoint_attribution = (!legacy_checkpoint).then(|| codex_history::TurnAttribution {
+        inference_allowance: None,
         turn_id: "newer-turn".to_string(),
         turn_trigger: Some("automation".to_string()),
         parent_turn_id: None,

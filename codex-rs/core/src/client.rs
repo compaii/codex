@@ -1455,7 +1455,10 @@ impl<'a> ResponsesHttpExecutor<'a> {
         }
     }
 
-    fn with_inference_allowance(mut self, allowance: Option<Arc<InferenceAllowance>>) -> Self {
+    pub(crate) fn with_inference_allowance(
+        mut self,
+        allowance: Option<Arc<InferenceAllowance>>,
+    ) -> Self {
         self.inference_allowance = allowance;
         self
     }

@@ -38,6 +38,11 @@ pub(crate) struct AsyncCompactionState {
 }
 
 pub(super) fn enabled(turn_context: &TurnContext) -> bool {
+    // Speculative requests are session-owned. Until they carry turn-owned
+    // cancellation, bounded executions use their metered foreground compaction.
+    if crate::turn_inference::allowance(turn_context).is_some() {
+        return false;
+    }
     turn_context
         .config
         .features

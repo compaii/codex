@@ -190,6 +190,7 @@ impl TurnRequestProcessor {
             app_server_client_name,
             app_server_client_version,
             only_if_idle,
+            None,
         )
         .await
         .map(|response| {
@@ -199,6 +200,26 @@ impl TurnRequestProcessor {
                 response.into()
             })
         })
+    }
+
+    pub(crate) async fn turn_start_bounded_if_idle(
+        &self,
+        request_id: ConnectionRequestId,
+        params: codex_app_server_protocol::TurnStartBoundedIfIdleParams,
+        app_server_client_name: Option<String>,
+        app_server_client_version: Option<String>,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        validate_user_input_image_urls(&params.turn.input)?;
+        self.turn_start_inner(
+            request_id,
+            params.turn,
+            app_server_client_name,
+            app_server_client_version,
+            true,
+            Some(params.allowance),
+        )
+        .await
+        .map(|response| Some(ClientResponsePayload::TurnStartBoundedIfIdle(response)))
     }
 
     pub(crate) async fn thread_inject_items(
@@ -531,6 +552,7 @@ impl TurnRequestProcessor {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn turn_start_inner(
         &self,
         request_id: ConnectionRequestId,
@@ -538,6 +560,7 @@ impl TurnRequestProcessor {
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
         only_if_idle: bool,
+        inference_allowance: Option<codex_protocol::turn_input::TurnInferenceAllowance>,
     ) -> Result<TurnStartResponse, JSONRPCErrorError> {
         let (thread_id, thread) =
             self.load_thread(&params.thread_id)
@@ -680,6 +703,7 @@ impl TurnRequestProcessor {
         let request = TurnInputRequest::new(input)
             .with_thread_settings(thread_settings)
             .on_start(TurnStartOptions {
+                inference_allowance,
                 turn_trigger: params.turn_trigger,
                 parent_turn_id: params.parent_turn_id,
                 initiating_agent_path: None,

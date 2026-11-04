@@ -122,15 +122,23 @@ fn reject_obsolete_request_fields(request: &JSONRPCRequest) -> Result<(), JSONRP
 }
 
 fn reject_removed_permission_profile(request: &JSONRPCRequest) -> Result<(), JSONRPCErrorError> {
-    if matches!(
-        request.method.as_str(),
-        "thread/start" | "thread/resume" | "thread/fork" | "turn/start" | "turn/startIfIdle"
-    ) && request
+    let params = request
         .params
         .as_ref()
-        .and_then(serde_json::Value::as_object)
-        .is_some_and(|params| params.contains_key("permissionProfile"))
-    {
+        .and_then(serde_json::Value::as_object);
+    let selected = if request.method == "turn/startBoundedIfIdle" {
+        params
+            .and_then(|params| params.get("turn"))
+            .and_then(serde_json::Value::as_object)
+    } else if matches!(
+        request.method.as_str(),
+        "thread/start" | "thread/resume" | "thread/fork" | "turn/start" | "turn/startIfIdle"
+    ) {
+        params
+    } else {
+        None
+    };
+    if selected.is_some_and(|params| params.contains_key("permissionProfile")) {
         let method = request.method.as_str();
         return Err(invalid_params(format!(
             "`permissionProfile` is no longer supported for `{method}`; use `permissions` with a named profile id instead"
@@ -1000,6 +1008,7 @@ impl MessageProcessor {
             | ClientRequest::ThreadArchive { .. } => (Some(self.turn_admission.admit()?), false),
             ClientRequest::TurnStart { .. }
             | ClientRequest::TurnStartIfIdle { .. }
+            | ClientRequest::TurnStartBoundedIfIdle { .. }
             | ClientRequest::TurnSteer { .. }
             | ClientRequest::ReviewStart { .. }
             | ClientRequest::ThreadCompactStart { .. }
@@ -1683,6 +1692,16 @@ impl MessageProcessor {
                         app_server_client_name.clone(),
                         client_version.clone(),
                         true,
+                    )
+                    .await
+            }
+            ClientRequest::TurnStartBoundedIfIdle { params, .. } => {
+                self.turn_processor
+                    .turn_start_bounded_if_idle(
+                        request_id.clone(),
+                        params,
+                        app_server_client_name.clone(),
+                        client_version.clone(),
                     )
                     .await
             }

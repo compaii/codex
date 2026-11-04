@@ -148,9 +148,9 @@ macro_rules! serialization_scope_expr {
     ($actual_params:ident, global_shared_read($key:literal)) => {
         Some(ClientRequestSerializationScope::GlobalSharedRead($key))
     };
-    ($actual_params:ident, thread_id($params:ident . $field:ident)) => {
+    ($actual_params:ident, thread_id($params:ident $( . $field:ident )+)) => {
         Some(ClientRequestSerializationScope::Thread {
-            thread_id: $actual_params.$field.clone(),
+            thread_id: $actual_params$(.$field)+.clone(),
         })
     };
     ($actual_params:ident, optional_thread_id($params:ident . $field:ident)) => {
@@ -1085,6 +1085,14 @@ client_request_definitions! {
         params: v2::TurnStartParams,
         inspect_params: true,
         serialization: thread_id(params.thread_id),
+        manual_payload_conversion: manual,
+        response: v2::TurnStartResponse,
+    },
+    /// Idle-only admission with mandatory physical-execution limits.
+    TurnStartBoundedIfIdle => "turn/startBoundedIfIdle" {
+        params: v2::TurnStartBoundedIfIdleParams,
+        inspect_params: true,
+        serialization: thread_id(params.turn.thread_id),
         manual_payload_conversion: manual,
         response: v2::TurnStartResponse,
     },
@@ -2338,6 +2346,24 @@ mod tests {
         let roundtrip = serde_json::to_value(request).unwrap();
         assert_eq!(roundtrip["method"], value["method"]);
         assert_eq!(roundtrip["params"]["threadId"], value["params"]["threadId"]);
+    }
+
+    #[test]
+    fn bounded_idle_requires_limits_and_serializes_on_the_nested_thread() {
+        let mut value = serde_json::json!({"id":8,"method":"turn/startBoundedIfIdle","params":{
+            "turn":{"threadId":"selected-thread","input":[]},
+            "allowance":{"maxProviderAttempts":3,"maxRequestBytes":1024,"deadlineUnixMs":42}
+        }});
+        let request: ClientRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(request.method_name(), "turn/startBoundedIfIdle");
+        assert_eq!(
+            request.serialization_scope(),
+            Some(ClientRequestSerializationScope::Thread {
+                thread_id: "selected-thread".into()
+            })
+        );
+        value["params"].as_object_mut().unwrap().remove("allowance");
+        assert!(serde_json::from_value::<ClientRequest>(value).is_err());
     }
 
     #[test]

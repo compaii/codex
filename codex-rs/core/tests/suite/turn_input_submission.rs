@@ -964,6 +964,7 @@ async fn recovery_preserves_durable_turn_attribution(
         assert_eq!(
             attribution,
             Some(TurnAttribution {
+                inference_allowance: None,
                 turn_id: turn_id.clone(),
                 turn_trigger: trigger.map(str::to_owned),
                 parent_turn_id: parent.map(str::to_owned),
