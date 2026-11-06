@@ -2145,6 +2145,7 @@ async fn bounded_turn_lifecycle_preserves_existing_goal_and_accounting() -> anyh
         total_token_usage: token_usage(100, 0, 50, 0, 150),
         last_token_usage: token_usage(100, 0, 50, 0, 150),
         model_context_window: None,
+        last_usage_includes_reasoning: None,
     };
     for contributor in harness.registry.token_usage_contributors() {
         contributor
