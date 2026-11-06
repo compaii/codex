@@ -204,3 +204,32 @@ fn legacy_hosts_do_not_acquire_an_extra_goal_quota_permit() {
     let _submission = host.admit_turn_start();
     assert_eq!(host.0.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn workspace_pause_waits_for_admitted_work_and_preserves_shutdown_drain() {
+    let admission = TurnAdmission::default();
+    let in_flight = admission.admit().unwrap();
+    let pending_pause = admission.pause();
+    tokio::pin!(pending_pause);
+    tokio::select! {
+        biased;
+        _ = &mut pending_pause => panic!("pause completed before the existing request"),
+        () = async {} => {}
+    }
+    assert!(admission.admit().is_err());
+    assert!(admission.admit_turn_start().is_none());
+    assert!(
+        admission
+            .admit_goal_continuation(codex_protocol::ThreadId::new(), Box::new(|| {}))
+            .is_none()
+    );
+    assert!(admission.admit_delegated_turn_start().is_none());
+    drop(in_flight);
+    let pause = pending_pause.await.unwrap();
+    drop(pause);
+    drop(admission.admit().unwrap());
+    let pause = admission.pause().await.unwrap();
+    admission.begin_drain();
+    drop(pause);
+    assert!(admission.admit().is_err());
+}

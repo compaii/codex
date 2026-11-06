@@ -19,6 +19,7 @@ use codex_utils_string::to_ascii_json_string;
 
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
+use crate::tools::context::ToolEnvironments;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::lifecycle::extension_tool_call_source;
@@ -74,8 +75,18 @@ impl ToolExecutor<ToolInvocation> for ExtensionToolAdapter {
                         .into(),
                 ));
             }
-            let environment_accessors = invocation.step_context.environments();
-            let environments = environment_accessors
+            let step = &invocation.step_context;
+            let selected: Vec<_> = match &invocation.environments {
+                ToolEnvironments::Arguments(environments) => {
+                    environments.iter().map(|(_, env)| env.as_ref()).collect()
+                }
+                _ => step.environments.turn_environments().collect(),
+            };
+            let accessors: Vec<_> = selected
+                .into_iter()
+                .map(|env| (env, step.fs_accessor(env)))
+                .collect();
+            let environments = accessors
                 .iter()
                 .map(|(environment, fs)| {
                     ToolEnvironment::new(
@@ -93,6 +104,33 @@ impl ToolExecutor<ToolInvocation> for ExtensionToolAdapter {
 }
 
 impl CoreToolRuntime for ExtensionToolAdapter {
+    fn environments_for_input(
+        &self,
+        invocation: &ToolInvocation,
+    ) -> Result<ToolEnvironments, codex_tools::FunctionCallError> {
+        let arguments = self.0.environment_arguments(&invocation.payload)?;
+        if arguments.is_empty() {
+            return Ok(ToolEnvironments::All);
+        }
+        arguments
+            .into_iter()
+            .map(|(field, id)| {
+                let env = invocation
+                    .step_context
+                    .environments
+                    .turn_environments()
+                    .find(|env| env.selection.environment_id == id)
+                    .ok_or_else(|| {
+                        codex_tools::FunctionCallError::RespondToModel(format!(
+                            "unknown or unavailable environment ID: {id}"
+                        ))
+                    })?;
+                Ok((field, Arc::new(env.clone())))
+            })
+            .collect::<Result<_, _>>()
+            .map(ToolEnvironments::Arguments)
+    }
+
     fn is_builtin_control_tool(&self) -> bool {
         let tool_name = self.0.tool_name();
         if tool_name.is_default_namespace() {
@@ -205,7 +243,7 @@ async fn to_extension_call<'a>(
     let codex_turn_metadata = invocation
         .turn
         .turn_metadata_state
-        .current_meta_value_for_mcp_request(ExecutionMetadata::from_settings(
+        .current_meta_value_for_extension_request(ExecutionMetadata::from_settings(
             &invocation.step_context.settings,
         ))
         .and_then(|metadata| to_ascii_json_string(&metadata).ok());
@@ -222,6 +260,8 @@ async fn to_extension_call<'a>(
             session: Arc::downgrade(&invocation.session),
             turn: Arc::downgrade(&invocation.turn),
         }),
+        attachment_store: Arc::clone(&invocation.session.services.image_store),
+        ephemeral: invocation.turn.config.ephemeral,
         environments,
         payload: invocation.payload.clone(),
     }
@@ -232,6 +272,7 @@ mod tests {
     use std::sync::Arc;
 
     use codex_extension_items::ExtensionItem;
+    use codex_extension_items::image_generation::GeneratedImageRef;
     use codex_extension_items::image_generation::ImageGenerationItem;
     use codex_extension_items::web_search::WebSearchItem;
     use codex_protocol::items::TurnItem;
@@ -401,6 +442,8 @@ mod tests {
             call_id: "call-extension".to_string(),
             tool_name: codex_tools::ToolName::plain("extension_echo"),
             source: ToolCallSource::Direct,
+            native_call: None,
+            environments: Default::default(),
             payload: ToolPayload::Function {
                 arguments: json!({ "message": "hello" }).to_string(),
             },
@@ -417,6 +460,7 @@ mod tests {
         assert_eq!(
             CoreToolRuntime::post_tool_use_payload(&handler, &invocation, &output),
             Some(PostToolUsePayload {
+                tool_cwd: None,
                 tool_name: HookToolName::new("extension_echo"),
                 tool_use_id: "call-extension".to_string(),
                 tool_input: json!({ "message": "hello" }),
@@ -500,6 +544,8 @@ mod tests {
                 cell_id: "cell-1".to_string(),
                 runtime_tool_call_id: "nested-call-1".to_string(),
             },
+            native_call: None,
+            environments: Default::default(),
             payload: ToolPayload::Function {
                 arguments: json!({ "message": "hello" }).to_string(),
             },
@@ -577,10 +623,13 @@ mod tests {
             id: "call-image".to_string(),
             status: "in_progress".to_string(),
             revised_prompt: None,
-            result: String::new(),
+            image: GeneratedImageRef::Inline {
+                result: String::new(),
+            },
             transparent_background: None,
             failure: None,
             saved_path: None,
+            input_images: Vec::new(),
             imagegen_request_id: None,
             generation_id: None,
         });
@@ -588,10 +637,13 @@ mod tests {
             id: "call-image".to_string(),
             status: "completed".to_string(),
             revised_prompt: Some("A tiny blue square".to_string()),
-            result: "cG5n".to_string(),
+            image: GeneratedImageRef::Inline {
+                result: "cG5n".to_string(),
+            },
             transparent_background: Some(true),
             failure: None,
             saved_path: Some(expected_path.clone()),
+            input_images: Vec::new(),
             imagegen_request_id: None,
             generation_id: None,
         });
@@ -613,10 +665,14 @@ mod tests {
                     call_id: "call-image".to_string(),
                     status: "completed".to_string(),
                     revised_prompt: Some("A tiny blue square".to_string()),
-                    result: "cG5n".to_string(),
+                    image: GeneratedImageRef::Inline {
+                        result: "cG5n".to_string(),
+                    },
                     transparent_background: Some(true),
                     failure: None,
                     saved_path: Some(expected_path.clone()),
+                    input_images: Vec::new(),
+                    generation_id: None,
                 })],
             },
         )

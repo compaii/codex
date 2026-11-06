@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -53,6 +54,7 @@ use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::TextPosition as AppTextPosition;
 use codex_app_server_protocol::TextRange as AppTextRange;
+use codex_app_server_transport::WebSocketCompression;
 use codex_app_server_transport::daemon_recovery_file_path;
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigLoadError;
@@ -104,6 +106,10 @@ mod code_mode_host;
 mod codex_home_metrics;
 mod command_exec;
 mod config_layer;
+mod startup_config;
+pub use startup_config::StartupConfigArgs;
+pub use startup_config::print_startup_config;
+
 mod config_manager;
 mod config_manager_service;
 mod connection_cleanup;
@@ -131,6 +137,7 @@ mod model_catalog;
 mod models;
 mod models_refresh_worker;
 mod notification_media;
+mod otel_config;
 mod otel_reloader;
 mod outgoing_message;
 mod plugin_config_reload;
@@ -138,6 +145,8 @@ mod request_processors;
 mod request_serialization;
 mod server_request_error;
 mod skills_watcher;
+mod startup_warnings;
+mod thread_sample;
 mod thread_state;
 mod thread_status;
 mod transport;
@@ -154,6 +163,7 @@ pub use crate::transport::AppServerTransport;
 pub use crate::transport::RemoteControlStartupMode;
 pub use crate::transport::app_server_control_socket_path;
 pub use crate::transport::take_remote_control_disabled_env;
+pub use crate::transport::verified_local_daemon_socket;
 
 const LOG_FORMAT_ENV_VAR: &str = "LOG_FORMAT";
 const OTEL_SERVICE_NAME: &str = "codex-app-server";
@@ -554,6 +564,8 @@ pub enum PluginStartupTasks {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppServerRuntimeOptions {
+    /// Optional host-owned frozen cloud skill catalog and resources, loaded once at startup.
+    pub cloud_skills_snapshot: Option<std::path::PathBuf>,
     pub code_mode_host_transport: CodeModeHostTransport,
     pub plugin_startup_tasks: PluginStartupTasks,
     pub remote_control_startup_mode: RemoteControlStartupMode,
@@ -564,6 +576,7 @@ pub struct AppServerRuntimeOptions {
 impl Default for AppServerRuntimeOptions {
     fn default() -> Self {
         Self {
+            cloud_skills_snapshot: None,
             code_mode_host_transport: CodeModeHostTransport::Local,
             plugin_startup_tasks: PluginStartupTasks::Start,
             remote_control_startup_mode: RemoteControlStartupMode::ResolvePersisted,
@@ -585,6 +598,18 @@ pub async fn run_main_with_transport_options(
     auth: WebsocketAuthSettings,
     runtime_options: AppServerRuntimeOptions,
 ) -> IoResult<AppServerExit> {
+    let cloud_skill_provider = match runtime_options.cloud_skills_snapshot {
+        Some(path) => {
+            let provider = tokio::task::spawn_blocking(move || {
+                codex_skills_extension::FrozenCloudSkillProvider::from_file(&path)
+            })
+            .await
+            .map_err(std::io::Error::other)?
+            .map_err(|err| std::io::Error::new(ErrorKind::InvalidInput, err))?;
+            Some(Arc::new(provider) as Arc<dyn codex_skills_extension::SkillProvider>)
+        }
+        None => None,
+    };
     #[cfg(target_os = "windows")]
     let _registered_core = codex_windows_sandbox::registered_core_requested();
     let managed_daemon = matches!(&transport, AppServerTransport::UnixSocket { .. })
@@ -625,21 +650,12 @@ pub async fn run_main_with_transport_options(
         arg0_paths.clone(),
         Arc::new(NoopThreadConfigLoader),
     );
-    let bootstrap_config = config_manager
-        .load_startup_config(startup_cwd.clone())
+    let startup = config_manager
+        .load_managed_startup_config(startup_cwd.clone())
         .await?;
-    let bootstrap_auth =
-        AuthManager::shared_from_config(&bootstrap_config, /*enable_codex_api_key_env*/ false)
-            .await
-            .map_err(std::io::Error::other)?;
-    config_manager.replace_cloud_config_bundle_loader(
-        bootstrap_auth,
-        bootstrap_config.chatgpt_base_url.clone(),
-        bootstrap_config.http_client_factory(),
-    );
     let mut config_warnings = Vec::new();
     let mut plugin_startup_config = PluginStartupConfig::Current;
-    let config = match config_manager.load_latest_config(startup_cwd).await {
+    let config = match startup.config {
         Ok(config) => config,
         Err(err) if is_unsupported_untrusted_approval_policy_error(&err) => {
             return Err(err);
@@ -666,11 +682,7 @@ pub async fn run_main_with_transport_options(
         AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
             .await
             .map_err(std::io::Error::other)?;
-    config_manager.replace_cloud_config_bundle_loader(
-        auth_manager.clone(),
-        config.chatgpt_base_url.clone(),
-        config.http_client_factory(),
-    );
+    config_manager.update_managed_config_loader(auth_manager.clone(), &config);
     config_manager
         .sync_default_client_residency_requirement()
         .await;
@@ -801,12 +813,12 @@ pub async fn run_main_with_transport_options(
     let stderr_fmt: StderrLogLayer = match log_format_from_env() {
         LogFormat::Json => tracing_subscriber::fmt::layer()
             .json()
-            .with_writer(std::io::stderr)
+            .with_writer(codex_app_server_daemon::stderr_writer)
             .with_span_events(stderr_span_events())
             .with_filter(EnvFilter::from_default_env())
             .boxed(),
         LogFormat::Default => tracing_subscriber::fmt::layer()
-            .with_writer(std::io::stderr)
+            .with_writer(codex_app_server_daemon::stderr_writer)
             .with_span_events(stderr_span_events())
             .with_filter(EnvFilter::from_default_env())
             .boxed(),
@@ -871,6 +883,14 @@ pub async fn run_main_with_transport_options(
     let remote_control_shutdown_token = transport_shutdown_token.child_token();
     let mut transport_accept_handles = Vec::<JoinHandle<()>>::new();
 
+    let websocket_compression = if config
+        .features
+        .enabled(Feature::AppServerWebSocketCompression)
+    {
+        WebSocketCompression::Zstd
+    } else {
+        WebSocketCompression::Plain
+    };
     let single_client_mode = matches!(&transport, AppServerTransport::Stdio);
     let graceful_signal_restart_enabled =
         runtime_options.install_shutdown_signal_handler && !single_client_mode;
@@ -903,6 +923,7 @@ pub async fn run_main_with_transport_options(
                 } else {
                     DaemonShutdownAccess::Disabled
                 },
+                websocket_compression,
             )
             .await?;
             transport_accept_handles.push(accept_handle);
@@ -913,6 +934,7 @@ pub async fn run_main_with_transport_options(
                 transport_event_tx.clone(),
                 transport_shutdown_token.clone(),
                 policy_from_settings(&auth)?,
+                websocket_compression,
             )
             .await?;
             transport_accept_handles.push(accept_handle);
@@ -1066,17 +1088,21 @@ pub async fn run_main_with_transport_options(
         let auth_manager = Arc::clone(&auth_manager);
         let initialize_notification_sender = outgoing_message_sender.clone();
         let outbound_control_tx = outbound_control_tx;
+        let (startup_warnings_tx, mut startup_warnings_rx) = mpsc::unbounded_channel();
         let mut processor = MessageProcessor::new(MessageProcessorArgs {
+            cloud_skill_provider,
             outgoing: outgoing_message_sender,
             analytics_events_client,
             arg0_paths,
             config: Arc::new(config),
+            startup_cwd,
             config_manager,
             environment_manager,
             feedback: feedback.clone(),
             log_db,
             state_db: state_db.clone(),
             config_warnings,
+            startup_warnings_tx,
             session_source,
             user_verification: Arc::new(crate::user_verification::Service::new(Arc::clone(
                 &auth_manager,
@@ -1429,6 +1455,9 @@ pub async fn run_main_with_transport_options(
                             }
                         }
                     }
+                    Some(message) = startup_warnings_rx.recv(), if connections.values().any(|state| state.session.initialized()) => {
+                        startup_warnings::send_warning(&initialize_notification_sender, message).await;
+                    }
                     _ = connection_cleanup_tasks.reap_next() => {}
                     result = thread_listener_tasks.join_next(), if !thread_listener_tasks.is_empty() => {
                         if let Some(Err(err)) = result {
@@ -1650,10 +1679,8 @@ fn sqlite_recovery_notice(
 fn emit_state_db_backup_warning(message: &str) {
     warn!("{message}");
     if !tracing::dispatcher::has_been_set() {
-        #[allow(clippy::print_stderr)]
-        {
-            eprintln!("{message}");
-        }
+        let _ =
+            codex_app_server_daemon::stderr_writer().write_all(format!("{message}\n").as_bytes());
     }
 }
 
@@ -1704,235 +1731,5 @@ fn analytics_rpc_transport(transport: &AppServerTransport) -> AppServerRpcTransp
 }
 
 #[cfg(test)]
-#[path = "stderr_logging_tests.rs"]
-mod stderr_logging_tests;
-
-#[cfg(test)]
-mod tests {
-    use super::LogFormat;
-    use super::ShutdownAction;
-    use super::ShutdownSignal;
-    use super::ShutdownState;
-    #[cfg(debug_assertions)]
-    use super::loader_overrides_with_test_user_config_file;
-    use super::turn_admission::TurnAdmission;
-    #[cfg(debug_assertions)]
-    use codex_config::LoaderOverrides;
-    use codex_extension_api::TurnStartAdmission;
-    #[cfg(debug_assertions)]
-    use codex_utils_absolute_path::AbsolutePathBuf;
-    use pretty_assertions::assert_eq;
-    use std::sync::Arc;
-    use tokio::sync::oneshot;
-    use tokio::sync::watch;
-
-    #[test]
-    fn shutdown_waits_for_admitted_requests_but_force_remains_available() {
-        let admission = TurnAdmission::default();
-        let active = admission.subscribe_active();
-        let in_flight = admission.admit().expect("request admitted");
-        let mut shutdown = ShutdownState::default();
-        let connection_count = 1;
-        let running_turn_count = 0;
-        let (_, running) = watch::channel(running_turn_count);
-        shutdown.on_signal(
-            ShutdownSignal::Forceable,
-            connection_count,
-            running_turn_count,
-            &admission,
-        );
-        assert!(matches!(
-            shutdown.update(&running, *active.borrow(), connection_count, &admission),
-            ShutdownAction::Noop
-        ));
-        shutdown.on_signal(
-            ShutdownSignal::Forceable,
-            connection_count,
-            running_turn_count,
-            &admission,
-        );
-        assert!(shutdown.forced());
-        assert!(matches!(
-            shutdown.update(&running, *active.borrow(), connection_count, &admission),
-            ShutdownAction::Finish
-        ));
-        drop(in_flight);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn maintenance_waits_without_closing_admission_then_commits_only_at_idle() {
-        let admission = TurnAdmission::default();
-        let (running_tx, running) = watch::channel(1);
-        let active = admission.subscribe_active();
-        let mut shutdown = ShutdownState::default();
-        for _ in 0..2 {
-            shutdown.on_signal(ShutdownSignal::GracefulOnly, 2, 1, &admission);
-            assert!(matches!(
-                shutdown.update(&running, *active.borrow(), 2, &admission),
-                ShutdownAction::Noop
-            ));
-            assert!(!shutdown.draining);
-            assert!(!shutdown.forced());
-            drop(admission.admit().expect("other clients remain admitted"));
-        }
-        // A start still preparing work must also keep maintenance out.
-        let start = admission.admit().expect("request admitted before idle");
-        running_tx.send_replace(0);
-        assert!(matches!(
-            shutdown.update(&running, *active.borrow(), 2, &admission),
-            ShutdownAction::Noop
-        ));
-        drop(start);
-        assert!(matches!(
-            shutdown.update(&running, *active.borrow(), 2, &admission),
-            ShutdownAction::Finish
-        ));
-        assert!(admission.admit().is_err());
-        assert!(shutdown.maintenance_deadline.is_some());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn maintenance_stalled_snapshot_reopens_admission_and_cancels_handoff() {
-        let admission = TurnAdmission::default();
-        let (_, running) = watch::channel(0);
-        let mut shutdown = ShutdownState::default();
-        shutdown.on_signal(ShutdownSignal::GracefulOnly, 1, 0, &admission);
-        assert!(matches!(
-            shutdown.update(&running, 0, 1, &admission),
-            ShutdownAction::Finish
-        ));
-        assert!(admission.admit().is_err());
-        // A stalled snapshot must never leave the shared server closed.
-        let resumed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let observed = Arc::clone(&resumed);
-        assert!(
-            admission
-                .admit_goal_continuation(
-                    codex_protocol::ThreadId::new(),
-                    Box::new(move || {
-                        observed.store(true, std::sync::atomic::Ordering::SeqCst);
-                    })
-                )
-                .is_none()
-        );
-        shutdown.maintenance_deadline = Some(tokio::time::Instant::now());
-        assert!(matches!(
-            shutdown.update(&running, 0, 1, &admission),
-            ShutdownAction::ResumeServing
-        ));
-        assert!(!shutdown.requested());
-        assert!(admission.admit().is_ok());
-        assert!(resumed.load(std::sync::atomic::Ordering::SeqCst));
-    }
-
-    #[test]
-    fn maintenance_does_not_rearm_after_queue_expiry_or_lost_observer() {
-        let admission = TurnAdmission::default();
-        for abandoned in [false, true] {
-            let mut shutdown = ShutdownState::default();
-            let (reply, observer) = oneshot::channel();
-            let (_flushed, flush_complete) = oneshot::channel();
-            let expires = if abandoned {
-                drop(observer);
-                tokio::time::Instant::now() + std::time::Duration::from_secs(120)
-            } else {
-                tokio::time::Instant::now()
-            };
-            shutdown.on_maintenance_request(expires, reply, flush_complete, &admission);
-            assert!(!shutdown.requested());
-            assert!(admission.admit().is_ok());
-        }
-        let mut shutdown = ShutdownState::default();
-        let (reply, _observer) = oneshot::channel();
-        let (_flushed, flush_complete) = oneshot::channel();
-        let received_expiry = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
-        shutdown.on_maintenance_request(received_expiry, reply, flush_complete, &admission);
-        assert_eq!(shutdown.maintenance_deadline, Some(received_expiry));
-        assert!(
-            admission
-                .admit_goal_continuation(codex_protocol::ThreadId::new(), Box::new(|| {}))
-                .is_none()
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn maintenance_pending_request_expires_without_ever_closing_admission() {
-        let admission = TurnAdmission::default();
-        let (_, running) = watch::channel(1);
-        let mut shutdown = ShutdownState::default();
-        shutdown.on_signal(ShutdownSignal::GracefulOnly, 1, 1, &admission);
-        assert!(!shutdown.draining);
-        let resumed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let observed = Arc::clone(&resumed);
-        assert!(
-            admission
-                .admit_goal_continuation(
-                    codex_protocol::ThreadId::new(),
-                    Box::new(move || {
-                        observed.store(true, std::sync::atomic::Ordering::SeqCst);
-                    })
-                )
-                .is_none()
-        );
-        shutdown.maintenance_deadline = Some(tokio::time::Instant::now());
-        assert!(matches!(
-            shutdown.update(&running, 0, 1, &admission),
-            ShutdownAction::ResumeServing
-        ));
-        assert!(!shutdown.requested());
-        assert!(admission.admit().is_ok());
-        assert!(resumed.load(std::sync::atomic::Ordering::SeqCst));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn maintenance_request_is_not_the_first_of_two_forceable_stop_signals() {
-        let admission = TurnAdmission::default();
-        let mut shutdown = ShutdownState::default();
-        shutdown.on_signal(ShutdownSignal::GracefulOnly, 1, 1, &admission);
-        shutdown.on_signal(ShutdownSignal::Forceable, 1, 1, &admission);
-        assert!(!shutdown.forced());
-        assert!(shutdown.draining);
-        assert!(!shutdown.maintenance);
-        assert!(admission.admit().is_err());
-        shutdown.on_signal(ShutdownSignal::Forceable, 1, 1, &admission);
-        assert!(shutdown.forced());
-    }
-
-    #[test]
-    fn log_format_from_env_value_matches_json_values_case_insensitively() {
-        assert_eq!(LogFormat::from_env_value(Some("json")), LogFormat::Json);
-        assert_eq!(LogFormat::from_env_value(Some("JSON")), LogFormat::Json);
-        assert_eq!(LogFormat::from_env_value(Some("  Json  ")), LogFormat::Json);
-    }
-
-    #[test]
-    fn log_format_from_env_value_defaults_for_non_json_values() {
-        assert_eq!(
-            LogFormat::from_env_value(/*value*/ None),
-            LogFormat::Default
-        );
-        assert_eq!(LogFormat::from_env_value(Some("")), LogFormat::Default);
-        assert_eq!(LogFormat::from_env_value(Some("text")), LogFormat::Default);
-        assert_eq!(LogFormat::from_env_value(Some("jsonl")), LogFormat::Default);
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn debug_test_user_config_file_overrides_loader_path() {
-        let path = std::env::temp_dir().join("codex-app-server-test-config.toml");
-        let loader_overrides = loader_overrides_with_test_user_config_file(
-            LoaderOverrides::default(),
-            Some(path.clone()),
-        )
-        .expect("test config path should be valid");
-
-        assert_eq!(
-            loader_overrides.user_config_path,
-            Some(AbsolutePathBuf::from_absolute_path(path).expect("absolute test path"))
-        );
-    }
-}
+#[path = "lib_tests.rs"]
+mod tests;

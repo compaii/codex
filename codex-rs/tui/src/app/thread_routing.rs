@@ -49,11 +49,30 @@ impl App {
             .await;
     }
 
-    pub(super) async fn shutdown_side_threads(&mut self, app_server: &mut AppServerSession) {
-        let side_thread_ids: Vec<ThreadId> = self.side_threads.keys().copied().collect();
-        for side_thread_id in side_thread_ids {
-            self.discard_side_thread(app_server, side_thread_id).await;
+    pub(super) async fn shutdown_side_threads(
+        &mut self,
+        app_server: &mut AppServerSession,
+        root: Option<ThreadId>,
+    ) -> bool {
+        if self.side_threads.is_empty() {
+            return true;
         }
+        let subtree = root.map(|id| self.known_thread_subtree(id));
+        let ids: Vec<_> = self
+            .side_threads
+            .iter()
+            .filter(|(_, side)| {
+                subtree
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&side.parent_thread_id))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        let mut closed = true;
+        for id in ids {
+            closed &= self.discard_side_thread(app_server, id).await;
+        }
+        closed
     }
 
     pub(super) fn abort_thread_event_listener(&mut self, thread_id: ThreadId) {
@@ -118,6 +137,22 @@ impl App {
         }
     }
 
+    pub(super) fn retain_subscriptions_for_fork(&mut self) {
+        // Tasks can start while the fork RPC is pending.
+        for id in self
+            .thread_event_channels
+            .keys()
+            .copied()
+            .chain(self.agent_navigation.tracked_thread_ids())
+            .filter(|id| !self.side_threads.contains_key(id))
+        {
+            self.agents_overview
+                .dispatched_requests
+                .entry(id)
+                .or_default();
+        }
+    }
+
     pub(super) async fn activate_thread_for_replay(
         &mut self,
         thread_id: ThreadId,
@@ -164,28 +199,38 @@ impl App {
 
     pub(super) fn thread_label(&self, thread_id: ThreadId) -> String {
         let is_primary = self.primary_thread_id == Some(thread_id);
-        let fallback_label = if is_primary {
-            "Main [default]".to_string()
-        } else {
-            let thread_id = thread_id.to_string();
-            let short_id: String = thread_id.chars().take(8).collect();
-            format!("Agent ({short_id})")
+        let anonymous = |label: &str| {
+            // Agents spawned together share the timestamp prefix of their UUIDv7 IDs.
+            let id = thread_id.to_string();
+            let suffix = id.rsplit('-').next().unwrap_or(&id);
+            format!("{label} ({suffix})")
         };
         if let Some(entry) = self.agent_navigation.get(&thread_id) {
+            if let Some(path) = entry.agent_path.as_deref().map(str::trim)
+                && !is_primary
+                && !path.is_empty()
+            {
+                return path.to_string();
+            }
             let label = format_agent_picker_item_name(
                 entry.agent_nickname.as_deref(),
                 entry.agent_role.as_deref(),
                 is_primary,
             );
-            if label == "Agent" {
-                let thread_id = thread_id.to_string();
-                let short_id: String = thread_id.chars().take(8).collect();
-                format!("{label} ({short_id})")
+            if !is_primary
+                && entry
+                    .agent_nickname
+                    .as_deref()
+                    .is_none_or(|name| name.trim().is_empty())
+            {
+                anonymous(&label)
             } else {
                 label
             }
+        } else if is_primary {
+            "Main [default]".to_string()
         } else {
-            fallback_label
+            anonymous("Agent")
         }
     }
 
@@ -203,7 +248,8 @@ impl App {
         &mut self,
         target_session: &crate::resume_picker::SessionTarget,
     ) -> bool {
-        if self.active_thread_id != Some(target_session.thread_id)
+        if self.chat_widget.has_provider_error()
+            || self.active_thread_id != Some(target_session.thread_id)
             || self
                 .thread_event_channels
                 .get(&target_session.thread_id)
@@ -536,10 +582,32 @@ impl App {
             return Ok(());
         }
 
-        if self
+        let submitted = match self
             .try_submit_active_thread_op_via_app_server(app_server, thread_id, &op)
-            .await?
+            .await
         {
+            Ok(submitted) => submitted,
+            Err(error) => {
+                if let Some(provider_error) =
+                    crate::app_server_session::model_provider_error(&error)
+                    && self.current_displayed_thread_id() == Some(thread_id)
+                {
+                    self.chat_widget.show_provider_error(
+                        provider_error,
+                        match &op {
+                            AppCommand::UserTurn {
+                                client_user_message_id,
+                                ..
+                            } => Some(client_user_message_id.as_str()),
+                            _ => None,
+                        },
+                    );
+                    return Ok(());
+                }
+                return Err(error);
+            }
+        };
+        if submitted {
             if ThreadEventStore::op_can_change_pending_replay_state(&op) {
                 self.note_thread_outbound_op(thread_id, &op).await;
                 self.refresh_pending_thread_approvals().await;
@@ -661,6 +729,9 @@ impl App {
         thread_id: ThreadId,
         op: &AppCommand,
     ) -> Result<bool> {
+        if user_turn_submission::try_submit_user_turn(self, app_server, thread_id, op).await? {
+            return Ok(true);
+        }
         match op {
             AppCommand::Interrupt => {
                 let mut turn_id = self
@@ -732,198 +803,14 @@ impl App {
                 });
                 Ok(true)
             }
-            AppCommand::UserTurn {
-                client_user_message_id,
-                items,
-                cwd,
-                approval_policy,
-                approvals_reviewer,
-                active_permission_profile: _,
-                model,
-                effort,
-                summary,
-                service_tier,
-                final_output_json_schema,
-                collaboration_mode,
-            } => {
-                let mut should_start_turn = true;
-                if let Some(turn_id) = self.active_turn_id_for_thread(thread_id).await {
-                    let mut steer_turn_id = turn_id;
-                    let mut retried_after_turn_mismatch = false;
-                    loop {
-                        match app_server
-                            .turn_steer(
-                                thread_id,
-                                steer_turn_id.clone(),
-                                client_user_message_id.clone(),
-                                items.to_vec(),
-                            )
-                            .await
-                        {
-                            Ok(_) => {
-                                if self.active_thread_id == Some(thread_id)
-                                    && self.chat_widget.thread_id() == Some(thread_id)
-                                {
-                                    crate::startup_recovery::acknowledged(client_user_message_id);
-                                }
-                                return Ok(true);
-                            }
-                            Err(error) => {
-                                if let Some(turn_error) =
-                                    active_turn_not_steerable_turn_error(&error)
-                                {
-                                    if !self.chat_widget.enqueue_rejected_steer() {
-                                        self.chat_widget.add_error_message(turn_error.message);
-                                    }
-                                    return Ok(true);
-                                }
-                                match active_turn_steer_race(&error) {
-                                    Some(ActiveTurnSteerRace::Missing) => {
-                                        if let Some(channel) =
-                                            self.thread_event_channels.get(&thread_id)
-                                        {
-                                            let mut store = channel.store.lock().await;
-                                            store.clear_active_turn_id();
-                                        }
-                                        should_start_turn = true;
-                                        break;
-                                    }
-                                    Some(ActiveTurnSteerRace::ExpectedTurnMismatch {
-                                        actual_turn_id,
-                                    }) if !retried_after_turn_mismatch
-                                        && actual_turn_id != steer_turn_id =>
-                                    {
-                                        // Review flows can swap the active turn before the TUI
-                                        // processes the corresponding notification. Retry once with
-                                        // the server-reported turn id so non-steerable review turns
-                                        // still fall through to the existing queueing behavior.
-                                        if let Some(channel) =
-                                            self.thread_event_channels.get(&thread_id)
-                                        {
-                                            let mut store = channel.store.lock().await;
-                                            store.set_active_turn_id(actual_turn_id.clone());
-                                        }
-                                        steer_turn_id = actual_turn_id;
-                                        retried_after_turn_mismatch = true;
-                                    }
-                                    Some(ActiveTurnSteerRace::ExpectedTurnMismatch {
-                                        actual_turn_id,
-                                    }) => {
-                                        if let Some(channel) =
-                                            self.thread_event_channels.get(&thread_id)
-                                        {
-                                            let mut store = channel.store.lock().await;
-                                            store.set_active_turn_id(actual_turn_id);
-                                        }
-                                        return Err(error.into());
-                                    }
-                                    None => return Err(error.into()),
-                                }
-                            }
-                        }
-                    }
-                }
-                if should_start_turn {
-                    let enabled = self.chat_widget.daybreak_enabled
-                        && !self.chat_widget.side_conversation_active()
-                        && !self.side_threads.contains_key(&thread_id);
-                    let eligible_account = self.chat_widget.daybreak_account_eligible();
-                    let cyber_access_program = match crate::daybreak::program_for_turn(
-                        &self.chat_widget.model_catalog().models,
-                        model,
-                        eligible_account,
-                        enabled,
-                    ) {
-                        Ok(program) => program,
-                        Err(message) => {
-                            if !self
-                                .chat_widget
-                                .handle_turn_start_rejection(message.clone())
-                            {
-                                self.chat_widget.add_error_message(message);
-                            }
-                            return Ok(true);
-                        }
-                    };
-                    let config = self.chat_widget.config_ref();
-                    let selected_profile =
-                        self.pending_server_profiles.get(&thread_id).or_else(|| {
-                            self.agents_overview
-                                .requested_permission_profiles
-                                .get(&thread_id)
-                        });
-                    let selected_active = selected_profile
-                        .map(|profile| ActivePermissionProfile::new(profile.profile_id.clone()));
-                    let (turn_approval_policy, turn_approvals_reviewer) =
-                        if let Some(profile) = selected_profile {
-                            (
-                                profile.approval_policy,
-                                profile.approvals_reviewer.map(Into::into),
-                            )
-                        } else if self.app_server_target.thread_params_mode()
-                            == crate::app_server_session::ThreadParamsMode::Remote
-                        {
-                            (
-                                Some(config.permissions.approval_policy.value().into()),
-                                Some(config.approvals_reviewer.into()),
-                            )
-                        } else {
-                            (
-                                Some(*approval_policy),
-                                Some(
-                                    approvals_reviewer
-                                        .unwrap_or(config.approvals_reviewer)
-                                        .into(),
-                                ),
-                            )
-                        };
-                    // Only explicit choices may override the saved server profile.
-                    let explicit_profile = self
-                        .runtime_permission_profile_override
-                        .as_ref()
-                        .filter(|profile| {
-                            profile.turn_override
-                                == RuntimePermissionProfileTurnOverride::LegacySandbox
-                        });
-                    let permissions_override = Self::turn_permissions_override_from_config(
-                        config,
-                        selected_active.as_ref().or_else(|| {
-                            explicit_profile
-                                .and_then(|profile| profile.active_permission_profile.as_ref())
-                        }),
-                        explicit_profile
-                            .and_then(RuntimePermissionProfileOverride::turn_permission_profile),
-                    );
-                    let response = app_server
-                        .turn_start(
-                            thread_id,
-                            client_user_message_id.clone(),
-                            items.to_vec(),
-                            cwd.clone(),
-                            turn_approval_policy,
-                            turn_approvals_reviewer,
-                            permissions_override,
-                            config.permissions.user_visible_workspace_roots(),
-                            model.to_string(),
-                            effort.clone(),
-                            *summary,
-                            service_tier.clone(),
-                            collaboration_mode.clone(),
-                            final_output_json_schema.clone(),
-                            cyber_access_program.map(Into::into),
-                        )
-                        .await?;
-                    if self.active_thread_id == Some(thread_id)
-                        && self.chat_widget.thread_id() == Some(thread_id)
-                    {
-                        crate::startup_recovery::acknowledged(client_user_message_id);
-                        self.chat_widget
-                            .record_safety_buffering_turn(response.turn.id, op);
-                    }
-                }
-                Ok(true)
-            }
             AppCommand::ListSkills { cwds, force_reload } => {
+                // A queued refresh can outlive the workspace it was requested for.
+                if !cwds
+                    .iter()
+                    .any(|cwd| cwd == self.chat_widget.config_ref().cwd.as_path())
+                {
+                    return Ok(true);
+                }
                 self.handle_skills_list_result(
                     app_server
                         .skills_list(codex_app_server_protocol::SkillsListParams {
@@ -1124,27 +1011,29 @@ impl App {
             .map(|(thread_id, channel)| (*thread_id, Arc::clone(&channel.store)))
             .collect();
 
-        let mut pending_thread_ids = Vec::new();
+        let mut pending_thread_ids = HashSet::new();
         for (thread_id, store) in channels {
             if Some(thread_id) == self.active_thread_id || Some(thread_id) == side_parent_thread_id
             {
                 continue;
             }
 
-            let store = store.lock().await;
-            if store.has_pending_thread_approvals() {
-                pending_thread_ids.push(thread_id);
+            if store.lock().await.has_pending_thread_approvals() {
+                pending_thread_ids.insert(thread_id);
+                // Approval requests can arrive before the thread's metadata.
+                if self.agent_navigation.get(&thread_id).is_none() {
+                    self.upsert_agent_picker_thread(
+                        thread_id, /*agent_nickname*/ None, /*agent_role*/ None,
+                        /*is_closed*/ false,
+                    );
+                }
             }
         }
 
-        pending_thread_ids.sort_by_key(ThreadId::to_string);
-
-        let threads = pending_thread_ids
-            .into_iter()
-            .map(|thread_id| self.thread_label(thread_id))
-            .collect();
-
-        self.chat_widget.set_pending_thread_approvals(threads);
+        if self.agent_navigation.pending_approvals != pending_thread_ids {
+            self.agent_navigation.pending_approvals = pending_thread_ids;
+            self.refresh_agent_picker();
+        }
     }
 
     pub(super) async fn refresh_side_parent_status_from_store(&mut self, thread_id: ThreadId) {
@@ -1251,6 +1140,11 @@ impl App {
                 started.thread.agent_role.clone(),
                 /*is_closed*/ false,
             );
+            self.agent_navigation.set_agent_path(
+                thread_id,
+                crate::app_server_session::source_agent_path(&started.thread.source),
+            );
+            self.sync_agent_picker_thread(thread_id);
 
             // Lifecycle responses already contain authoritative session state. Their rollout may
             // not exist until the first turn, so inferring it again can wait through reader retries.
@@ -1325,12 +1219,25 @@ impl App {
         {
             self.chat_widget
                 .on_thread_settings_updated(settings.clone());
+            if confirmed_profile.is_some()
+                || settings
+                    .thread_settings
+                    .active_permission_profile
+                    .as_ref()
+                    .is_some_and(|profile| {
+                        self.agents_overview
+                            .selected_permission_profiles
+                            .get(&thread_id)
+                            == Some(&profile.id)
+                    })
+            {
+                // Also adopt changed custom definitions and settings from another client
+                // after a no-op re-selection that needed no pending request.
+                self.adopt_server_permissions();
+            }
             notification = None;
         }
         if confirmed_profile.is_some() {
-            if self.chat_widget.thread_id() == Some(thread_id) {
-                self.adopt_server_permissions();
-            }
             self.app_event_tx.send(AppEvent::SettingsSelectionSettled);
         }
 
@@ -1373,8 +1280,9 @@ impl App {
         if let Some(activity) =
             sub_agent_activity_item(notification).and_then(sub_agent_activity_display)
         {
+            let thread_id = activity.thread_id;
             self.agent_navigation.record_sub_agent_activity(activity);
-            self.sync_active_agent_label();
+            self.sync_agent_picker_thread(thread_id);
             return;
         }
 
@@ -1403,6 +1311,7 @@ impl App {
                 thread_id, /*agent_nickname*/ None, /*agent_role*/ None,
                 /*is_closed*/ false,
             );
+            self.sync_agent_picker_thread(thread_id);
         }
     }
 
@@ -1586,6 +1495,7 @@ impl App {
             thread_id, /*agent_nickname*/ None, /*agent_role*/ None,
             /*is_closed*/ false,
         );
+        self.sync_agent_picker_thread(thread_id);
         let channel = self.ensure_thread_channel(thread_id);
         {
             let mut store = channel.store.lock().await;
@@ -1899,23 +1809,23 @@ impl App {
         let confirmed_message_ids = snapshot
             .turns
             .iter()
-            .flat_map(|turn| &turn.items)
+            .flat_map(Turn::item_payloads)
             .chain(snapshot.events.iter().filter_map(|event| {
                 let ThreadBufferedEvent::Notification(notification) = event else {
                     return None;
                 };
                 if let ServerNotification::ItemStarted(notification) = notification.as_ref() {
-                    Some(&notification.item)
+                    Some(&notification.item.payload)
                 } else if let ServerNotification::ItemCompleted(notification) =
                     notification.as_ref()
                 {
-                    Some(&notification.item)
+                    Some(&notification.item.payload)
                 } else {
                     None
                 }
             }))
             .filter_map(|item| {
-                if let ThreadItem::UserMessage { client_id, .. } = item {
+                if let ThreadItemPayload::UserMessage { client_id, .. } = item {
                     client_id.clone()
                 } else {
                     None
@@ -2059,6 +1969,23 @@ impl App {
     }
 
     pub(super) fn handle_thread_event_now(&mut self, event: ThreadBufferedEvent) {
+        // Replay has its own handler; suppress repeated notifications for the current turn.
+        if crate::terminal_size_telemetry::enabled(&self.config)
+            && !self.terminal_size_tags.is_empty()
+            && let ThreadBufferedEvent::Notification(notification) = &event
+            && let ServerNotification::TurnStarted(started) = notification.as_ref()
+            && self
+                .active_thread_id
+                .is_some_and(|id| id.to_string() == started.thread_id)
+            && self.chat_widget.last_turn_id() != Some(started.turn.id.as_str())
+        {
+            crate::terminal_size_telemetry::record(
+                &self.terminal_size_tags,
+                &self.config,
+                "turn_start",
+                crate::terminal_size_telemetry::read_size(),
+            );
+        }
         let needs_refresh = matches!(
             &event,
             ThreadBufferedEvent::Notification(notification)
@@ -2197,14 +2124,14 @@ impl App {
         let automatic_title_user_message = if self.chat_widget.thread_name().is_none()
             && let ThreadBufferedEvent::Notification(notification) = &event
             && let ServerNotification::ItemCompleted(notification) = notification.as_ref()
-            && let ThreadItem::UserMessage { content, .. } = &notification.item
+            && let ThreadItemPayload::UserMessage { content, .. } = &notification.item.payload
         {
             Some(
                 content
                     .iter()
                     .filter_map(|item| match item {
                         codex_app_server_protocol::UserInput::Text { text, .. } => {
-                            Some(crate::ide_context::extract_prompt_request_with_offset(text).0)
+                            Some(crate::user_prompt::extract_prompt_request_with_offset(text).0)
                         }
                         _ => None,
                     })

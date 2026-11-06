@@ -322,6 +322,7 @@ async fn same_thread_retry_keeps_subscription_and_restores_draft() -> Result<()>
         /*failed_thread_name*/ None,
     )
     .await?;
+    let backend_id = app_server.backend_id();
     app.enqueue_primary_thread_session(
         test_thread_session(thread_id, test_path_buf("/tmp/project")),
         Vec::new(),
@@ -343,6 +344,7 @@ async fn same_thread_retry_keeps_subscription_and_restores_draft() -> Result<()>
         &mut tui,
         &mut app_server,
         crate::resume_picker::SessionTarget {
+            backend_id,
             path,
             thread_id,
             cwd: None,
@@ -377,6 +379,7 @@ pub(super) enum HistoryCapabilities {
     ThreadStartDuringLegacyShutdown,
     ConfigReadUnsupported(i64),
     ConfigReadFails,
+    SuperBindingsUnsupported,
     ConfigReadUnknownVoice,
     VoiceCatalogCustom,
     VoiceCatalogUnavailable,
@@ -655,6 +658,18 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
                                 message: "config temporarily unavailable".to_string(),
                             },
                         })
+                    } else if history_capabilities == HistoryCapabilities::SuperBindingsUnsupported
+                        && request.method == "config/value/write"
+                    {
+                        JSONRPCMessage::Error(JSONRPCError {
+                            id: request_id,
+                            error: JSONRPCErrorError {
+                                code: -32600,
+                                data: None,
+                                message: "Invalid configuration: unknown key `super-left`"
+                                    .to_string(),
+                            },
+                        })
                     } else if history_capabilities == HistoryCapabilities::VoiceCatalogUnavailable
                         && request.method == "thread/realtime/listVoices"
                     {
@@ -880,8 +895,12 @@ pub(super) async fn start_recording_app_server_with_realtime_speech(
     .await?;
 
     Ok((
-        AppServerSession::new(app_server, thread_params_mode)
-            .with_local_codex_home(&config.codex_home),
+        AppServerSession::new(
+            crate::backend_id::BackendId::new(),
+            app_server,
+            thread_params_mode,
+        )
+        .with_local_codex_home(&config.codex_home),
         requests,
         proxy,
     ))
@@ -924,6 +943,51 @@ async fn make_history_test_app() -> Result<(Box<App>, tempfile::TempDir)> {
     app.config.codex_home = codex_home.path().to_path_buf().abs();
     app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
     Ok((app, codex_home))
+}
+
+#[tokio::test]
+async fn in_app_remote_resume_picker_lists_all_providers_after_provider_switch() -> Result<()> {
+    let (mut app, _codex_home) = make_history_test_app().await?;
+    let remote_root = tempdir()?;
+    let remote_cwd = remote_root.path().join("project");
+    std::fs::create_dir(&remote_cwd)?;
+    let (app_server, requests, proxy) = start_recording_remote_app_server(&app.config).await?;
+    let mut app_server = app_server.with_remote_cwd_override(Some(remote_cwd.clone()));
+    // Provider A's conversations must remain visible after switching to provider B.
+    app_server.model_provider_override = Some("provider-b".to_string());
+    let mut backends = crate::app::backend_sessions::BackendSessions::new(app_server);
+
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+    tui.set_alt_screen_enabled(/*enabled*/ false);
+    tui.pause_events();
+    let mut picker = Box::pin(app.open_resume_picker_for_backends(&mut tui, &mut backends));
+    let params = tokio::time::timeout(std::time::Duration::from_secs(/*secs*/ 5), async {
+        loop {
+            if let Some(params) = recorded_params(&requests, "thread/list").pop() {
+                break Ok::<_, color_eyre::Report>(params);
+            }
+            tokio::select! {
+                result = &mut picker => {
+                    result?;
+                    break Err(color_eyre::eyre::eyre!(
+                        "picker exited before requesting its thread list"
+                    ));
+                }
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+    })
+    .await??;
+    drop(picker);
+    backends.shutdown().await?;
+    proxy.await??;
+
+    assert_eq!(
+        params["cwd"],
+        serde_json::Value::String(remote_cwd.display().to_string())
+    );
+    assert_eq!(params["modelProviders"], serde_json::json!([]));
+    Ok(())
 }
 
 #[tokio::test]
@@ -987,29 +1051,30 @@ async fn delete_current_thread_navigates_only_after_success() -> Result<()> {
         let side_id = side.session.thread_id;
         app.side_threads
             .insert(side_id, SideThreadState::new(thread_id));
-        if !matches!(app.app_server_target, AppServerTarget::Embedded) {
-            // The recording proxy rejects the next unsubscribe after a failed fork.
-            side_config.cwd = side_config.cwd.join("failure");
-            assert!(
-                server
-                    .fork_side_thread(
-                        &app.local_settings,
-                        side_config,
-                        thread_id,
-                        /*selected_profile*/ None
-                    )
-                    .await
-                    .is_err()
-            );
-            assert_matches!(
-                app.delete_current_thread(&mut tui, &mut server).await?,
-                AppRunControl::Continue
-            );
-            assert_eq!(app.active_thread_id, Some(thread_id));
-            assert!(app.side_threads.contains_key(&side_id));
-            assert!(!app.chat_widget.has_active_view());
-            assert_eq!(recorded_params(&requests, "thread/delete").len(), 1);
-        }
+        let unrelated_side = ThreadId::new();
+        app.side_threads
+            .insert(unrelated_side, SideThreadState::new(ThreadId::new()));
+        // The recording proxy rejects the next unsubscribe after a failed fork.
+        side_config.cwd = side_config.cwd.join("failure");
+        assert!(
+            server
+                .fork_side_thread(
+                    &app.local_settings,
+                    side_config,
+                    thread_id,
+                    /*selected_profile*/ None
+                )
+                .await
+                .is_err()
+        );
+        assert_matches!(
+            app.delete_current_thread(&mut tui, &mut server).await?,
+            AppRunControl::Continue
+        );
+        assert_eq!(app.active_thread_id, Some(thread_id));
+        assert!(app.side_threads.contains_key(&side_id));
+        assert!(!app.chat_widget.has_active_view());
+        assert_eq!(recorded_params(&requests, "thread/delete").len(), 1);
         let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
         app.app_event_tx = AppEventSender::new(tx);
         let control =
@@ -1021,37 +1086,35 @@ async fn delete_current_thread_navigates_only_after_success() -> Result<()> {
                 .await
                 .is_err()
         );
-        if matches!(app.app_server_target, AppServerTarget::Embedded) {
-            assert_matches!(control, AppRunControl::Exit(ExitReason::ThreadRemoved));
-            assert!(recorded_params(&requests, "thread/unsubscribe").is_empty());
-        } else {
-            assert_matches!(control, AppRunControl::Continue);
-            assert!(app.side_threads.is_empty());
-            assert_eq!(
-                recorded_params(&requests, "thread/unsubscribe"),
-                vec![serde_json::json!({"threadId": side_id.to_string()}); 2]
-            );
-            loop {
-                let event = tokio::time::timeout(Duration::from_secs(/*secs*/ 5), events.recv())
-                    .await?
-                    .expect("command center refresh");
-                let refreshed = matches!(&event, AppEvent::AgentsOverviewThreadsLoaded { .. });
-                Box::pin(app.handle_event(&mut tui, &mut server, event)).await?;
-                if refreshed {
-                    break;
-                }
+        assert_matches!(control, AppRunControl::Continue);
+        assert_eq!(
+            app.side_threads.keys().copied().collect::<Vec<_>>(),
+            vec![unrelated_side]
+        );
+        assert_eq!(
+            recorded_params(&requests, "thread/unsubscribe"),
+            vec![serde_json::json!({"threadId": side_id.to_string()}); 2]
+        );
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(/*secs*/ 5), events.recv())
+                .await?
+                .expect("command center refresh");
+            let refreshed = matches!(&event, AppEvent::AgentsOverviewThreadsLoaded { .. });
+            Box::pin(app.handle_event(&mut tui, &mut server, event)).await?;
+            if refreshed {
+                break;
             }
-            assert_eq!(
-                (
-                    app.active_thread_id,
-                    app.primary_thread_id,
-                    app.chat_widget.thread_id()
-                ),
-                (None, None, None)
-            );
-            assert!(app.chat_widget.composer_is_empty());
-            assert!(app.chat_widget.has_active_view());
         }
+        assert_eq!(
+            (
+                app.active_thread_id,
+                app.primary_thread_id,
+                app.chat_widget.thread_id()
+            ),
+            (None, None, None)
+        );
+        assert!(app.chat_widget.composer_is_empty());
+        assert!(app.chat_widget.has_active_view());
         assert_eq!(
             recorded_params(&requests, "thread/delete"),
             vec![
@@ -1239,16 +1302,18 @@ async fn archive_current_thread_reports_success_only_after_archiving() -> Result
 
     app.active_thread_id = Some(thread_id);
     assert_matches!(
-        app.archive_current_thread(&mut tui, &mut app_server).await?,
-        AppRunControl::Exit(ExitReason::Archived(archived_id)) if archived_id == thread_id
+        app.archive_current_thread(&mut tui, &mut app_server)
+            .await?,
+        AppRunControl::Continue
     );
 
+    assert!(app.chat_widget.active_view_is(AGENTS_OVERVIEW_VIEW_ID));
     app_server.shutdown().await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn archive_current_thread_returns_shared_servers_to_agents() -> Result<()> {
+async fn archive_current_thread_returns_to_agents() -> Result<()> {
     let endpoint = crate::resolve_remote_addr("ws://127.0.0.1:4500")?;
     for (target, attachment, side_exists) in [
         AppServerTarget::LocalDaemon {
@@ -1377,7 +1442,6 @@ async fn local_daemon_registers_approval_gated_mcp_tools_for_both_start_paths_sc
 -> Result<()> {
     let (mut app, events, _ops) = Box::pin(make_test_app_with_channels()).await;
     // Invalid optional worktree settings must preserve both daemon start paths.
-    app.config.features.enable(Feature::Worktrees)?;
     let codex_home = tempdir()?;
     app.config.codex_home = codex_home.path().to_path_buf().abs();
     app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
@@ -1823,36 +1887,39 @@ async fn older_external_server_starts_without_unsupported_dynamic_tools_or_histo
 }
 
 #[tokio::test]
-async fn embedded_server_rejects_unowned_dynamic_tool_calls() -> Result<()> {
+async fn embedded_server_dispatches_only_its_own_dynamic_tools() -> Result<()> {
     let (mut app, mut events, _ops) = make_test_app_with_channels().await;
     let codex_home = tempdir()?;
     app.config.codex_home = codex_home.path().to_path_buf().abs();
     app.config.sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
     let app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
-    app.handle_app_server_event(
-        &app_server,
-        codex_app_server_client::AppServerEvent::ServerRequest(Box::new(
-            ServerRequest::DynamicToolCall {
-                request_id: AppServerRequestId::Integer(100),
-                params: codex_app_server_protocol::DynamicToolCallParams {
-                    thread_id: "thread-1".to_string(),
-                    turn_id: "turn-1".to_string(),
-                    call_id: "call-1".to_string(),
-                    namespace: Some("codex_app".to_string()),
-                    tool: "list_threads".to_string(),
-                    arguments: serde_json::json!({}),
+    for (id, namespace, expected_success) in [(100, "codex_app", false), (101, "codex_tui", true)] {
+        app.handle_app_server_event(
+            &app_server,
+            codex_app_server_client::AppServerEvent::ServerRequest(Box::new(
+                ServerRequest::DynamicToolCall {
+                    request_id: AppServerRequestId::Integer(id),
+                    params: codex_app_server_protocol::DynamicToolCallParams {
+                        thread_id: "thread-1".to_string(),
+                        turn_id: "turn-1".to_string(),
+                        call_id: "call-1".to_string(),
+                        namespace: Some(namespace.to_string()),
+                        tool: "list_threads".to_string(),
+                        arguments: serde_json::json!({}),
+                    },
                 },
-            },
-        )),
-    )
-    .await;
-    let AppEvent::DynamicToolCallCompleted { response, .. } = events
-        .try_recv()
-        .expect("embedded dynamic calls must receive a response")
-    else {
-        panic!("expected a dynamic tool failure response")
-    };
-    assert!(!response.success);
+            )),
+        )
+        .await;
+        let AppEvent::DynamicToolCallCompleted { response, .. } =
+            tokio::time::timeout(Duration::from_secs(5), events.recv())
+                .await?
+                .expect("embedded dynamic calls must receive a response")
+        else {
+            panic!("expected a dynamic tool response")
+        };
+        assert_eq!(response.success, expected_success);
+    }
     app_server.shutdown().await?;
     Ok(())
 }
@@ -2488,7 +2555,7 @@ async fn older_pagination_reconciles_review_prompts_across_page_boundaries() -> 
     let initial_cells = crate::thread_transcript::thread_items_to_transcript_cells(
         Some(thread_id),
         &app.config.cwd,
-        started.turns.iter().flat_map(|turn| turn.items.clone()),
+        started.turns.iter().flat_map(Turn::item_payloads).cloned(),
         crate::thread_transcript::RawReasoningVisibility::Hidden,
         Some(&app.config),
     );
@@ -2662,7 +2729,7 @@ async fn transcript_alt_beginning_loads_every_older_history_page() -> Result<()>
     let initial_cells = crate::thread_transcript::thread_items_to_transcript_cells(
         Some(thread_id),
         &app.config.cwd,
-        started.turns.iter().flat_map(|turn| turn.items.clone()),
+        started.turns.iter().flat_map(Turn::item_payloads).cloned(),
         crate::thread_transcript::RawReasoningVisibility::Hidden,
         Some(&app.config),
     );
@@ -3078,7 +3145,7 @@ async fn underfilled_scrollback_fetches_older_pages_without_opening_the_transcri
     let mut initial_cells = crate::thread_transcript::thread_items_to_transcript_cells(
         Some(thread_id),
         &app.config.cwd,
-        started.turns.iter().flat_map(|turn| turn.items.clone()),
+        started.turns.iter().flat_map(Turn::item_payloads).cloned(),
         crate::thread_transcript::RawReasoningVisibility::Hidden,
         Some(&app.config),
     );
@@ -3217,7 +3284,7 @@ async fn paginated_workflows_never_request_full_thread_history() -> Result<()> {
     ))
     .await?;
     assert_eq!(resumed.session.thread_id, paginated_thread_id);
-    assert!(recorded_params(&requests, "thread/read").is_empty());
+    assert_eq!(recorded_params(&requests, "thread/read").len(), 1);
     let resume_requests = recorded_params(&requests, "thread/resume");
     assert_eq!(resume_requests.len(), 1);
     assert_eq!(resume_requests[0]["excludeTurns"], true);
@@ -3608,7 +3675,7 @@ async fn cold_paginated_subagent_transcript_excludes_inherited_parent_history() 
     let [child_entry] = child_item_page.data.as_slice() else {
         panic!("paginated subagent should expose exactly one child message");
     };
-    let ThreadItem::UserMessage { content, .. } = &child_entry.item else {
+    let ThreadItemPayload::UserMessage { content, .. } = &child_entry.item.payload else {
         panic!("paginated subagent should expose its child user message");
     };
     assert_eq!(resumed.session.thread_id, child_thread_id);
@@ -3624,9 +3691,9 @@ async fn cold_paginated_subagent_transcript_excludes_inherited_parent_history() 
         resumed
             .turns
             .iter()
-            .flat_map(|turn| turn.items.iter())
+            .flat_map(Turn::item_payloads)
             .collect::<Vec<_>>(),
-        vec![&child_entry.item],
+        vec![&child_entry.item.payload],
     );
 
     let cells = crate::thread_transcript::load_session_transcript(
@@ -4493,6 +4560,16 @@ async fn changing_directory_preserves_project_trust_permissions_history_and_hook
     let source = codex_utils_path_uri::PathUri::from_abs_path(&agents.abs());
     assert!(configured.instruction_source_paths.contains(&source));
     assert_eq!(configured.approvals_reviewer, ApprovalsReviewer::AutoReview);
+    let earlier_skills_requests = recorded_params(&requests, "skills/list");
+    app.submit_active_thread_op(
+        &mut server,
+        AppCommand::list_skills(vec![current.clone()], /*force_reload*/ true),
+    )
+    .await?;
+    assert_eq!(
+        recorded_params(&requests, "skills/list"),
+        earlier_skills_requests
+    );
     let (cwd, result) = (current.clone(), Err("stale skills".into()));
     let skills = AppEvent::SkillsListLoaded { cwd, result };
     let (cwd, plugins) = (current.clone(), Some(vec![]));
@@ -4709,6 +4786,7 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                     Some("Failed Fork"),
                 )
                 .await?;
+                let backend_id = app_server.backend_id();
                 let root = app_server
                     .resume_thread(
                         &app.local_settings,
@@ -4825,6 +4903,7 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
                         &mut tui,
                         &mut app_server,
                         crate::resume_picker::SessionTarget {
+                            backend_id,
                             path: Some(root_rollout_path),
                             thread_id: root_thread_id,
                             cwd: None,
@@ -4835,7 +4914,8 @@ fn session_lifecycle_avoids_redundant_subagent_metadata_reads() -> Result<()> {
 
                 assert!(matches!(control, AppRunControl::Continue));
                 assert_eq!(app.chat_widget.thread_id(), Some(root_thread_id));
-                assert_eq!(take_backfill_counts(&requests), (1, expected_reads));
+                // Include the selected root’s receipt as well as the loaded child metadata.
+                assert_eq!(take_backfill_counts(&requests), (1, expected_reads + 1));
                 assert_eq!(
                     app.agent_navigation.get(&child_thread_id),
                     Some(&AgentPickerThreadEntry {
@@ -5262,6 +5342,80 @@ async fn command_center_read_only_open_requests_and_failure_preservation() -> Re
             }
         }
         owner.shutdown().await?;
+        server.shutdown().await?;
+        proxy.await??;
+    }
+    Ok(())
+}
+
+#[path = "backend_ownership_tests.rs"]
+mod backend_ownership_tests;
+
+#[tokio::test]
+async fn provider_error_preserves_partial_history_notice() -> Result<()> {
+    for reopen_via_overview in [false, true] {
+        let (mut app, _home) = Box::pin(make_history_test_app()).await?;
+        std::fs::write(
+            app.config.codex_home.join("config.toml"),
+            "[tui]\nresume_cwd = 'current'\n",
+        )?;
+        for cwd in [test_path_buf("/"), app.config.cwd.to_path_buf()] {
+            crate::legacy_core::config::set_project_trust_level(
+                app.config.codex_home.as_path(),
+                &cwd,
+                codex_protocol::config_types::TrustLevel::Trusted,
+            )
+            .map_err(std::io::Error::other)?;
+        }
+        let mut saved_config = app.config.clone();
+        saved_config.model_provider_id = "missing_provider".into();
+        let thread_id = create_history_rollout(
+            &saved_config,
+            ThreadHistoryMode::Paginated,
+            "Saved provider chat",
+        )?;
+        let (mut server, requests, proxy) = start_recording_app_server_with_history(
+            &app.config,
+            HistoryCapabilities::ItemsListFails,
+            /*blocked_thread_list*/ None,
+            /*failed_thread_name*/ None,
+            crate::app_server_session::ThreadParamsMode::Embedded,
+            LoaderOverrides::default(),
+        )
+        .await?;
+        let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+        app.app_event_tx = AppEventSender::new(sender);
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        if reopen_via_overview {
+            Box::pin(app.select_agents_overview_thread(&mut tui, &mut server, thread_id)).await?;
+        } else {
+            let target = SessionTarget {
+                backend_id: server.backend_id(),
+                path: None,
+                thread_id,
+                cwd: None,
+                history_mode: Some(ThreadHistoryMode::Paginated),
+            };
+            Box::pin(app.resume_target_session(&mut tui, &mut server, target)).await?;
+        }
+        assert!(app.chat_widget.has_provider_error());
+        let notice = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                AppEvent::InsertHistoryCell(cell) => {
+                    Some(lines_to_single_string(&cell.display_lines(/*width*/ 200)))
+                }
+                _ => None,
+            })
+            .find(|message| message.contains("Showing up to 100 recent prompts"))
+            .expect("provider error should preserve the partial-history notice");
+        insta::allow_duplicates! {
+            insta::assert_snapshot!(notice, @"• Showing up to 100 recent prompts and final replies. Intermediate messages and tool activity are unavailable.");
+        }
+        assert!(
+            recorded_params(&requests, "thread/turns/list")
+                .iter()
+                .any(|params| params["itemsView"] == "summary")
+        );
         server.shutdown().await?;
         proxy.await??;
     }

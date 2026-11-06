@@ -20,7 +20,7 @@ use codex_app_server_protocol::JSONRPCNotification;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerRequest;
-use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadItemPayload;
 use codex_app_server_protocol::ThreadStartParams;
 use codex_app_server_protocol::ThreadStartResponse;
 use codex_app_server_protocol::TurnStartParams;
@@ -448,7 +448,7 @@ async fn dynamic_tool_call_round_trip_sends_text_content_items_to_model() -> Res
     let started = wait_for_dynamic_tool_started(&mut mcp, call_id).await?;
     assert_eq!(started.thread_id, thread_id);
     assert_eq!(started.turn_id, turn_id.clone());
-    let ThreadItem::DynamicToolCall {
+    let ThreadItemPayload::DynamicToolCall {
         id,
         namespace,
         tool,
@@ -457,7 +457,7 @@ async fn dynamic_tool_call_round_trip_sends_text_content_items_to_model() -> Res
         content_items,
         success,
         duration_ms,
-    } = started.item
+    } = started.item.payload
     else {
         panic!("expected dynamic tool call item");
     };
@@ -504,7 +504,7 @@ async fn dynamic_tool_call_round_trip_sends_text_content_items_to_model() -> Res
     let completed = wait_for_dynamic_tool_completed(&mut mcp, call_id).await?;
     assert_eq!(completed.thread_id, thread_id);
     assert_eq!(completed.turn_id, turn_id);
-    let ThreadItem::DynamicToolCall {
+    let ThreadItemPayload::DynamicToolCall {
         id,
         namespace,
         tool,
@@ -513,7 +513,7 @@ async fn dynamic_tool_call_round_trip_sends_text_content_items_to_model() -> Res
         content_items,
         success,
         duration_ms,
-    } = completed.item
+    } = completed.item.payload
     else {
         panic!("expected dynamic tool call item");
     };
@@ -742,12 +742,12 @@ async fn dynamic_tool_call_round_trip_handles_content_items() -> Result<()> {
     let completed = wait_for_dynamic_tool_completed(&mut mcp, call_id).await?;
     assert_eq!(completed.thread_id, params.thread_id);
     assert_eq!(completed.turn_id, params.turn_id);
-    let ThreadItem::DynamicToolCall {
+    let ThreadItemPayload::DynamicToolCall {
         status,
         content_items: completed_content_items,
         success,
         ..
-    } = completed.item
+    } = completed.item.payload
     else {
         panic!("expected dynamic tool call item");
     };
@@ -837,12 +837,12 @@ async fn dynamic_tool_remote_image_response_becomes_model_visible_error() -> Res
     let completed = wait_for_dynamic_tool_completed(&mut mcp, call_id).await?;
     assert_eq!(completed.thread_id, params.thread_id);
     assert_eq!(completed.turn_id, params.turn_id);
-    let ThreadItem::DynamicToolCall {
+    let ThreadItemPayload::DynamicToolCall {
         status,
         content_items,
         success,
         ..
-    } = completed.item
+    } = completed.item.payload
     else {
         panic!("expected dynamic tool call item");
     };
@@ -893,12 +893,12 @@ async fn dynamic_tool_remote_audio_response_becomes_model_visible_error() -> Res
     let completed = wait_for_dynamic_tool_completed(&mut mcp, call_id).await?;
     assert_eq!(completed.thread_id, params.thread_id);
     assert_eq!(completed.turn_id, params.turn_id);
-    let ThreadItem::DynamicToolCall {
+    let ThreadItemPayload::DynamicToolCall {
         status,
         content_items,
         success,
         ..
-    } = completed.item
+    } = completed.item.payload
     else {
         panic!("expected dynamic tool call item");
     };
@@ -985,7 +985,8 @@ async fn wait_for_dynamic_tool_started(
             continue;
         };
         let started: ItemStartedNotification = serde_json::from_value(params)?;
-        if matches!(&started.item, ThreadItem::DynamicToolCall { id, .. } if id == call_id) {
+        if matches!(&started.item.payload, ThreadItemPayload::DynamicToolCall { id, .. } if id == call_id)
+        {
             return Ok(started);
         }
     }
@@ -1005,7 +1006,8 @@ async fn wait_for_dynamic_tool_completed(
             continue;
         };
         let completed: ItemCompletedNotification = serde_json::from_value(params)?;
-        if matches!(&completed.item, ThreadItem::DynamicToolCall { id, .. } if id == call_id) {
+        if matches!(&completed.item.payload, ThreadItemPayload::DynamicToolCall { id, .. } if id == call_id)
+        {
             return Ok(completed);
         }
     }

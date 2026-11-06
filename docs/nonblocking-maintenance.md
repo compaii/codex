@@ -97,6 +97,13 @@ Unsupported, busy, lost or unconfirmed handoffs leave work serving; never procee
 to package selection from an unconfirmed outcome. Observe actual process exit,
 not just a stale PID file, failed probe, elapsed timeout or saved snapshot.
 
+For0.167, use the current canonical package builder: the package includes the
+native CLI, `codex-code-mode-host` and the standalone `codex-exec-server`, plus
+its platform resources and `execServer` manifest entry. A previously qualified
+two-executable0.163 artifact is not a complete0.167 package. Keep all binaries
+from the same qualified source; the existing executor stdio/helper re-exec test
+checks that new component without model input or live session changes.
+
 `update --from-cli --if-stopped` uses the existing complete-package installer,
 confirmation and operation-lock recheck. It refuses a running receiver even with
 `--yes`; a receiver that appears after confirmation also prevents replacement.
@@ -154,6 +161,11 @@ independent conversation admission while another turn is held, actual managed
 idle snapshots, publish failure reopening, blocked persistence timeout and late
 completion, plus Core input and task-lifetime contracts. Use mock providers;
 production conversations and input replay are unnecessary for these regressions.
+
+For the complete App Server library suite, first build the existing MCP fixture
+with `cargo build -p codex-rmcp-client --bin test_stdio_server` in the same
+profile/target directory. A library-only invocation does not build that dependency
+binary; its absence is a test setup failure, not a native startup incident.
 
 Read retained outcomes before retrying a failed operation. Inspect rollout tails
 with bounded seek/read windows or stream selected records; never use whole-file

@@ -6,6 +6,7 @@ use crate::realtime_conversation::handle_speech as handle_realtime_conversation_
 use crate::realtime_conversation::handle_start as handle_realtime_conversation_start;
 use crate::realtime_conversation::handle_text as handle_realtime_conversation_text;
 use async_channel::Receiver;
+use codex_features::Feature;
 use codex_otel::set_parent_from_w3c_trace_context;
 use tracing::Instrument;
 use tracing::debug_span;
@@ -26,6 +27,7 @@ use crate::tasks::UserShellCommandTask;
 use crate::tasks::execute_user_shell_command;
 use crate::thread_manager::AgentTreeShutdownFailure;
 use crate::thread_manager::thread_store_error_kind;
+use codex_protocol::approvals::ExecApprovalKind;
 use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::ErrorEvent;
@@ -33,7 +35,6 @@ use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GuardianAssessmentEvent;
 use codex_protocol::protocol::GuardianAssessmentStatus;
-use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RealtimeConversationListVoicesResponseEvent;
 use codex_protocol::protocol::RealtimeVoicesList;
@@ -82,7 +83,7 @@ pub async fn realtime_conversation_list_voices(sess: &Session, sub_id: String) {
 pub async fn inter_agent_communication(
     sess: &Arc<Session>,
     sub_id: String,
-    communication: InterAgentCommunication,
+    communication: crate::PendingAgentMessage,
     start_options: codex_protocol::turn_input::TurnStartOptions,
 ) {
     let trigger_turn = communication.trigger_turn;
@@ -90,7 +91,10 @@ pub async fn inter_agent_communication(
         .enqueue_mailbox_communication(communication, start_options)
         .await;
     crate::agent_communication::emit_agent_communication_receive(&sub_id);
-    if trigger_turn || sess.has_outstanding_durable_sleep() {
+    if trigger_turn
+        || sess.features.enabled(Feature::WakeOnAgentMessages)
+        || sess.has_outstanding_durable_sleep()
+    {
         sess.maybe_start_turn_for_pending_work_with_sub_id(sub_id)
             .await;
     }
@@ -172,36 +176,51 @@ pub async fn resolve_elicitation(
     }
 }
 
-/// Propagate a user's exec approval decision to the session.
-/// Also optionally applies an execpolicy amendment.
-pub async fn exec_approval(
-    sess: &Arc<Session>,
-    approval_id: String,
-    turn_id: Option<String>,
-    decision: ReviewDecision,
-) {
-    let event_turn_id = turn_id.unwrap_or_else(|| approval_id.clone());
-    if let ReviewDecision::ApprovedExecpolicyAmendment {
-        proposed_execpolicy_amendment,
-    } = &decision
-        && let Err(err) = sess
-            .persist_execpolicy_amendment(proposed_execpolicy_amendment)
+impl Session {
+    /// Claim the prompt before applying a decision that can outlive the requesting execution.
+    pub(crate) async fn resolve_exec_approval(
+        self: &Arc<Self>,
+        approval_id: String,
+        turn_id: Option<String>,
+        decision: ReviewDecision,
+    ) {
+        let Some((pending, active_turn_id)) = self
+            .take_pending_approval(&approval_id, turn_id.as_deref())
             .await
-    {
-        let message = format!("Failed to apply execpolicy amendment: {err}");
-        tracing::warn!("{message}");
-        let warning = EventMsg::Warning(WarningEvent { message });
-        sess.send_event_raw(Event {
-            id: event_turn_id.clone(),
-            msg: warning,
-        })
-        .await;
-    }
-    match decision {
-        ReviewDecision::Abort => {
-            sess.interrupt_task().await;
+        else {
+            return;
+        };
+        let decision = pending.validate(decision);
+        if decision == ReviewDecision::Abort {
+            let turn_id = if pending.kind == ExecApprovalKind::HumanCommand {
+                Some(&pending.turn_id)
+            } else {
+                active_turn_id.as_ref()
+            };
+            if let Some(turn_id) = turn_id {
+                self.abort_turn_if_active(
+                    turn_id,
+                    TurnAbortReason::Interrupted,
+                    /*error*/ None,
+                )
+                .await;
+            }
+        } else if let ReviewDecision::ApprovedExecpolicyAmendment {
+            proposed_execpolicy_amendment,
+        } = &decision
+            && let Err(err) = self
+                .persist_execpolicy_amendment(proposed_execpolicy_amendment)
+                .await
+        {
+            let message = format!("Failed to apply execpolicy amendment: {err}");
+            tracing::warn!("{message}");
+            self.send_event_raw(Event {
+                id: turn_id.unwrap_or(approval_id),
+                msg: EventMsg::Warning(WarningEvent { message }),
+            })
+            .await;
         }
-        other => sess.notify_approval(&approval_id, other).await,
+        let _ = pending.sender.send(decision);
     }
 }
 
@@ -393,10 +412,10 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
     sess.services
         .rollout_thread_trace
         .record_protocol_event(&event.msg);
-    sess.deliver_event_raw(event).await;
     sess.services
         .rollout_thread_trace
         .record_ended(codex_rollout_trace::RolloutStatus::Completed);
+    sess.deliver_event_raw(event).await;
     true
 }
 
@@ -468,7 +487,9 @@ pub(super) async fn submission_loop(
                 match update {
                     Ok(true) => {
                         sess.input_queue.notify_mailbox();
-                        if sess.has_outstanding_durable_sleep() {
+                        if sess.features.enabled(Feature::WakeOnAgentMessages)
+                            || sess.has_outstanding_durable_sleep()
+                        {
                             sess.maybe_start_turn_for_pending_work().await;
                         }
                     }
@@ -638,6 +659,10 @@ pub(super) async fn submission_loop(
                     }
                     false
                 }
+                Op::ReplaceDynamicTools { tools, reply } => {
+                    let _ = reply.send(sess.replace_dynamic_tools(tools).await);
+                    false
+                }
                 Op::TurnSettings {
                     turn_id,
                     update,
@@ -651,6 +676,8 @@ pub(super) async fn submission_loop(
                     communication,
                     start_options,
                 } => {
+                    let communication =
+                        crate::PendingAgentMessage::new(communication, sub.message_delivery);
                     inter_agent_communication(&sess, sub.id.clone(), communication, start_options)
                         .await;
                     false
@@ -660,7 +687,8 @@ pub(super) async fn submission_loop(
                     turn_id,
                     decision,
                 } => {
-                    exec_approval(&sess, approval_id, turn_id, decision).await;
+                    sess.resolve_exec_approval(approval_id, turn_id, decision)
+                        .await;
                     false
                 }
                 Op::PatchApproval { id, decision } => {
@@ -750,6 +778,9 @@ pub(super) async fn submission_loop(
             );
             warn!("failed to shutdown thread persistence after submission channel closed: {err}");
         }
+        sess.services
+            .rollout_thread_trace
+            .record_ended(codex_rollout_trace::RolloutStatus::Aborted);
     }
     debug!("Agent loop exited");
 }

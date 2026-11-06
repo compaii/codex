@@ -25,6 +25,8 @@ use tokio_util::sync::CancellationToken;
 /// One captured action and its host-enforced constraints. Guardian derives the
 /// contributor input and owns cancellation for the complete review operation.
 pub struct ReviewRequest<'a, H> {
+    /// Final serving value retained by the host for this action.
+    pub serving_assessment: Option<bool>,
     pub host: H,
     pub approval_id: &'a str,
     pub tool_call_id: Option<&'a str>,
@@ -43,6 +45,8 @@ pub struct ReviewRequest<'a, H> {
     pub escalated_exec: bool,
     pub full_access: bool,
     pub cancellation: CancellationToken,
+    /// Overall review budget; None disables only the review deadline.
+    pub timeout: Option<std::time::Duration>,
     pub model: &'a ModelInfo,
     pub telemetry: &'a SessionTelemetry,
     /// The host verified the assessment opt-in and an explicit OTLP log destination.
@@ -71,6 +75,10 @@ impl<H: ReviewHost> ReviewRequest<'_, H> {
             .telemetry
             .start_timer("codex.guardian.decision.duration_ms", &[])
             .ok();
+        let _blocking = self
+            .thread_store
+            .get::<crate::ReviewBlocking>()
+            .map(|blocking| blocking.enter());
         let runtime = self.thread_store.get::<crate::ReviewerTasks>();
         let _task = runtime.as_ref().map(|runtime| runtime.tasks.token());
         if runtime
@@ -96,6 +104,7 @@ impl<H: ReviewHost> ReviewRequest<'_, H> {
             };
             let permissions = self.host.permissions();
             let input = ApprovalDecisionInput {
+                serving_assessment: self.serving_assessment,
                 permissions: permissions.as_ref(),
                 approval_id: self.approval_id,
                 tool_call_id: self.tool_call_id,

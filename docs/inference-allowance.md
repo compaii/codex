@@ -42,9 +42,12 @@ and its accounting untouched. The existing extension-tool execution boundary
 rejects bounded `create_goal` and `update_goal`, while retaining `get_goal` and
 authenticated human goal controls. An independently authorized goal may resume
 while attention is busy and continue afterward with its own authority. Native agent-tool entry points also refuse a bounded spawn,
-resume or turn-triggering input before recipient loading/submission until an
-owner-reserved child admission can carry the allocation. V2 queue-only mail keeps
-its existing non-starting behavior. This refusal covers both direct and Code Mode
+resume or message input before recipient loading/submission until an
+owner-reserved child admission can carry the allocation. In0.167, V2 queue-only
+mail can wake an ordinary recipient with `wake_on_agent_messages`, so it shares
+this refusal; the queue-only mode alone does not prove that no inference starts.
+Ordinary queue-only wakes also cannot replenish a bounded predecessor or leave
+an active reservation after refusing it. This refusal covers both direct and Code Mode
 execution; it is not a separately allocated delegation implementation. Independent
 ordinary agent work is unchanged. The synchronous approval entry refuses bounded
 actions before consulting cached or model contributors; an explicitly cancelled request remains an abort. The

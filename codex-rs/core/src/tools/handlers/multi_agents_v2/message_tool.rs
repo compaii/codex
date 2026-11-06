@@ -46,9 +46,9 @@ pub(super) async fn handle_message_string_tool(
     message: String,
     analytics: &mut ToolCallAnalytics,
 ) -> Result<FunctionToolOutput, FunctionCallError> {
-    if mode == MessageDeliveryMode::TriggerTurn {
-        crate::turn_inference::require_agent_admission(&invocation.turn)?;
-    }
+    // Queue-only mail can wake a root with wake_on_agent_messages enabled.
+    // A bounded sender cannot start that unreserved recipient indirectly.
+    crate::turn_inference::require_agent_admission(&invocation.turn)?;
     let message = message_content(message)?;
     let ToolInvocation {
         session,

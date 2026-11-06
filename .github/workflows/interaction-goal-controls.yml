@@ -111,21 +111,23 @@ jobs:
           RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all multi_agent_v2_tools_emit_collaborator_analytics -- --nocapture
       - name: Bounded turn admission, lifecycle and unrelated goal isolation
         run: |
-          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-core --lib -- session::turn_input::tests::bounded session::async_compaction::tests::bounded turn_inference::tests::refuses guardian::tests::bounded_approval_review_defers_before_any_contributor
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-core --lib -- bounded_ agent_message_wake_reservation_preserves_existing_boundaries delegated_mailbox_selection_rechecks_lineage_without_consuming_new_input turn_inference::tests::refuses
           RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-guardian-v2 --lib -- bounded_attention_invalidates_cached_scores_without_classification contributor_accounts_for_parent_checkpoint
       - name: Shared inference allowance and no-replay transport regressions
         run: |
           cargo test --locked --profile dev-small -j 2 -p codex-api
           cargo test --locked --profile dev-small -j 2 -p codex-http-client --lib single_attempt_pool_rejects_a_legacy_client_that_lost_its_contract
-      - name: Build the native CLI and its required tool host
+      - name: Build the native CLI, required tool host and standalone executor
         id: native-build
         run: |
-          cargo build --locked --profile dev-small -j 2 -p codex-cli --bin codex
-          cargo build --locked --profile dev-small -j 2 -p codex-code-mode-host --bin codex-code-mode-host
+          cargo build --locked --profile dev-small -j 2 -p codex-cli -p codex-code-mode-host -p codex-exec-server-cli --bin codex --bin codex-code-mode-host --bin codex-exec-server
           target/dev-small/codex --version
+          target/dev-small/codex-exec-server --version
           test -x target/dev-small/codex-code-mode-host
-          sha256sum target/dev-small/codex target/dev-small/codex-code-mode-host
+          sha256sum target/dev-small/codex target/dev-small/codex-code-mode-host target/dev-small/codex-exec-server
           git rev-parse HEAD > target/dev-small/interaction-source.txt
+      - name: Standalone executor initialization and helper re-exec
+        run: cargo test --locked --profile dev-small -j 2 -p codex-exec-server-cli --test standalone
       - name: Confirmed maintenance and stopped-only local package guards
         run: |
           RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server-daemon --lib
@@ -161,6 +163,7 @@ jobs:
           path: |
             codex-rs/target/dev-small/codex
             codex-rs/target/dev-small/codex-code-mode-host
+            codex-rs/target/dev-small/codex-exec-server
             codex-rs/target/dev-small/interaction-source.txt
             codex-rs/app-server-protocol/schema/
             sdk/python/src/openai_codex/generated/
