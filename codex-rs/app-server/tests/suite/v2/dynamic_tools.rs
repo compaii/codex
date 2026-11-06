@@ -575,6 +575,8 @@ async fn dynamic_tool_call_round_trip_sends_text_content_items_to_model() -> Res
 }
 
 struct PendingDynamicToolCall {
+    // Input admission reloads provider configuration; keep it for the whole journey.
+    _codex_home: TempDir,
     mcp: TestAppServer,
     server: MockServer,
     request_id: RequestId,
@@ -689,6 +691,7 @@ async fn start_function_dynamic_tool_call_with_responses(
     assert_eq!(actual_params, params);
 
     Ok(PendingDynamicToolCall {
+        _codex_home: codex_home,
         mcp,
         server,
         request_id,
@@ -701,6 +704,7 @@ async fn start_function_dynamic_tool_call_with_responses(
 async fn dynamic_tool_call_round_trip_handles_content_items() -> Result<()> {
     let call_id = "dyn-call-items-1";
     let PendingDynamicToolCall {
+        _codex_home,
         mut mcp,
         server,
         request_id,
@@ -819,6 +823,7 @@ async fn dynamic_tool_call_round_trip_handles_content_items() -> Result<()> {
 async fn dynamic_tool_remote_image_response_becomes_model_visible_error() -> Result<()> {
     let call_id = "dyn-call-remote-image";
     let PendingDynamicToolCall {
+        _codex_home,
         mut mcp,
         server,
         request_id,
@@ -875,6 +880,7 @@ async fn dynamic_tool_remote_image_response_becomes_model_visible_error() -> Res
 async fn dynamic_tool_remote_audio_response_becomes_model_visible_error() -> Result<()> {
     let call_id = "dyn-call-remote-audio";
     let PendingDynamicToolCall {
+        _codex_home,
         mut mcp,
         server,
         request_id,
@@ -1036,6 +1042,7 @@ async fn exercise_idle_only_turn(bounded: bool) -> Result<()> {
         create_final_assistant_message_sse_response("Heartbeat reviewed")?
     };
     let PendingDynamicToolCall {
+        _codex_home,
         mut mcp,
         server,
         request_id,
