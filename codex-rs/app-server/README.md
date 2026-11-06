@@ -339,8 +339,13 @@ configured provider, including profile and app-server launch overrides. The JSON
 `currentModelProvider`, `modelProviderNotConfigured` identifies a missing provider, and
 `modelProviderPolicyConflict` identifies a mandatory-policy conflict. Clients can still use
 `thread/read` to display history and disable the composer with the error's explanation.
-Changing the resume request's provider does not bypass validation of the saved provider;
-switch the configured provider back to continue the chat. Input is also rejected when the
+Changing the resume request's provider does not bypass validation of the saved provider.
+This fork additionally preserves an explicitly reasserted saved per-thread provider when its
+exact definition remains in current owner configuration. This allows an existing selected
+profile to coexist with the server default without selecting a new provider. Missing/changed
+routes and managed restrictions still refuse; a retained or request-injected definition alone
+does not qualify. Threads without an explicit session selection retain the default mismatch
+check; switch the configured provider back to continue those chats. Input is also rejected when the
 current provider configuration cannot be loaded. Older clients retain their normal error
 fallback for unrecognized structured error variants.
 
