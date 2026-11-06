@@ -73,6 +73,8 @@ pub enum LifecycleCommand {
     Restart {
         feature_overrides: BTreeMap<String, bool>,
     },
+    /// Restore a confirmed maintenance snapshot only if no receiver is serving.
+    RestoreIfStopped,
     Stop,
     Version,
 }
@@ -213,6 +215,7 @@ pub struct RemoteControlOutput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RestartIfRunningOutcome {
     Busy,
+    Deferred,
     NotRunning,
     NotReady,
     AlreadyCurrent,
@@ -235,12 +238,29 @@ enum RestartDecision {
     Restart,
 }
 
+#[derive(Debug, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceOutput {
+    pub pid: u32,
+    /// handoffReady confirms the snapshot, not process exit or package adoption.
+    pub outcome: String,
+}
+
+/// Request a bounded natural-idle handoff without blocking ordinary attachment.
+pub async fn maintenance() -> Result<MaintenanceOutput> {
+    ensure_supported_platform()?;
+    let daemon = Daemon::from_environment()?;
+    client::request_maintenance(&daemon.socket_path).await
+}
+
 pub async fn run(command: LifecycleCommand) -> Result<LifecycleOutput> {
     ensure_supported_platform()?;
     #[cfg(windows)]
     if matches!(
         command,
-        LifecycleCommand::Start | LifecycleCommand::Restart { .. }
+        LifecycleCommand::Start
+            | LifecycleCommand::Restart { .. }
+            | LifecycleCommand::RestoreIfStopped
     ) {
         backend::windows::ensure_not_elevated()?;
     }
@@ -424,6 +444,7 @@ impl Daemon {
             LifecycleCommand::Restart { feature_overrides } => {
                 selected.restart(&feature_overrides).await
             }
+            LifecycleCommand::RestoreIfStopped => selected.restore_if_stopped().await,
             LifecycleCommand::Stop => {
                 let output = selected.stop().await?;
                 if let Err(err) = thread_recovery::discard_pending(&selected) {
@@ -538,12 +559,37 @@ impl Daemon {
             .await)
     }
 
+    /// Called under the existing lifecycle lock. Never stop another receiver or
+    /// treat a missing/consumed/interrupted snapshot as a fresh start.
+    async fn restore_if_stopped(&self) -> Result<LifecycleOutput> {
+        let settings = self.load_settings().await?;
+        anyhow::ensure!(
+            self.running_backend_instance(&settings).await?.is_none()
+                && client::probe(&self.socket_path).await.is_err(),
+            "a receiver is serving or starting; maintenance restore left it unchanged"
+        );
+        let path = self.recovery_file()?;
+        let metadata =
+            std::fs::metadata(&path).context("confirmed maintenance snapshot is required")?;
+        anyhow::ensure!(
+            metadata.is_file() && metadata.len() <= 64 * 1024 * 1024,
+            "maintenance snapshot exceeds the native64MiB bound"
+        );
+        let snapshot = codex_app_server_transport::daemon_recovery::read_snapshot(&path)?;
+        anyhow::ensure!(
+            snapshot.interrupted.is_empty(),
+            "interrupted native work is not a confirmed idle-maintenance snapshot"
+        );
+        self.restart_with_settings(settings).await
+    }
+
     #[cfg(any(unix, windows))]
     pub(crate) async fn try_restart_if_running(
         &self,
         mode: RestartMode,
         managed_codex_bin: &Path,
         package_root: &Path,
+        nonblocking: bool,
     ) -> Result<RestartIfRunningOutcome> {
         let operation_lock = self.open_operation_lock_file().await?;
         if !try_lock_file(&operation_lock)? {
@@ -588,6 +634,17 @@ impl Daemon {
                 }
                 RestartDecision::AlreadyCurrent => RestartIfRunningOutcome::AlreadyCurrent,
                 RestartDecision::Restart => {
+                    if nonblocking {
+                        let Some(process) = backend.running_process().await? else {
+                            return Ok(RestartIfRunningOutcome::Deferred);
+                        };
+                        // A maintenance lease must never hold the shared CLI
+                        // operation lock while unrelated work is still running.
+                        drop(operation_lock);
+                        return self
+                            .restart_after_maintenance(process, managed_codex_bin)
+                            .await;
+                    }
                     #[cfg(windows)]
                     backend::windows::ensure_detached_launch(managed_codex_bin)?;
                     if let Err(err) = thread_recovery::discard_pending(self) {
@@ -654,6 +711,92 @@ impl Daemon {
             tracing::debug!(%error, "skipped daemon release pruning");
         }
         Ok(outcome)
+    }
+
+    async fn restart_after_maintenance(
+        &self,
+        process: backend::RunningProcess,
+        managed_codex_bin: &Path,
+    ) -> Result<RestartIfRunningOutcome> {
+        let outcome =
+            match client::request_maintenance_for_process(&self.socket_path, process.pid()).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    diagnostics::event("maintenance_deferred", error.to_string());
+                    return Ok(RestartIfRunningOutcome::Deferred);
+                }
+            };
+        if outcome.outcome != "handoffReady" {
+            diagnostics::event("maintenance_deferred", outcome.outcome);
+            return Ok(RestartIfRunningOutcome::Deferred);
+        }
+        let recovery = self.recovery_file()?;
+        // Stop removes the snapshot. Never turn its absence into a cold start.
+        let Ok(metadata) = tokio::fs::metadata(&recovery).await else {
+            return Ok(RestartIfRunningOutcome::Deferred);
+        };
+        let pending = thread_recovery::PendingMaintenance {
+            process,
+            managed_bin: managed_codex_bin.to_path_buf(),
+            snapshot_identity: managed_install::executable_identity(&recovery).await?,
+            snapshot_modified: metadata.modified()?,
+        };
+        thread_recovery::save_maintenance(self, &pending)?;
+        Ok(self
+            .continue_pending_maintenance()
+            .await?
+            .unwrap_or(RestartIfRunningOutcome::Deferred))
+    }
+
+    async fn continue_pending_maintenance(&self) -> Result<Option<RestartIfRunningOutcome>> {
+        let Some(pending) = thread_recovery::load_maintenance(self)? else {
+            return Ok(None);
+        };
+        // A saved handoff is not proof of exit. Retain the exact continuation
+        // across bounded observations, updater re-exec and shared-lock contention.
+        let exited = tokio::time::timeout(Duration::from_secs(3), async {
+            while pending.process.is_active().await? {
+                sleep(Duration::from_millis(25)).await;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        if !matches!(exited, Ok(Ok(()))) {
+            return Ok(Some(RestartIfRunningOutcome::Deferred));
+        }
+        let operation_lock = self.open_operation_lock_file().await?;
+        if !try_lock_file(&operation_lock)? {
+            return Ok(Some(RestartIfRunningOutcome::Deferred));
+        }
+        let recovery = self.recovery_file()?;
+        let same_snapshot = match tokio::fs::metadata(&recovery).await {
+            Ok(metadata) if metadata.modified()? == pending.snapshot_modified => {
+                managed_install::executable_identity(&recovery).await? == pending.snapshot_identity
+            }
+            _ => false,
+        };
+        // Explicit Stop or another receiver consumes/replaces this handoff.
+        if !same_snapshot
+            || !self.is_stable_standalone_release()?
+            || managed_install::resolved_managed_codex_bin(&self.current_managed_codex_bin()?)
+                .await?
+                != pending.managed_bin
+        {
+            thread_recovery::discard_maintenance(self)?;
+            return Ok(Some(RestartIfRunningOutcome::Deferred));
+        }
+        let settings = self.load_settings().await?;
+        if self.running_backend_instance(&settings).await?.is_some()
+            || client::probe(&self.socket_path).await.is_ok()
+        {
+            thread_recovery::discard_maintenance(self)?;
+            return Ok(Some(RestartIfRunningOutcome::Deferred));
+        }
+        self.start_managed_backend_with_bin(&settings, &pending.managed_bin)
+            .await?;
+        self.wait_until_ready().await?;
+        thread_recovery::discard_maintenance(self)?;
+        Ok(Some(RestartIfRunningOutcome::Restarted))
     }
 
     async fn stop(&self) -> Result<LifecycleOutput> {
@@ -1473,12 +1616,56 @@ mod tests {
             LifecycleStatus::NotRunning
         );
         assert!(!daemon.recovery_file().expect("recovery path").exists());
+        daemon
+            .run(super::LifecycleCommand::RestoreIfStopped)
+            .await
+            .expect_err("restore cannot turn a missing snapshot into a cold start");
         // Simulate an older stop client leaving a snapshot behind.
         std::fs::write(
             daemon.recovery_file().expect("recovery path"),
             r#"["thread"]"#,
         )
         .expect("legacy saved threads");
+        daemon
+            .run(super::LifecycleCommand::RestoreIfStopped)
+            .await
+            .expect_err("missing complete backend package");
+        assert_eq!(
+            std::fs::read_to_string(daemon.recovery_file().unwrap()).unwrap(),
+            r#"["thread"]"#
+        );
+        let snapshot = codex_app_server_transport::daemon_recovery::RecoverySnapshot {
+            loaded: ["thread".to_string()].into_iter().collect(),
+            interrupted: [(
+                "thread".to_string(),
+                codex_app_server_transport::daemon_recovery::InterruptedTurn {
+                    turn_id: "incomplete".into(),
+                    output_schema: None,
+                    service_tier: None,
+                    cyber_access_program: None,
+                    local_environment: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        codex_app_server_transport::daemon_recovery::write_snapshot(
+            &daemon.recovery_file().unwrap(),
+            &snapshot,
+        )
+        .unwrap();
+        let error = daemon
+            .run(super::LifecycleCommand::RestoreIfStopped)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("interrupted native work"));
+        assert_eq!(
+            codex_app_server_transport::daemon_recovery::read_snapshot(
+                &daemon.recovery_file().unwrap()
+            )
+            .unwrap(),
+            snapshot
+        );
         daemon
             .run(super::LifecycleCommand::Start)
             .await
@@ -1521,6 +1708,18 @@ mod tests {
         let backend = crate::backend::pid_backend(daemon.backend_paths(&settings));
         backend.start().await.expect("start local backend");
         let bootstrapped = daemon.is_bootstrapped(&settings).await;
+        let pid_record = std::fs::read(&daemon.pid_file).unwrap();
+        let guard = daemon.acquire_operation_lock().await.unwrap();
+        let result = daemon.restore_if_stopped().await;
+        drop(guard);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("receiver is serving")
+        );
+        assert_eq!(std::fs::read(&daemon.pid_file).unwrap(), pid_record);
+        assert!(backend.is_starting_or_running().await.unwrap());
         backend.stop().await.expect("stop local backend");
         assert!(bootstrapped.expect("managed local backend"));
     }

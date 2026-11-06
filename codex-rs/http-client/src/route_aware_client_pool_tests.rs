@@ -1180,3 +1180,34 @@ impl Write for TestLogSink {
         Ok(())
     }
 }
+
+#[tokio::test]
+async fn single_attempt_pool_rejects_a_legacy_client_that_lost_its_contract() {
+    let pool = RouteAwareClientPool::with_builder(
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        ClientRouteClass::Api,
+        HttpClientBuilder::new().without_replays(),
+    )
+    .with_tls_backend_fallback();
+    assert!(pool.supports_single_attempt());
+    assert!(pool.rustls_clients.is_none());
+    let client = HttpClientBuilder::new()
+        .build_direct()
+        .expect("legacy client");
+    let crate::client::HttpClientBackend::Direct(client) = client.backend else {
+        panic!("expected fixed client");
+    };
+    pool.clients
+        .lock()
+        .expect("cache lock")
+        .insert(OutboundProxyRoute::Direct, client);
+    let request = reqwest::Request::new(
+        Method::POST,
+        reqwest::Url::parse("http://127.0.0.1:1/not-sent").expect("URL"),
+    );
+    let result = pool
+        .send_with_resolver(request, |_| async { Ok(OutboundProxyRoute::Direct) })
+        .await;
+    assert!(matches!(result, Err(RouteAwareRequestError::Build(message))
+        if message == "resolved HTTP client lost the single-attempt contract"));
+}

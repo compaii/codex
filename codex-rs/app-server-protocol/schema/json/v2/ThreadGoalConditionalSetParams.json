@@ -1,0 +1,71 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ThreadGoalMutationOrigin": {
+      "description": "Distinguishes explicit user actions from automatic goal lifecycle mutations.",
+      "enum": [
+        "user",
+        "automatic"
+      ],
+      "type": "string"
+    },
+    "ThreadGoalStatus": {
+      "enum": [
+        "active",
+        "paused",
+        "blocked",
+        "usageLimited",
+        "budgetLimited",
+        "complete"
+      ],
+      "type": "string"
+    }
+  },
+  "properties": {
+    "expectedRevision": {
+      "type": "string"
+    },
+    "objective": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "origin": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ThreadGoalMutationOrigin"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "status": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ThreadGoalStatus"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "threadId": {
+      "type": "string"
+    },
+    "tokenBudget": {
+      "format": "int64",
+      "type": [
+        "integer",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "expectedRevision",
+    "threadId"
+  ],
+  "title": "ThreadGoalConditionalSetParams",
+  "type": "object"
+}

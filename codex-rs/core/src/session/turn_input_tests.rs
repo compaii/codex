@@ -1141,6 +1141,125 @@ async fn steer_preserves_request_origin(
 }
 
 #[tokio::test]
+async fn bounded_admission_attaches_one_shared_account_without_sticky_thread_limits() {
+    let (session, _) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let spec = codex_protocol::turn_input::TurnInferenceAllowance {
+        max_provider_attempts: 2,
+        max_request_bytes: 1024,
+        deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+    };
+    let prepared = PreparedTurnInputSettings::prepare(
+        &session,
+        ThreadSettingsOverrides::default(),
+        TurnStartOptions {
+            inference_allowance: Some(spec),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let ctx = prepared
+        .apply_started(&session, "bounded-test".into(), TurnStartKind::User)
+        .await
+        .unwrap()
+        .unwrap();
+    let first = crate::turn_inference::allowance(&ctx).unwrap();
+    let second = crate::turn_inference::allowance(&ctx).unwrap();
+    assert!(Arc::ptr_eq(&first, &second));
+    first.claim_attempt().unwrap();
+    assert_eq!(second.attempted().unwrap(), 1);
+    let ordinary = PreparedTurnInputSettings::prepare(
+        &session,
+        ThreadSettingsOverrides::default(),
+        TurnStartOptions::default(),
+    )
+    .await
+    .unwrap()
+    .apply_started(
+        &session,
+        "ordinary-after-bounded".into(),
+        TurnStartKind::User,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(crate::turn_inference::allowance(&ordinary).is_none());
+}
+
+#[tokio::test]
+async fn bounded_recovery_refuses_instead_of_replenishing_spent_attempts() {
+    let (session, _) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let spec = codex_protocol::turn_input::TurnInferenceAllowance {
+        max_provider_attempts: 2,
+        max_request_bytes: 128,
+        deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+    };
+    assert!(
+        handle_recovery(
+            &session,
+            ThreadSettingsOverrides::default(),
+            TurnStartOptions {
+                inference_allowance: Some(spec),
+                ..Default::default()
+            },
+            "retained-bounded-turn".into()
+        )
+        .await
+        .is_err()
+    );
+    assert!(session.active_turn.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn bounded_predecessor_refuses_an_unreserved_direct_continuation() {
+    let (session, _) = make_session_and_context().await;
+    let session = Arc::new(session);
+    session.state.lock().await.turn_attribution = Some(codex_history::TurnAttribution {
+        inference_allowance: Some(Box::new(
+            codex_protocol::turn_input::TurnInferenceAllowance {
+                max_provider_attempts: 1,
+                max_request_bytes: 128,
+                deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+            },
+        )),
+        turn_id: "bounded-predecessor".into(),
+        turn_trigger: Some("heartbeat".into()),
+        parent_turn_id: None,
+        initiating_agent_path: None,
+        root_turn_id: None,
+    });
+    session.state.lock().await.last_started_turn_id = Some("bounded-predecessor".into());
+    let input = TurnInputRequest::new(SubmittedTurnInput::ResponseItem(
+        ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: None,
+            name: Some("automatic_continuation".into()),
+            namespace: None,
+            output: codex_protocol::models::FunctionCallOutputPayload {
+                body: codex_protocol::models::FunctionCallOutputBody::Text("continue".into()),
+                success: None,
+            },
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ));
+    assert!(
+        handle(
+            &session,
+            input,
+            TurnInputMode::ContinueIfIdle {
+                expected_previous_turn_id: "bounded-predecessor".into(),
+            },
+            "unreserved-successor".into()
+        )
+        .await
+        .is_err()
+    );
+    assert!(session.active_turn.lock().await.is_none());
+}
+
+#[tokio::test]
 async fn scored_prompt_keeps_its_submission_item_id() {
     let (session, turn, events) = make_session_and_context_with_rx().await;
     session
@@ -1237,4 +1356,49 @@ async fn scored_prompt_keeps_its_submission_item_id() {
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(ui_ids.len(), 3);
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+/// Queue-only message wakes may reuse ordinary context but never replenish a bounded turn.
+#[test_case(false; "ordinary_wake")]
+#[test_case(true; "bounded_predecessor")]
+#[tokio::test]
+async fn agent_message_wake_preserves_bounded_predecessor(bounded: bool) {
+    let (mut session, _) = make_session_and_context().await;
+    session
+        .features
+        .enable(Feature::WakeOnAgentMessages)
+        .expect("enable agent-message wakes");
+    session.state.lock().await.turn_attribution = Some(codex_history::TurnAttribution {
+        inference_allowance: bounded.then(|| {
+            Box::new(codex_protocol::turn_input::TurnInferenceAllowance {
+                max_provider_attempts: 1,
+                max_request_bytes: 128,
+                deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+            })
+        }),
+        turn_id: "predecessor".into(),
+        turn_trigger: Some("heartbeat".into()),
+        parent_turn_id: None,
+        initiating_agent_path: None,
+        root_turn_id: None,
+    });
+    let communication = InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("valid worker path"),
+        AgentPath::root(),
+        Vec::new(),
+        "late worker update".to_string(),
+        /*trigger_turn*/ false,
+    );
+    session
+        .input_queue
+        .enqueue_mailbox_communication(communication.clone().into(), Default::default())
+        .await;
+
+    let reservation = session.reserve_pending_work_turn().await;
+    assert_eq!(reservation.is_none(), bounded);
+    assert_eq!(session.active_turn.lock().await.is_none(), bounded);
+    assert_eq!(
+        session.input_queue.drain_mailbox_input_items().await.0,
+        vec![TurnInput::InterAgentCommunication(communication.into())]
+    );
 }

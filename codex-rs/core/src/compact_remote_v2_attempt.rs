@@ -142,7 +142,10 @@ pub(super) async fn run_remote_compact_v2_attempt(
                 .executed_tool_calls
                 .attach_to_compaction_prompt(&mut input);
             let client_session = client_session.unwrap_or_else(|| {
-                owned_client_session.insert(sess.services.model_client.new_session())
+                owned_client_session.insert(crate::turn_inference::bind(
+                    sess.services.model_client.new_session(),
+                    turn_context,
+                ))
             });
             (
                 model_info,

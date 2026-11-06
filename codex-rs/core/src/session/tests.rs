@@ -6394,6 +6394,7 @@ async fn compaction_persists_resume_metadata_and_companion_records() {
         multi_agent_version: Some(MultiAgentVersion::V2),
         last_started_turn_id: Some(turn_context.sub_id.clone()),
         turn_attribution: Some(codex_history::TurnAttribution {
+            inference_allowance: None,
             turn_id: turn_context.sub_id.clone(),
             turn_trigger: Some("automation".to_string()),
             parent_turn_id: Some("parent-turn".to_string()),
@@ -7148,6 +7149,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         parent_observer_event_tx: OnceLock::new(),
         agent_status: agent_status_tx,
         state: Mutex::new(state),
+        initial_resume_configuration: std::sync::OnceLock::new(),
+        initial_resume_input_config: std::sync::OnceLock::new(),
         thread_settings_persistence: Semaphore::new(/*permits*/ 1),
         code_mode_message_tasks: Default::default(),
         managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
@@ -9471,6 +9474,8 @@ where
         parent_observer_event_tx: OnceLock::new(),
         agent_status: agent_status_tx,
         state: Mutex::new(state),
+        initial_resume_configuration: std::sync::OnceLock::new(),
+        initial_resume_input_config: std::sync::OnceLock::new(),
         thread_settings_persistence: Semaphore::new(/*permits*/ 1),
         code_mode_message_tasks: Default::default(),
         managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
@@ -13817,5 +13822,151 @@ async fn rejected_mcp_refresh_then_corrected_user_config_blocks_ordinary_replace
             .get("enterprise")
             .is_some_and(|server| server.enabled),
         "rejection must not permit same-name ordinary-auth replacement in this session"
+    );
+}
+
+#[tokio::test]
+async fn resolved_resume_requires_full_config_and_unchanged_runtime() {
+    let (session, _) = make_session_and_context().await;
+    let config = session.get_config().await;
+    assert!(
+        !session
+            .can_reuse_resolved_resume_config(config.as_ref())
+            .await
+    );
+    // Normal startup derives token-budget activation even with no configured
+    // budget. Resume resolves the original loader input, not that derived Config.
+    let mut activated = config.as_ref().clone();
+    activated
+        .prepare_token_budget_for_startup()
+        .expect("startup config");
+    assert_ne!(activated, *config);
+    session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .original_config_do_not_use = Arc::new(activated);
+    assert!(
+        session
+            .initial_resume_input_config
+            .set(Arc::clone(&config))
+            .is_ok()
+    );
+    let initial = session.state.lock().await.session_configuration.clone();
+    assert!(
+        session
+            .initial_resume_configuration
+            .set(initial.clone())
+            .is_ok()
+    );
+    assert!(
+        session
+            .can_reuse_resolved_resume_config(config.as_ref())
+            .await
+    );
+    let mut rebound_roots = config.as_ref().clone();
+    rebound_roots.workspace_roots_explicit = !config.workspace_roots_explicit;
+    assert!(
+        !session
+            .can_reuse_resolved_resume_config(&rebound_roots)
+            .await
+    );
+    let mut changed = config.as_ref().clone();
+    changed.model_provider.http_headers = Some(std::collections::HashMap::from([(
+        "X-Changed".to_string(),
+        "changed".into(),
+    )]));
+    assert!(!session.can_reuse_resolved_resume_config(&changed).await);
+    for change in 0..9 {
+        {
+            let mut state = session.state.lock().await;
+            state.session_configuration = initial.clone();
+            let current = &mut state.session_configuration;
+            match change {
+                0 => {
+                    Arc::make_mut(&mut current.step_settings)
+                        .collaboration_mode
+                        .settings
+                        .reasoning_effort = Some(ReasoningEffortConfig::Low)
+                }
+                1 => {
+                    Arc::make_mut(&mut current.step_settings).service_tier =
+                        Some("priority".to_string())
+                }
+                2 => {
+                    let summary = &mut Arc::make_mut(&mut current.step_settings).reasoning_summary;
+                    *summary = if *summary
+                        == Some(codex_protocol::config_types::ReasoningSummary::Detailed)
+                    {
+                        None
+                    } else {
+                        Some(codex_protocol::config_types::ReasoningSummary::Detailed)
+                    };
+                }
+                3 => current
+                    .runtime_workspace_roots
+                    .push(current.legacy_fallback_cwd.clone()),
+                4 => current.windows_sandbox_level = WindowsSandboxLevel::Elevated,
+                5 => current
+                    .disabled_plugin_ids
+                    .push("changed-plugin".to_string()),
+                6 => {
+                    Arc::make_mut(&mut current.step_settings).personality =
+                        Some(codex_protocol::config_types::Personality::Friendly)
+                }
+                7 => current
+                    .set_permission_profile_for_tests(PermissionProfile::Disabled)
+                    .expect("test permission update"),
+                _ => {
+                    current
+                        .turn_extension_init
+                        .insert("opaque host data".to_string());
+                }
+            }
+        }
+        assert!(
+            !session
+                .can_reuse_resolved_resume_config(config.as_ref())
+                .await,
+            "change {change}"
+        );
+    }
+    {
+        let mut state = session.state.lock().await;
+        state.session_configuration = initial;
+        // A runtime refresh must not make a new config look like startup state.
+        state.session_configuration.original_config_do_not_use = Arc::new(changed.clone());
+    }
+    assert!(!session.can_reuse_resolved_resume_config(&changed).await);
+    assert!(
+        !session
+            .can_reuse_resolved_resume_config(config.as_ref())
+            .await
+    );
+
+    let (guardian, _) = make_session_and_context().await;
+    let guardian_config = guardian.get_config().await;
+    let guardian_initial = {
+        let mut state = guardian.state.lock().await;
+        state.session_configuration.trusted_guardian_reviewer = true;
+        state.session_configuration.clone()
+    };
+    assert!(
+        guardian
+            .initial_resume_input_config
+            .set(Arc::clone(&guardian_config))
+            .is_ok()
+    );
+    assert!(
+        guardian
+            .initial_resume_configuration
+            .set(guardian_initial)
+            .is_ok()
+    );
+    assert!(
+        !guardian
+            .can_reuse_resolved_resume_config(guardian_config.as_ref())
+            .await
     );
 }

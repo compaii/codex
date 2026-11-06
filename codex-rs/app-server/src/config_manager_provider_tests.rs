@@ -305,18 +305,149 @@ name = "Gateway"
         .await?;
     let default_manager =
         ConfigManager::without_managed_config_for_tests(home.path().to_path_buf());
-    let error = default_manager
+    if key == "model_provider" {
+        // An explicit session route still present in owner configuration now
+        // coexists with the default; ordinary inherited profiles do not opt in.
+        default_manager
+            .check_thread_model_provider_for_input(&current)
+            .await?;
+    } else {
+        let error = default_manager
+            .check_thread_model_provider_for_input(&current)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<ModelProviderError>()),
+            Some(&ModelProviderError::ModelProviderMismatch {
+                model_provider: "gateway".into(),
+                current_model_provider: "openai".into(),
+            })
+        );
+    }
+    Ok(())
+}
+
+/// Saved explicit profiles can coexist with the server default, but never
+/// retain a route withdrawn/changed by the owner or a managed restriction.
+#[tokio::test]
+async fn explicit_saved_provider_preserves_configured_route_only() -> Result<()> {
+    let home = tempdir()?;
+    let config_path = home.path().join("config.toml");
+    let original = "model_provider = 'openai'\n[model_providers.gateway]\nname = 'Gateway'\nwire_api = 'responses'\nrequires_openai_auth = true\nsupports_websockets = false\n";
+    std::fs::write(&config_path, original)?;
+    let manager = ConfigManager::without_managed_config_for_tests(home.path().to_path_buf());
+    let overrides = Some(HashMap::from([(
+        "model_provider".into(),
+        serde_json::json!("gateway"),
+    )]));
+    let current = manager
+        .load_for_resume(
+            Some("gateway"),
+            overrides.clone(),
+            ConfigOverrides::default(),
+            Some(home.path().to_path_buf()),
+        )
+        .await?;
+    assert_eq!(current.model_provider_id, "gateway");
+    manager
         .check_thread_model_provider_for_input(&current)
-        .await
-        .unwrap_err();
-    assert_eq!(
-        error
-            .get_ref()
-            .and_then(|error| error.downcast_ref::<ModelProviderError>()),
-        Some(&ModelProviderError::ModelProviderMismatch {
-            model_provider: "gateway".into(),
-            current_model_provider: "openai".into(),
-        })
+        .await?;
+    // No explicit reassertion, or an attempt to replace the saved provider,
+    // retains the existing mismatch refusal.
+    assert!(
+        manager
+            .load_for_resume(
+                Some("gateway"),
+                None,
+                ConfigOverrides::default(),
+                Some(home.path().to_path_buf())
+            )
+            .await
+            .is_err()
     );
+    assert!(
+        manager
+            .load_for_resume(
+                Some("gateway"),
+                Some(HashMap::from([(
+                    "model_provider".into(),
+                    serde_json::json!("openai")
+                )])),
+                ConfigOverrides::default(),
+                Some(home.path().to_path_buf())
+            )
+            .await
+            .is_err()
+    );
+    let managed = ConfigManager::new_for_tests(
+        home.path().to_path_buf(),
+        Vec::new(),
+        LoaderOverrides::without_managed_config_for_tests(),
+        CloudConfigBundleFixture::loader_with_enterprise_requirement("model_provider = 'openai'"),
+    );
+    assert!(
+        managed
+            .check_thread_model_provider_for_input(&current)
+            .await
+            .is_err()
+    );
+    assert!(
+        managed
+            .load_for_resume(
+                Some("gateway"),
+                overrides.clone(),
+                ConfigOverrides::default(),
+                Some(home.path().to_path_buf())
+            )
+            .await
+            .is_err()
+    );
+    for changed in [
+        original.replace("supports_websockets = false", "supports_websockets = true"),
+        "model_provider = 'openai'\n".into(),
+    ] {
+        std::fs::write(&config_path, &changed)?;
+        assert!(
+            manager
+                .check_thread_model_provider_for_input(&current)
+                .await
+                .is_err()
+        );
+        let refreshed = manager
+            .load_for_resume(
+                Some("gateway"),
+                overrides.clone(),
+                ConfigOverrides::default(),
+                Some(home.path().to_path_buf()),
+            )
+            .await;
+        if changed.contains("model_providers.gateway") {
+            // A cold resume may adopt the owner's NEW definition; it must not
+            // silently retain the old session/profile definition.
+            assert_ne!(refreshed?.model_provider, current.model_provider);
+        } else {
+            assert!(refreshed.is_err());
+        }
+        let injected = Some(HashMap::from([
+            ("model_provider".into(), serde_json::json!("gateway")),
+            (
+                "model_providers".into(),
+                serde_json::json!({"gateway": current.model_provider}),
+            ),
+        ]));
+        assert!(
+            manager
+                .load_for_resume(
+                    Some("gateway"),
+                    injected,
+                    ConfigOverrides::default(),
+                    Some(home.path().to_path_buf())
+                )
+                .await
+                .is_err()
+        );
+    }
     Ok(())
 }

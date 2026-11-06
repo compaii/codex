@@ -4732,3 +4732,44 @@ async fn build_agent_resume_config_clears_base_instructions() {
         .expect("approval policy set");
     assert_eq!(config, expected);
 }
+
+#[test_case::test_case(false; "queue_only_can_wake")]
+#[test_case::test_case(true; "explicit_trigger")]
+#[tokio::test]
+async fn bounded_agent_message_refuses_before_recipient_resolution(trigger: bool) {
+    let (session, turn) = make_session_and_context().await;
+    let allowance =
+        crate::turn_inference::prepare(&codex_protocol::turn_input::TurnInferenceAllowance {
+            max_provider_attempts: 1,
+            max_request_bytes: 128,
+            deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+        })
+        .expect("valid bounded allowance");
+    turn.extension_data.insert(Arc::clone(&allowance));
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let call = invocation(
+        Arc::clone(&session),
+        turn,
+        if trigger {
+            "followup_task"
+        } else {
+            "send_message"
+        },
+        function_payload(json!({
+            "target": "/root/not_loaded",
+            "message": "must not cause unreserved recipient work"
+        })),
+    );
+    let result = if trigger {
+        FollowupTaskHandlerV2.handle(call).await
+    } else {
+        SendMessageHandlerV2.handle(call).await
+    };
+    let Err(FunctionCallError::RespondToModel(message)) = result else {
+        panic!("bounded message must refuse before resolving/loading a recipient");
+    };
+    assert!(message.contains("separately reserved agent admission"));
+    assert_eq!(allowance.attempted().expect("retained attempts"), 0);
+    assert!(session.active_turn.lock().await.is_none());
+}

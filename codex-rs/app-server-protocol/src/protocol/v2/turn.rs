@@ -306,6 +306,17 @@ pub struct TurnStartParams {
     pub cyber_access_program: Option<CyberAccessProgram>,
 }
 
+/// Mandatory bounded idle-only admission. An older server must reject this
+/// method rather than ignore an optional field on ordinary turn/start.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct TurnStartBoundedIfIdleParams {
+    #[experimental(nested)]
+    pub turn: TurnStartParams,
+    pub allowance: codex_protocol::turn_input::TurnInferenceAllowance,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]

@@ -305,3 +305,67 @@ async fn assert_catalog_budget(evidence: BudgetEvidence) -> Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bounded_attention_invalidates_cached_scores_without_classification() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let fixture = catalog_budget_fixture(server.uri(), 32_000).await?;
+    let thread_store = fixture.test.codex.thread_extension_data();
+    set_cached_score(
+        thread_store,
+        SecurityRiskScore {
+            scores: BTreeMap::from([("action_risk".to_owned(), 0.0)]),
+            call_id: None,
+            action: None,
+            sampled_at: None,
+        },
+    );
+    let progress = thread_store
+        .get::<GuardianV2ScoreProgress>()
+        .expect("score progress");
+    let turn_store = ExtensionData::new("bounded-review-turn");
+    turn_store.insert(codex_protocol::turn_input::TurnInferenceAllowance {
+        max_provider_attempts: 1,
+        max_request_bytes: 1024,
+        deadline_unix_ms: i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis(),
+        )? + 30_000,
+    });
+    let tool_name = ToolName::plain("read_file");
+    let payload = ToolPayload::Function {
+        arguments: r#"{"path":"README.md"}"#.to_owned(),
+    };
+    let before = server.received_requests().await.expect("requests").len();
+    fixture.registry.tool_lifecycle_contributors()[0]
+        .on_tool_start(ToolStartInput {
+            permissions: Box::pin(async {
+                panic!("bounded observation must not prepare classifier permissions")
+            }),
+            session_store: &fixture.session_store,
+            thread_store,
+            turn_store: &turn_store,
+            turn_id: "bounded-review-turn",
+            root_turn_id: None,
+            call_id: "bounded-review-action",
+            originating_item_id: None,
+            serving_assessment: None,
+            tool_name: &tool_name,
+            mcp_tool: None,
+            payload: &payload,
+            conversation_history: fixture.test.codex.conversation_history_snapshot().await,
+            source: ToolCallSource::Direct,
+        })
+        .await;
+    assert!(
+        progress.inspect(None).has_unscored_failure,
+        "an old low-risk score must not cover bounded work"
+    );
+    assert_eq!(
+        server.received_requests().await.expect("requests").len(),
+        before
+    );
+    Ok(())
+}

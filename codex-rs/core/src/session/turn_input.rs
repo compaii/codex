@@ -99,6 +99,7 @@ impl TurnStartKind {
 struct PreparedTurnInputSettings {
     thread_settings_update: Option<SessionSettingsUpdate>,
     start_options: TurnStartOptions,
+    inference_allowance: Option<Arc<codex_api::InferenceAllowance>>,
 }
 
 impl PreparedTurnInputSettings {
@@ -109,6 +110,11 @@ impl PreparedTurnInputSettings {
         thread_settings: impl Into<WithTurnExtensionData<ThreadSettingsOverrides>>,
         start_options: TurnStartOptions,
     ) -> CodexResult<Self> {
+        let inference_allowance = start_options
+            .inference_allowance
+            .as_ref()
+            .map(crate::turn_inference::prepare)
+            .transpose()?;
         let thread_settings = thread_settings.into();
         let thread_settings_update = if thread_settings.request
             == ThreadSettingsOverrides::default()
@@ -129,6 +135,7 @@ impl PreparedTurnInputSettings {
         Ok(Self {
             thread_settings_update,
             start_options,
+            inference_allowance,
         })
     }
 
@@ -146,6 +153,7 @@ impl PreparedTurnInputSettings {
         kind: TurnStartKind,
     ) -> CodexResult<Option<Arc<TurnContext>>> {
         let TurnStartOptions {
+            inference_allowance: inference_spec,
             turn_trigger,
             final_output_json_schema,
             service_tier,
@@ -187,6 +195,12 @@ impl PreparedTurnInputSettings {
         let Some((turn_context, settings_snapshot)) = turn_context else {
             return Ok(None);
         };
+        if let Some(spec) = inference_spec {
+            turn_context.extension_data.insert(spec);
+        }
+        if let Some(allowance) = self.inference_allowance {
+            turn_context.extension_data.insert(allowance);
+        }
         if let Some(turn_trigger) = turn_trigger {
             turn_context
                 .turn_metadata_state
@@ -238,6 +252,13 @@ pub(super) async fn handle(
     submission_id: String,
 ) -> CodexResult<TurnInputSubmission> {
     let request = request.into();
+    if request.request.start.inference_allowance.is_some()
+        && !matches!(mode, TurnInputMode::StartIfIdle)
+    {
+        return Err(CodexErr::InvalidRequest(
+            "bounded inference requires fresh idle-only admission".into(),
+        ));
+    }
     if let SubmittedTurnInput::ResponseItem(item)
     | SubmittedTurnInput::AnnotatedResponseItem(AnnotatedResponseItem { item, .. }) =
         &request.request.input
@@ -317,6 +338,11 @@ pub(super) async fn handle_recovery(
     start_options: TurnStartOptions,
     submission_id: String,
 ) -> CodexResult<TurnInputSubmission> {
+    if start_options.inference_allowance.is_some() {
+        return Err(CodexErr::InvalidRequest(
+            "bounded execution cannot recover by reconstructing its allocation".into(),
+        ));
+    }
     let WithTurnExtensionData {
         request: thread_settings,
         turn_extension_init,
@@ -426,15 +452,15 @@ async fn start_or_steer(
                         .session_source,
                     SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
                 );
-            let _admission = if is_delegated_input {
-                None
+            let admission = if is_delegated_input {
+                session.services.extensions.admit_delegated_turn_start()
             } else {
-                let Some(admission) = session.services.extensions.admit_turn_start() else {
-                    return Ok(TurnInputSubmission::NotSubmitted {
-                        reason: NotSubmittedReason::ServerDraining,
-                    });
-                };
-                Some(admission)
+                session.services.extensions.admit_turn_start()
+            };
+            let Some(_admission) = admission else {
+                return Ok(TurnInputSubmission::NotSubmitted {
+                    reason: NotSubmittedReason::ServerDraining,
+                });
             };
             let Some(turn_context) = settings
                 .apply_started(session, submission_id.clone(), TurnStartKind::User)
@@ -498,6 +524,7 @@ async fn start_if_idle(
         responsesapi_client_metadata,
         ..
     } = request;
+    let bounded_input = start.inference_allowance.is_some();
     if session.input_queue.has_trigger_turn_mailbox_items().await {
         return Ok(TurnInputSubmission::NotSubmitted {
             reason: NotSubmittedReason::PendingTriggerTurn,
@@ -513,26 +540,30 @@ async fn start_if_idle(
         });
     }
 
-    let _admission = session.services.extensions.admit_turn_start();
-    // A one-shot review delegate completes its already-running parent's work.
-    // Its explicit input carries parent lineage; automatic starts do not qualify.
-    if _admission.is_none()
-        && !(kind == TurnStartKind::User
-            && start.parent_turn_id.is_some()
-            && matches!(
-                session
-                    .state
-                    .lock()
-                    .await
-                    .session_configuration
-                    .session_source,
-                SessionSource::SubAgent(SubAgentSource::Review)
-            ))
-    {
+    let ordinary = session.services.extensions.admit_turn_start();
+    // A one-shot review delegate completes its existing parent's work; the host
+    // still requires a live task when its idle-maintenance gate is closed.
+    let admission = if ordinary.is_none()
+        && kind == TurnStartKind::User
+        && start.parent_turn_id.is_some()
+        && matches!(
+            session
+                .state
+                .lock()
+                .await
+                .session_configuration
+                .session_source,
+            SessionSource::SubAgent(SubAgentSource::Review)
+        ) {
+        session.services.extensions.admit_delegated_turn_start()
+    } else {
+        ordinary
+    };
+    let Some(_admission) = admission else {
         return Ok(TurnInputSubmission::NotSubmitted {
             reason: NotSubmittedReason::ServerDraining,
         });
-    }
+    };
 
     let turn_state = {
         let mut active_turn = session.active_turn.lock().await;
@@ -541,12 +572,22 @@ async fn start_if_idle(
                 reason: NotSubmittedReason::NotIdle,
             });
         }
-        if let Some(expected) = expected_previous_turn_id
-            && session.state.lock().await.last_started_turn_id.as_ref() != Some(&expected)
-        {
-            return Ok(TurnInputSubmission::NotSubmitted {
-                reason: NotSubmittedReason::Superseded,
-            });
+        if let Some(expected) = expected_previous_turn_id {
+            let state = session.state.lock().await;
+            if state.last_started_turn_id.as_ref() != Some(&expected) {
+                return Ok(TurnInputSubmission::NotSubmitted {
+                    reason: NotSubmittedReason::Superseded,
+                });
+            }
+            if start.inference_allowance.is_none()
+                && state.turn_attribution.as_ref().is_some_and(|prior| {
+                    prior.turn_id == expected && prior.inference_allowance.is_some()
+                })
+            {
+                return Err(CodexErr::InvalidRequest(
+                    "continuation of bounded execution requires fresh reserved admission".into(),
+                ));
+            }
         }
         let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
         Arc::clone(&active_turn.turn_state)
@@ -619,22 +660,26 @@ async fn start_if_idle(
         TurnStartKind::Automatic | TurnStartKind::Recovery => {
             // Empty automatic user input resumes sampling without a new message.
             if !matches!(&input, SubmittedTurnInput::UserInput { .. }) {
-                session
-                    .input_queue
-                    .extend_pending_input_for_turn_state(
-                        turn_state.as_ref(),
-                        vec![
-                            pending_turn_input(
-                                session,
-                                input,
-                                sender_messages.as_ref(),
-                                &turn_context.sub_id,
-                                input_metadata,
-                            )
-                            .await,
-                        ],
-                    )
-                    .await;
+                let input = pending_turn_input(
+                    session,
+                    input,
+                    sender_messages.as_ref(),
+                    &turn_context.sub_id,
+                    input_metadata,
+                )
+                .await;
+                if bounded_input && kind == TurnStartKind::Automatic {
+                    // Additional application context already makes task_input
+                    // nonempty. Queueing the explicit bounded input separately
+                    // would sample that context first, spending an allowance
+                    // attempt before delivering the work that owns it.
+                    task_input.push(input);
+                } else {
+                    session
+                        .input_queue
+                        .extend_pending_input_for_turn_state(turn_state.as_ref(), vec![input])
+                        .await;
+                }
             }
         }
     }
@@ -735,7 +780,6 @@ impl Session {
         {
             return None;
         }
-        let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
         let previous_options = if has_trigger_turn {
             Default::default()
         } else {
@@ -747,6 +791,10 @@ impl Session {
                 .map(codex_history::TurnAttribution::start_options)
                 .unwrap_or_default()
         };
+        if previous_options.inference_allowance.is_some() {
+            return None;
+        }
+        let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
         Some((Arc::clone(&active_turn.turn_state), previous_options))
     }
 
@@ -844,7 +892,10 @@ impl Session {
         Ok(())
     }
 
-    async fn clear_reserved_idle_turn(&self, turn_state: &Arc<tokio::sync::Mutex<TurnState>>) {
+    pub(crate) async fn clear_reserved_idle_turn(
+        &self,
+        turn_state: &Arc<tokio::sync::Mutex<TurnState>>,
+    ) {
         let mut active_turn_guard = self.active_turn.lock().await;
         if let Some(active_turn) = active_turn_guard.as_ref()
             && active_turn.task.is_none()
@@ -962,7 +1013,7 @@ impl Session {
     }
 }
 
-async fn merge_additional_context_input(
+pub(super) async fn merge_additional_context_input(
     session: &Session,
     turn_context: &TurnContext,
     additional_context: BTreeMap<String, AdditionalContextEntry>,

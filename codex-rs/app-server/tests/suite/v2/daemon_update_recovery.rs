@@ -34,6 +34,402 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::client_async;
 use tokio_tungstenite::tungstenite::Message;
 
+#[cfg(unix)]
+fn request_maintenance(server: &Child) -> Result<()> {
+    let status = StdCommand::new("kill")
+        .arg("-HUP")
+        .arg(server.id().context("server pid")?.to_string())
+        .status()?;
+    anyhow::ensure!(status.success(), "maintenance signal failed");
+    Ok(())
+}
+
+async fn begin_maintenance(socket: &Path) -> Result<WebSocketStream<UnixStream>> {
+    let stream = UnixStream::connect(socket).await?;
+    let (mut ws, response) = client_async("ws://localhost/daemon/maintenance", stream).await?;
+    let pid = response.headers()[codex_app_server_transport::DAEMON_MAINTENANCE_CAPABILITY_HEADER]
+        .to_str()?
+        .strip_prefix("v1:")
+        .context("nonblocking maintenance capability")?;
+    ws.send(Message::Text(pid.to_owned().into())).await?;
+    Ok(ws)
+}
+
+async fn maintenance_outcome(ws: &mut WebSocketStream<UnixStream>) -> Result<String> {
+    let frame = timeout(Duration::from_secs(10), ws.next())
+        .await?
+        .context("maintenance reply")??;
+    let Message::Text(frame) = frame else {
+        anyhow::bail!("expected maintenance outcome")
+    };
+    let result: serde_json::Value = serde_json::from_str(&frame)?;
+    Ok(result["outcome"]
+        .as_str()
+        .context("outcome string")?
+        .to_owned())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn managed_maintenance_keeps_admitting_while_a_turn_runs_then_saves_idle_roots() -> Result<()>
+{
+    let home = TempDir::new()?;
+    let (release, gate) = oneshot::channel();
+    let (mock, _completions) =
+        start_streaming_sse_server(vec![vec![stream_chunk(Some(gate), "Done")?]]).await;
+    create_config_toml(home.path(), mock.uri(), "never")?;
+    let socket = home.path().join("control/server.sock");
+    let mut server = spawn_server(home.path(), &socket)?;
+    let mut client = connect_default_daemon_client(&socket).await?;
+    let first = start_thread(&mut client, 2, json!({})).await?;
+    start_turn(&mut client, 3, &first.thread.id).await?;
+    wait_for_requests(&mock, 1).await?;
+    let mut maintenance = begin_maintenance(&socket).await?;
+    assert_still_running(&mut server, "maintenance waits without closing admission").await;
+    request_maintenance(&server)?;
+    let second = start_thread(&mut client, 4, json!({})).await?;
+    release.send(()).expect("held turn waiting");
+    assert_eq!(maintenance_outcome(&mut maintenance).await?, "handoffReady");
+    wait_success(&mut server).await?;
+    let snapshot = daemon_recovery::read_snapshot(&daemon_recovery_file_path(home.path()))?;
+    assert_eq!(snapshot.loaded, [first.thread.id, second.thread.id].into());
+    assert!(snapshot.interrupted.is_empty());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test_case::test_case("pause")]
+#[test_case::test_case("clear")]
+#[test_case::test_case("replace")]
+#[tokio::test]
+async fn managed_maintenance_retry_respects_later_goal_control(change: &str) -> Result<()> {
+    let home = TempDir::new()?;
+    let (release_goal, goal_gate) = oneshot::channel();
+    let (release_human, human_gate) = oneshot::channel();
+    let (mock, _) = start_streaming_sse_server(vec![
+        vec![stream_chunk(Some(goal_gate), "Useful goal progress")?],
+        vec![stream_chunk(Some(human_gate), "Human work finished")?],
+    ])
+    .await;
+    create_config_toml(home.path(), mock.uri(), "never")?;
+    let config = home.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "{}\n[features]\ngoals = true\n",
+            std::fs::read_to_string(&config)?
+        ),
+    )?;
+    let socket = home.path().join("control/server.sock");
+    let mut server = spawn_server(home.path(), &socket)?;
+    let mut client = connect_daemon_client(
+        &socket,
+        InitializeCapabilities {
+            experimental_api: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let goal = start_thread(&mut client, 2, json!({})).await?.thread.id;
+    request(
+        &mut client,
+        3,
+        "thread/goal/set",
+        json!({"threadId":goal,"objective":"Original objective"}),
+    )
+    .await?;
+    wait_for_requests(&mock, 1).await?;
+    let human = start_thread(&mut client, 4, json!({})).await?.thread.id;
+    start_turn(&mut client, 5, &human).await?;
+    wait_for_requests(&mock, 2).await?;
+    let recovery = daemon_recovery_file_path(home.path());
+    std::fs::create_dir_all(&recovery)?;
+    let mut maintenance = begin_maintenance(&socket).await?;
+    assert_still_running(&mut server, "maintenance must not interrupt either turn").await;
+    release_goal.send(()).expect("goal response waiting");
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let Message::Text(text) = client.next().await.context("socket closed")?? else {
+                continue;
+            };
+            let message: serde_json::Value = serde_json::from_str(&text)?;
+            if message["method"] == "turn/completed" && message["params"]["threadId"] == goal {
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    })
+    .await??;
+    match change {
+        "pause" => {
+            request(
+                &mut client,
+                6,
+                "thread/goal/set",
+                json!({"threadId":goal,"status":"paused"}),
+            )
+            .await?;
+        }
+        "clear" | "replace" => {
+            request(
+                &mut client,
+                6,
+                "thread/goal/clear",
+                json!({"threadId":goal}),
+            )
+            .await?;
+            if change == "replace" {
+                request(
+                    &mut client,
+                    7,
+                    "thread/goal/set",
+                    json!({"threadId":goal,"objective":"Replacement objective","status":"paused"}),
+                )
+                .await?;
+            }
+        }
+        _ => unreachable!(),
+    }
+    let expected = request(&mut client, 8, "thread/goal/get", json!({"threadId":goal})).await?;
+    release_human.send(()).expect("human response waiting");
+    assert_eq!(
+        maintenance_outcome(&mut maintenance)
+            .await
+            .with_context(|| diagnostic_tail(home.path()))?,
+        "deferred"
+    );
+    assert_still_running(&mut server, "defer keeps human service available").await;
+    assert_eq!(
+        mock.requests().await.len(),
+        2,
+        "superseded goal must not resume"
+    );
+    let actual = request(&mut client, 9, "thread/goal/get", json!({"threadId":goal})).await?;
+    assert_eq!(
+        actual, expected,
+        "later control and accounting remain exact"
+    );
+    std::fs::remove_dir(&recovery)?;
+    request_shutdown(&server, &socket).await?;
+    wait_success(&mut server).await?;
+    Ok(())
+}
+
+// Actual goal extension + Core + managed maintenance, using loopback SSE only.
+#[cfg(unix)]
+#[test_case::test_case(false; "handoff")]
+#[test_case::test_case(true; "snapshot_failure_resumes_once")]
+#[tokio::test]
+async fn managed_maintenance_withholds_goal_continuation(snapshot_failure: bool) -> Result<()> {
+    let home = TempDir::new()?;
+    let (release, gate) = oneshot::channel();
+    let (release_retry, retry_gate) = oneshot::channel();
+    let (mock, _completions) = start_streaming_sse_server(vec![
+        vec![stream_chunk(Some(gate), "Useful first progress")?],
+        vec![stream_chunk(Some(retry_gate), "Useful resumed progress")?],
+    ])
+    .await;
+    create_config_toml(home.path(), mock.uri(), "never")?;
+    let config = home.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "{}\n[features]\ngoals = true\n",
+            std::fs::read_to_string(&config)?
+        ),
+    )?;
+    let socket = home.path().join("control/server.sock");
+    let mut server = spawn_server(home.path(), &socket)?;
+    let mut client = connect_daemon_client(
+        &socket,
+        InitializeCapabilities {
+            experimental_api: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let thread = start_thread(&mut client, 2, json!({})).await?.thread.id;
+    request(
+        &mut client,
+        3,
+        "thread/goal/set",
+        json!({
+            "threadId":thread, "objective":"Keep making useful progress", "tokenBudget":100000
+        }),
+    )
+    .await?;
+    wait_for_requests(&mock, 1).await?;
+    let recovery = daemon_recovery_file_path(home.path());
+    if snapshot_failure {
+        std::fs::create_dir_all(&recovery)?;
+    }
+    let mut maintenance = begin_maintenance(&socket).await?;
+    assert_still_running(&mut server, "must finish the admitted turn").await;
+    // Human metadata admission is still open while maintenance is pending.
+    let before = request(
+        &mut client,
+        4,
+        "thread/goal/get",
+        json!({"threadId":thread}),
+    )
+    .await?;
+    release.send(()).expect("initial goal turn is waiting");
+    let outcome = maintenance_outcome(&mut maintenance)
+        .await
+        .with_context(|| diagnostic_tail(home.path()))?;
+    if snapshot_failure {
+        assert_eq!(outcome, "deferred");
+        wait_for_requests(&mock, 2)
+            .await
+            .with_context(|| diagnostic_tail(home.path()))?;
+        let after = request(
+            &mut client,
+            5,
+            "thread/goal/get",
+            json!({"threadId":thread}),
+        )
+        .await?;
+        for field in ["objective", "status", "tokenBudget", "createdAt"] {
+            assert_eq!(
+                before["goal"][field], after["goal"][field],
+                "goal field {field}"
+            );
+        }
+        request(
+            &mut client,
+            6,
+            "thread/goal/set",
+            json!({"threadId":thread,"status":"paused"}),
+        )
+        .await?;
+        release_retry.send(()).expect("resumed turn is waiting");
+        assert_still_running(&mut server, "deferred receiver remains available").await;
+        assert_eq!(
+            mock.requests().await.len(),
+            2,
+            "one retry, no duplicate continuation"
+        );
+        std::fs::remove_dir(&recovery)?;
+        request_shutdown(&server, &socket).await?;
+    } else {
+        assert_eq!(outcome, "handoffReady");
+        assert_eq!(
+            mock.requests().await.len(),
+            1,
+            "no fresh goal work before handoff"
+        );
+    }
+    wait_success(&mut server)
+        .await
+        .with_context(|| diagnostic_tail(home.path()))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test_case::test_case("publish")]
+#[test_case::test_case("root")]
+#[tokio::test]
+async fn managed_maintenance_failure_reopens_without_disconnecting(failure: &str) -> Result<()> {
+    let home = TempDir::new()?;
+    create_config_toml(home.path(), "http://127.0.0.1:1", "never")?;
+    let socket = home.path().join("control/server.sock");
+    let mut server = spawn_server(home.path(), &socket)?;
+    let mut client = connect_default_daemon_client(&socket).await?;
+    let root = start_thread(&mut client, 2, json!({})).await?;
+    let recovery = daemon_recovery_file_path(home.path());
+    let corrupt_root = root
+        .thread
+        .path
+        .context("persistent root rollout")?
+        .with_extension("jsonl.zst");
+    if failure == "publish" {
+        // Staging succeeds, but publishing over a directory must fail.
+        std::fs::create_dir_all(&recovery)?;
+    } else {
+        std::fs::create_dir_all(corrupt_root.parent().context("rollout directory")?)?;
+        std::fs::write(&corrupt_root, b"invalid compressed rollout")?;
+    }
+    let mut maintenance = begin_maintenance(&socket).await?;
+    assert_eq!(maintenance_outcome(&mut maintenance).await?, "deferred");
+    assert_still_running(&mut server, "failed maintenance must keep serving").await;
+    start_thread(&mut client, 3, json!({})).await?;
+    if failure == "publish" {
+        assert!(recovery.is_dir());
+        std::fs::remove_dir(&recovery)?;
+    } else {
+        assert!(
+            !recovery.exists(),
+            "partial root set must not become recovery"
+        );
+        std::fs::remove_file(&corrupt_root)?;
+    }
+    request_shutdown(&server, &socket).await?;
+    wait_success(&mut server).await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn managed_maintenance_stalled_persistence_times_out_and_late_writer_cannot_publish()
+-> Result<()> {
+    let home = TempDir::new()?;
+    create_config_toml(home.path(), "http://127.0.0.1:1", "never")?;
+    let socket = home.path().join("control/server.sock");
+    let mut server = spawn_server(home.path(), &socket)?;
+    let mut client = connect_default_daemon_client(&socket).await?;
+    let root = start_thread(&mut client, 2, json!({})).await?;
+    let rollout = root.thread.path.context("idle rollout path")?;
+    assert!(!rollout.exists());
+    let compressed = rollout.with_extension("jsonl.zst");
+    std::fs::create_dir_all(compressed.parent().context("rollout directory")?)?;
+    anyhow::ensure!(
+        StdCommand::new("mkfifo")
+            .arg(&compressed)
+            .status()?
+            .success(),
+        "mkfifo failed"
+    );
+    let mut maintenance = begin_maintenance(&socket).await?;
+    let blocked = timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(sender) = tokio::net::unix::pipe::OpenOptions::new().open_sender(&compressed)
+            {
+                return sender;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("maintenance did not reach persistence barrier")?;
+    // The actual managed path has a five-second finalization deadline.
+    assert_eq!(maintenance_outcome(&mut maintenance).await?, "deferred");
+    start_thread(&mut client, 3, json!({}))
+        .await
+        .with_context(|| {
+            format!(
+                "independent conversation after snapshot timeout: {}",
+                diagnostic_tail(home.path())
+            )
+        })?;
+    assert!(!daemon_recovery_file_path(home.path()).exists());
+    // Keep the blocked reader's open descriptor, but prevent explicit cleanup
+    // from opening this test-only FIFO a second time after its writer closes.
+    std::fs::remove_file(&compressed)?;
+    drop(blocked);
+    sleep(Duration::from_millis(100)).await;
+    assert!(
+        !daemon_recovery_file_path(home.path()).exists(),
+        "abandoned writer published recovery"
+    );
+    request_shutdown(&server, &socket).await?;
+    wait_success(&mut server).await.with_context(|| {
+        format!(
+            "explicit cleanup after released persistence: {}",
+            diagnostic_tail(home.path())
+        )
+    })?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn managed_restart_resumes_loaded_threads_and_goal_without_client() -> Result<()> {
     let home = TempDir::new()?;
@@ -435,11 +831,37 @@ async fn managed_force_shutdown_exits_with_blocked_rollout_writer() -> Result<()
     // The running parent can create a child after admissions drain. Its listener
     // needs the unload lock held by the blocked snapshot.
     release_spawn.send(()).expect("parent is waiting to spawn");
-    wait_for_requests(&mock, /*count*/ 3).await?;
+    wait_for_requests(&mock, /*count*/ 3)
+        .await
+        .with_context(|| {
+            format!(
+                "delegated child while snapshot writer blocked: {}",
+                diagnostic_tail(home.path())
+            )
+        })?;
     assert_still_running(&mut server, "graceful shutdown must wait for the writer").await;
     request_shutdown(&server, &socket_path).await?;
-    wait_success(&mut server).await?;
+    wait_success(&mut server).await.with_context(|| {
+        format!(
+            "explicit forced-exit response: {}",
+            diagnostic_tail(home.path())
+        )
+    })?;
     Ok(())
+}
+
+fn diagnostic_tail(home: &Path) -> String {
+    use std::io::Read;
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    let Ok(mut file) = std::fs::File::open(home.join("daemon-stderr.log")) else {
+        return "no fixture log".into();
+    };
+    let size = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    let _ = file.seek(SeekFrom::Start(size.saturating_sub(16384)));
+    let mut bytes = Vec::new();
+    let _ = file.take(16384).read_to_end(&mut bytes);
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 async fn wait_success(server: &mut Child) -> Result<()> {
@@ -829,7 +1251,7 @@ pub(super) fn spawn_server(home: &Path, socket_path: &Path) -> Result<Child> {
         )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(std::fs::File::create(home.join("daemon-stderr.log"))?)
         .kill_on_drop(true)
         .spawn()?)
 }

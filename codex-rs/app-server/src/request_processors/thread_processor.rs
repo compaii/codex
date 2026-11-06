@@ -531,6 +531,9 @@ enum RunningThreadResumeResult {
     /// The optional stored thread contains the history-bearing probe that cold
     /// resume can reuse instead of reading the rollout again.
     NotRunning(Option<Box<StoredThread>>),
+    /// Loaded and eligible for replacement, but first resolve the full config
+    /// outside the shared thread-list permit.
+    ResolveOverrides(Box<StoredThread>),
 }
 
 impl ThreadRequestProcessor {
@@ -3958,6 +3961,7 @@ impl ThreadRequestProcessor {
                     app_server_client_name.clone(),
                     app_server_client_version.clone(),
                     /*cold_resume_history*/ None,
+                    /*resolved_config*/ None,
                 )
                 .await?
             {
@@ -3971,6 +3975,7 @@ impl ThreadRequestProcessor {
                     return Ok(ControlFlow::Break(()));
                 }
                 RunningThreadResumeResult::NotRunning(stored_thread) => stored_thread,
+                RunningThreadResumeResult::ResolveOverrides(stored_thread) => Some(stored_thread),
             },
             ThreadResumeTarget::DaemonRecovery(saved) => {
                 let thread_id = ThreadId::from_string(&params.thread_id)
@@ -4126,6 +4131,7 @@ impl ThreadRequestProcessor {
                     app_server_client_name,
                     app_server_client_version,
                     cold_resume_history,
+                    /*resolved_config*/ None,
                 )
                 .await?
             {
@@ -4136,7 +4142,8 @@ impl ThreadRequestProcessor {
                         .map_err(|_| thread_closing_for_resume(child_thread_id))?;
                     Ok(ControlFlow::Break(()))
                 }
-                RunningThreadResumeResult::NotRunning(_) => Err(invalid_request(
+                RunningThreadResumeResult::NotRunning(_)
+                | RunningThreadResumeResult::ResolveOverrides(_) => Err(invalid_request(
                     "cannot resume an unloaded multi-agent v2 sub-agent through its parent; resume the parent first, or use thread/read to inspect it",
                 )),
             };
@@ -4329,6 +4336,45 @@ impl ThreadRequestProcessor {
                 config.personality = settings.personality;
             }
         }
+
+        if let ThreadResumeTarget::Client(request_id) = target
+            && let InitialHistory::Resumed(resumed) = &thread_history
+            && self
+                .thread_manager
+                .get_thread(resumed.conversation_id)
+                .await
+                .is_ok()
+        {
+            match self
+                .resume_running_thread(
+                    request_id,
+                    params,
+                    app_server_client_name.clone(),
+                    app_server_client_version.clone(),
+                    /*cold_resume_history*/ None,
+                    Some(&config),
+                )
+                .await?
+            {
+                RunningThreadResumeResult::Handled(completion) => {
+                    drop(_goal_resume_guard);
+                    drop(_thread_list_state_permit);
+                    let _ = completion.await;
+                    return Ok(ControlFlow::Break(()));
+                }
+                RunningThreadResumeResult::NotRunning(_) => {
+                    // Shutdown may flush newer history. Resolve again from its
+                    // retained outcome rather than starting from the old copy.
+                    return Ok(ControlFlow::Continue(()));
+                }
+                RunningThreadResumeResult::ResolveOverrides(_) => {
+                    return Err(internal_error(
+                        "resolved resume configuration was not accepted",
+                    ));
+                }
+            }
+        }
+
         let response_history = thread_history.clone();
 
         match self
@@ -4639,6 +4685,7 @@ impl ThreadRequestProcessor {
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
         cold_resume_history: Option<&[RolloutItem]>,
+        resolved_config: Option<&Config>,
     ) -> Result<RunningThreadResumeResult, JSONRPCErrorError> {
         let running_thread = if params.history.is_some() {
             if let Ok(existing_thread_id) = ThreadId::from_string(&params.thread_id)
@@ -4707,6 +4754,7 @@ impl ThreadRequestProcessor {
                 selected_service_tier.as_deref(),
             );
             if !mismatch_details.is_empty() {
+                let mut unchanged_configuration = false;
                 let has_subscribers = !self
                     .thread_state_manager
                     .subscribed_connection_ids(existing_thread_id)
@@ -4727,33 +4775,49 @@ impl ThreadRequestProcessor {
                     && matches!(loaded_status, ThreadStatus::Idle)
                     && !is_running
                 {
-                    // A loaded idle thread is only a cache entry. Shut it down
-                    // before removing it so cold resume cannot duplicate a
-                    // thread that timed out during shutdown.
-                    match wait_for_thread_shutdown(&existing_thread).await {
-                        ThreadShutdownResult::Complete => {
-                            self.thread_manager.remove_thread(&existing_thread_id).await;
-                            self.finalize_thread_teardown(existing_thread_id).await;
-                            // Shutdown can flush newer rollout items, so reload the
-                            // stored thread before starting the replacement session.
-                            return Ok(RunningThreadResumeResult::NotRunning(None));
-                        }
-                        ThreadShutdownResult::SubmitFailed => {
-                            warn!("failed to submit Shutdown to thread {existing_thread_id}");
-                        }
-                        ThreadShutdownResult::TimedOut => {
-                            warn!("thread {existing_thread_id} shutdown timed out");
+                    let Some(candidate) = resolved_config else {
+                        return Ok(RunningThreadResumeResult::ResolveOverrides(Box::new(
+                            source_thread,
+                        )));
+                    };
+                    if existing_thread
+                        .can_reuse_resolved_resume_config(candidate)
+                        .await
+                    {
+                        // Full normal config resolution and the owned startup
+                        // baseline prove this request does not change settings.
+                        unchanged_configuration = true;
+                    } else {
+                        // A loaded idle thread is only a cache entry. Shut it down
+                        // before removing it so cold resume cannot duplicate a
+                        // thread that timed out during shutdown.
+                        match wait_for_thread_shutdown(&existing_thread).await {
+                            ThreadShutdownResult::Complete => {
+                                self.thread_manager.remove_thread(&existing_thread_id).await;
+                                self.finalize_thread_teardown(existing_thread_id).await;
+                                // Shutdown can flush newer rollout items, so reload the
+                                // stored thread before starting the replacement session.
+                                return Ok(RunningThreadResumeResult::NotRunning(None));
+                            }
+                            ThreadShutdownResult::SubmitFailed => {
+                                warn!("failed to submit Shutdown to thread {existing_thread_id}");
+                            }
+                            ThreadShutdownResult::TimedOut => {
+                                warn!("thread {existing_thread_id} shutdown timed out");
+                            }
                         }
                     }
                 }
 
                 // Preserve rejoin semantics when another client can still observe
                 // the loaded thread or shutdown did not complete.
-                tracing::warn!(
-                    "thread/resume overrides ignored for loaded thread {}: {}",
-                    existing_thread_id,
-                    mismatch_details.join("; ")
-                );
+                if !unchanged_configuration {
+                    tracing::warn!(
+                        "thread/resume overrides ignored for loaded thread {}: {}",
+                        existing_thread_id,
+                        mismatch_details.join("; ")
+                    );
+                }
             }
             self.config_manager
                 .check_thread_model_provider_for_input(existing_thread.config().await.as_ref())

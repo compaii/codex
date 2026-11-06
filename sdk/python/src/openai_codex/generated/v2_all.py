@@ -5344,6 +5344,57 @@ class ThreadExtra(BaseModel):
     )
 
 
+class ThreadGoalActivationDisposition1(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    kind: Literal["uncertain"]
+    reason: str
+
+
+class ThreadGoalActivationDisposition2(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    kind: Literal["started"]
+    turn_id: str
+
+
+class ThreadGoalActivationDisposition3(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    kind: Literal["steered"]
+    turn_id: str
+
+
+class ThreadGoalActivationDisposition4(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    kind: Literal["notStarted"]
+    reason: str
+
+
+class ThreadGoalActivationDisposition(
+    RootModel[
+        ThreadGoalActivationDisposition1
+        | ThreadGoalActivationDisposition2
+        | ThreadGoalActivationDisposition3
+        | ThreadGoalActivationDisposition4
+    ]
+):
+    root: Annotated[
+        ThreadGoalActivationDisposition1
+        | ThreadGoalActivationDisposition2
+        | ThreadGoalActivationDisposition3
+        | ThreadGoalActivationDisposition4,
+        Field(
+            description="Admission is not evidence of incorporation, goal completion or hearing."
+        ),
+    ]
+
+
 class ThreadGoalClearResponse(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -5358,6 +5409,14 @@ class ThreadGoalClearedNotification(BaseModel):
     thread_id: Annotated[str, Field(alias="threadId")]
 
 
+class ThreadGoalConditionalClearResponse(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    cleared: bool
+    revision: str
+
+
 class ThreadGoalGetParams(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -5368,6 +5427,13 @@ class ThreadGoalGetParams(BaseModel):
 class ThreadGoalMutationOrigin(Enum):
     user = "user"
     automatic = "automatic"
+
+
+class ThreadGoalSnapshotParams(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    thread_id: Annotated[str, Field(alias="threadId")]
 
 
 class ThreadGoalStatus(Enum):
@@ -6671,6 +6737,16 @@ class TurnEnvironmentParams(BaseModel):
     ] = None
 
 
+class TurnInferenceAllowance(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+    )
+    deadline_unix_ms: Annotated[int, Field(alias="deadlineUnixMs")]
+    max_provider_attempts: Annotated[int, Field(alias="maxProviderAttempts", ge=0)]
+    max_request_bytes: Annotated[int, Field(alias="maxRequestBytes", ge=0)]
+
+
 class TurnInterruptParams(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -7266,6 +7342,17 @@ class ThreadNameSetRequest(BaseModel):
     id: RequestId
     method: Annotated[Literal["thread/name/set"], Field(title="Thread/name/setRequestMethod")]
     params: ThreadSetNameParams
+
+
+class ThreadGoalSnapshotRequest(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    id: RequestId
+    method: Annotated[
+        Literal["thread/goal/snapshot"], Field(title="Thread/goal/snapshotRequestMethod")
+    ]
+    params: ThreadGoalSnapshotParams
 
 
 class ThreadGoalGetRequest(BaseModel):
@@ -10375,6 +10462,58 @@ class ThreadGoalClearParams(BaseModel):
     thread_id: Annotated[str, Field(alias="threadId")]
 
 
+class ThreadGoalConditionalActivateParams(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    additional_context: Annotated[
+        dict[str, AdditionalContextEntry], Field(alias="additionalContext")
+    ]
+    expected_revision: Annotated[str, Field(alias="expectedRevision")]
+    objective: str | None = None
+    origin: ThreadGoalMutationOrigin | None = None
+    thread_id: Annotated[str, Field(alias="threadId")]
+    token_budget: Annotated[int | None, Field(alias="tokenBudget")] = None
+
+
+class ThreadGoalConditionalActivateResponse(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    activation: ThreadGoalActivationDisposition
+    goal: ThreadGoal
+    revision: str
+
+
+class ThreadGoalConditionalClearParams(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    expected_revision: Annotated[str, Field(alias="expectedRevision")]
+    origin: ThreadGoalMutationOrigin | None = None
+    thread_id: Annotated[str, Field(alias="threadId")]
+
+
+class ThreadGoalConditionalSetParams(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    expected_revision: Annotated[str, Field(alias="expectedRevision")]
+    objective: str | None = None
+    origin: ThreadGoalMutationOrigin | None = None
+    status: ThreadGoalStatus | None = None
+    thread_id: Annotated[str, Field(alias="threadId")]
+    token_budget: Annotated[int | None, Field(alias="tokenBudget")] = None
+
+
+class ThreadGoalConditionalSetResponse(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    goal: ThreadGoal
+    revision: str
+
+
 class ThreadGoalGetResponse(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -10401,6 +10540,14 @@ class ThreadGoalSetResponse(BaseModel):
         populate_by_name=True,
     )
     goal: ThreadGoal
+
+
+class ThreadGoalSnapshotResponse(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    goal: ThreadGoal | None = None
+    revision: str
 
 
 class ThreadGoalUpdatedNotification(BaseModel):
@@ -11216,6 +11363,42 @@ class ThreadForkRequest(BaseModel):
     id: RequestId
     method: Annotated[Literal["thread/fork"], Field(title="Thread/forkRequestMethod")]
     params: ThreadForkParams
+
+
+class ThreadGoalConditionalActivateRequest(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    id: RequestId
+    method: Annotated[
+        Literal["thread/goal/conditionalActivate"],
+        Field(title="Thread/goal/conditionalActivateRequestMethod"),
+    ]
+    params: ThreadGoalConditionalActivateParams
+
+
+class ThreadGoalConditionalSetRequest(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    id: RequestId
+    method: Annotated[
+        Literal["thread/goal/conditionalSet"],
+        Field(title="Thread/goal/conditionalSetRequestMethod"),
+    ]
+    params: ThreadGoalConditionalSetParams
+
+
+class ThreadGoalConditionalClearRequest(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    id: RequestId
+    method: Annotated[
+        Literal["thread/goal/conditionalClear"],
+        Field(title="Thread/goal/conditionalClearRequestMethod"),
+    ]
+    params: ThreadGoalConditionalClearParams
 
 
 class ThreadGoalSetRequest(BaseModel):
@@ -13257,6 +13440,15 @@ class TurnStartRequest(BaseModel):
     params: TurnStartParams
 
 
+class TurnStartIfIdleRequest(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    id: RequestId
+    method: Annotated[Literal["turn/startIfIdle"], Field(title="Turn/startIfIdleRequestMethod")]
+    params: TurnStartParams
+
+
 class ExternalAgentConfigImportRequest(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -13279,227 +13471,6 @@ class ExternalAgentConfigImportRecordHistoryRequest(BaseModel):
         Field(title="ExternalAgentConfig/import/recordHistoryRequestMethod"),
     ]
     params: ExternalAgentConfigImportHistoryRecordParams
-
-
-class ClientRequest(
-    RootModel[
-        InitializeRequest
-        | ThreadStartRequest
-        | ThreadResumeRequest
-        | ThreadForkRequest
-        | ThreadArchiveRequest
-        | ThreadDeleteRequest
-        | ThreadUnsubscribeRequest
-        | ThreadNameSetRequest
-        | ThreadGoalSetRequest
-        | ThreadGoalGetRequest
-        | ThreadGoalClearRequest
-        | ThreadMetadataUpdateRequest
-        | ThreadAttachmentAddRequest
-        | ThreadAttachmentListRequest
-        | ThreadAttachmentOwnerListRequest
-        | ThreadAttachmentRemoveRequest
-        | ThreadSectionMoveRequest
-        | ThreadUnarchiveRequest
-        | ThreadCompactStartRequest
-        | ThreadShellCommandRequest
-        | ThreadApproveGuardianDeniedActionRequest
-        | ThreadRevertRequest
-        | ThreadListRequest
-        | ThreadSectionListRequest
-        | ThreadSectionCreateRequest
-        | ThreadSectionUpdateRequest
-        | ThreadSectionDeleteRequest
-        | ThreadLoadedListRequest
-        | ThreadReadRequest
-        | ThreadTurnsListRequest
-        | ThreadItemsListRequest
-        | ThreadInjectItemsRequest
-        | SkillsListRequest
-        | SkillsExtraRootsSetRequest
-        | HooksListRequest
-        | MarketplaceAddRequest
-        | MarketplaceRemoveRequest
-        | MarketplaceUpgradeRequest
-        | PluginListRequest
-        | PluginInstalledRequest
-        | PluginReconcileRequest
-        | PluginReadRequest
-        | PluginSkillReadRequest
-        | PluginShareSaveRequest
-        | PluginShareUpdateTargetsRequest
-        | PluginShareListRequest
-        | PluginShareCheckoutRequest
-        | PluginShareDeleteRequest
-        | AppReadRequest
-        | AppListRequest
-        | AppInstalledRequest
-        | FsReadFileRequest
-        | FsWriteFileRequest
-        | FsCreateDirectoryRequest
-        | FsGetMetadataRequest
-        | FsReadDirectoryRequest
-        | FsRemoveRequest
-        | FsCopyRequest
-        | FsWatchRequest
-        | FsUnwatchRequest
-        | SkillsConfigWriteRequest
-        | PluginInstallRequest
-        | PluginUninstallRequest
-        | TurnStartRequest
-        | TurnSteerRequest
-        | TurnInterruptRequest
-        | ReviewStartRequest
-        | ModelListRequest
-        | AccountGatewayOAuthReadRequest
-        | AccountGatewayOAuthLoginRequest
-        | AccountGatewayOAuthCancelRequest
-        | ModelProviderCapabilitiesReadRequest
-        | ExperimentalFeatureListRequest
-        | PermissionProfileListRequest
-        | ExperimentalFeatureEnablementSetRequest
-        | McpServerOauthLoginRequest
-        | ConfigMcpServerReloadRequest
-        | McpServerStatusListRequest
-        | McpServerResourceReadRequest
-        | McpServerToolCallRequest
-        | WindowsSandboxSetupStartRequest
-        | WindowsSandboxReadinessRequest
-        | AccountLoginStartRequest
-        | AccountLoginCancelRequest
-        | AccountLogoutRequest
-        | AccountRateLimitsReadRequest
-        | AccountRateLimitResetCreditConsumeRequest
-        | AccountUsageReadRequest
-        | AccountWorkspaceMessagesReadRequest
-        | AccountSendAddCreditsNudgeEmailRequest
-        | FeedbackUploadRequest
-        | FeedbackSaveRequest
-        | CommandExecRequest
-        | CommandExecWriteRequest
-        | CommandExecTerminateRequest
-        | CommandExecResizeRequest
-        | ConfigReadRequest
-        | ExternalAgentConfigDetectRequest
-        | ExternalAgentConfigImportRequest
-        | ExternalAgentConfigImportRecordHistoryRequest
-        | ExternalAgentConfigImportReadHistoriesRequest
-        | ConfigValueWriteRequest
-        | ConfigBatchWriteRequest
-        | ConfigRequirementsReadRequest
-        | AccountReadRequest
-        | FuzzyFileSearchRequest
-    ]
-):
-    root: Annotated[
-        InitializeRequest
-        | ThreadStartRequest
-        | ThreadResumeRequest
-        | ThreadForkRequest
-        | ThreadArchiveRequest
-        | ThreadDeleteRequest
-        | ThreadUnsubscribeRequest
-        | ThreadNameSetRequest
-        | ThreadGoalSetRequest
-        | ThreadGoalGetRequest
-        | ThreadGoalClearRequest
-        | ThreadMetadataUpdateRequest
-        | ThreadAttachmentAddRequest
-        | ThreadAttachmentListRequest
-        | ThreadAttachmentOwnerListRequest
-        | ThreadAttachmentRemoveRequest
-        | ThreadSectionMoveRequest
-        | ThreadUnarchiveRequest
-        | ThreadCompactStartRequest
-        | ThreadShellCommandRequest
-        | ThreadApproveGuardianDeniedActionRequest
-        | ThreadRevertRequest
-        | ThreadListRequest
-        | ThreadSectionListRequest
-        | ThreadSectionCreateRequest
-        | ThreadSectionUpdateRequest
-        | ThreadSectionDeleteRequest
-        | ThreadLoadedListRequest
-        | ThreadReadRequest
-        | ThreadTurnsListRequest
-        | ThreadItemsListRequest
-        | ThreadInjectItemsRequest
-        | SkillsListRequest
-        | SkillsExtraRootsSetRequest
-        | HooksListRequest
-        | MarketplaceAddRequest
-        | MarketplaceRemoveRequest
-        | MarketplaceUpgradeRequest
-        | PluginListRequest
-        | PluginInstalledRequest
-        | PluginReconcileRequest
-        | PluginReadRequest
-        | PluginSkillReadRequest
-        | PluginShareSaveRequest
-        | PluginShareUpdateTargetsRequest
-        | PluginShareListRequest
-        | PluginShareCheckoutRequest
-        | PluginShareDeleteRequest
-        | AppReadRequest
-        | AppListRequest
-        | AppInstalledRequest
-        | FsReadFileRequest
-        | FsWriteFileRequest
-        | FsCreateDirectoryRequest
-        | FsGetMetadataRequest
-        | FsReadDirectoryRequest
-        | FsRemoveRequest
-        | FsCopyRequest
-        | FsWatchRequest
-        | FsUnwatchRequest
-        | SkillsConfigWriteRequest
-        | PluginInstallRequest
-        | PluginUninstallRequest
-        | TurnStartRequest
-        | TurnSteerRequest
-        | TurnInterruptRequest
-        | ReviewStartRequest
-        | ModelListRequest
-        | AccountGatewayOAuthReadRequest
-        | AccountGatewayOAuthLoginRequest
-        | AccountGatewayOAuthCancelRequest
-        | ModelProviderCapabilitiesReadRequest
-        | ExperimentalFeatureListRequest
-        | PermissionProfileListRequest
-        | ExperimentalFeatureEnablementSetRequest
-        | McpServerOauthLoginRequest
-        | ConfigMcpServerReloadRequest
-        | McpServerStatusListRequest
-        | McpServerResourceReadRequest
-        | McpServerToolCallRequest
-        | WindowsSandboxSetupStartRequest
-        | WindowsSandboxReadinessRequest
-        | AccountLoginStartRequest
-        | AccountLoginCancelRequest
-        | AccountLogoutRequest
-        | AccountRateLimitsReadRequest
-        | AccountRateLimitResetCreditConsumeRequest
-        | AccountUsageReadRequest
-        | AccountWorkspaceMessagesReadRequest
-        | AccountSendAddCreditsNudgeEmailRequest
-        | FeedbackUploadRequest
-        | FeedbackSaveRequest
-        | CommandExecRequest
-        | CommandExecWriteRequest
-        | CommandExecTerminateRequest
-        | CommandExecResizeRequest
-        | ConfigReadRequest
-        | ExternalAgentConfigDetectRequest
-        | ExternalAgentConfigImportRequest
-        | ExternalAgentConfigImportRecordHistoryRequest
-        | ExternalAgentConfigImportReadHistoriesRequest
-        | ConfigValueWriteRequest
-        | ConfigBatchWriteRequest
-        | ConfigRequirementsReadRequest
-        | AccountReadRequest
-        | FuzzyFileSearchRequest,
-        Field(description="Request from the client to the server.", title="ClientRequest"),
-    ]
 
 
 class RequestPermissionsGuardianApprovalReviewAction(BaseModel):
@@ -13853,4 +13824,257 @@ class ServerNotification(
             description="Notification sent from the server to the client.",
             title="ServerNotification",
         ),
+    ]
+
+
+class TurnStartBoundedIfIdleParams(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+    )
+    allowance: TurnInferenceAllowance
+    turn: TurnStartParams
+
+
+class TurnStartBoundedIfIdleRequest(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    id: RequestId
+    method: Annotated[
+        Literal["turn/startBoundedIfIdle"], Field(title="Turn/startBoundedIfIdleRequestMethod")
+    ]
+    params: TurnStartBoundedIfIdleParams
+
+
+class ClientRequest(
+    RootModel[
+        InitializeRequest
+        | ThreadStartRequest
+        | ThreadResumeRequest
+        | ThreadForkRequest
+        | ThreadArchiveRequest
+        | ThreadDeleteRequest
+        | ThreadUnsubscribeRequest
+        | ThreadNameSetRequest
+        | ThreadGoalSnapshotRequest
+        | ThreadGoalConditionalActivateRequest
+        | ThreadGoalConditionalSetRequest
+        | ThreadGoalConditionalClearRequest
+        | ThreadGoalSetRequest
+        | ThreadGoalGetRequest
+        | ThreadGoalClearRequest
+        | ThreadMetadataUpdateRequest
+        | ThreadAttachmentAddRequest
+        | ThreadAttachmentListRequest
+        | ThreadAttachmentOwnerListRequest
+        | ThreadAttachmentRemoveRequest
+        | ThreadSectionMoveRequest
+        | ThreadUnarchiveRequest
+        | ThreadCompactStartRequest
+        | ThreadShellCommandRequest
+        | ThreadApproveGuardianDeniedActionRequest
+        | ThreadRevertRequest
+        | ThreadListRequest
+        | ThreadSectionListRequest
+        | ThreadSectionCreateRequest
+        | ThreadSectionUpdateRequest
+        | ThreadSectionDeleteRequest
+        | ThreadLoadedListRequest
+        | ThreadReadRequest
+        | ThreadTurnsListRequest
+        | ThreadItemsListRequest
+        | ThreadInjectItemsRequest
+        | SkillsListRequest
+        | SkillsExtraRootsSetRequest
+        | HooksListRequest
+        | MarketplaceAddRequest
+        | MarketplaceRemoveRequest
+        | MarketplaceUpgradeRequest
+        | PluginListRequest
+        | PluginInstalledRequest
+        | PluginReconcileRequest
+        | PluginReadRequest
+        | PluginSkillReadRequest
+        | PluginShareSaveRequest
+        | PluginShareUpdateTargetsRequest
+        | PluginShareListRequest
+        | PluginShareCheckoutRequest
+        | PluginShareDeleteRequest
+        | AppReadRequest
+        | AppListRequest
+        | AppInstalledRequest
+        | FsReadFileRequest
+        | FsWriteFileRequest
+        | FsCreateDirectoryRequest
+        | FsGetMetadataRequest
+        | FsReadDirectoryRequest
+        | FsRemoveRequest
+        | FsCopyRequest
+        | FsWatchRequest
+        | FsUnwatchRequest
+        | SkillsConfigWriteRequest
+        | PluginInstallRequest
+        | PluginUninstallRequest
+        | TurnStartRequest
+        | TurnStartIfIdleRequest
+        | TurnStartBoundedIfIdleRequest
+        | TurnSteerRequest
+        | TurnInterruptRequest
+        | ReviewStartRequest
+        | ModelListRequest
+        | AccountGatewayOAuthReadRequest
+        | AccountGatewayOAuthLoginRequest
+        | AccountGatewayOAuthCancelRequest
+        | ModelProviderCapabilitiesReadRequest
+        | ExperimentalFeatureListRequest
+        | PermissionProfileListRequest
+        | ExperimentalFeatureEnablementSetRequest
+        | McpServerOauthLoginRequest
+        | ConfigMcpServerReloadRequest
+        | McpServerStatusListRequest
+        | McpServerResourceReadRequest
+        | McpServerToolCallRequest
+        | WindowsSandboxSetupStartRequest
+        | WindowsSandboxReadinessRequest
+        | AccountLoginStartRequest
+        | AccountLoginCancelRequest
+        | AccountLogoutRequest
+        | AccountRateLimitsReadRequest
+        | AccountRateLimitResetCreditConsumeRequest
+        | AccountUsageReadRequest
+        | AccountWorkspaceMessagesReadRequest
+        | AccountSendAddCreditsNudgeEmailRequest
+        | FeedbackUploadRequest
+        | FeedbackSaveRequest
+        | CommandExecRequest
+        | CommandExecWriteRequest
+        | CommandExecTerminateRequest
+        | CommandExecResizeRequest
+        | ConfigReadRequest
+        | ExternalAgentConfigDetectRequest
+        | ExternalAgentConfigImportRequest
+        | ExternalAgentConfigImportRecordHistoryRequest
+        | ExternalAgentConfigImportReadHistoriesRequest
+        | ConfigValueWriteRequest
+        | ConfigBatchWriteRequest
+        | ConfigRequirementsReadRequest
+        | AccountReadRequest
+        | FuzzyFileSearchRequest
+    ]
+):
+    root: Annotated[
+        InitializeRequest
+        | ThreadStartRequest
+        | ThreadResumeRequest
+        | ThreadForkRequest
+        | ThreadArchiveRequest
+        | ThreadDeleteRequest
+        | ThreadUnsubscribeRequest
+        | ThreadNameSetRequest
+        | ThreadGoalSnapshotRequest
+        | ThreadGoalConditionalActivateRequest
+        | ThreadGoalConditionalSetRequest
+        | ThreadGoalConditionalClearRequest
+        | ThreadGoalSetRequest
+        | ThreadGoalGetRequest
+        | ThreadGoalClearRequest
+        | ThreadMetadataUpdateRequest
+        | ThreadAttachmentAddRequest
+        | ThreadAttachmentListRequest
+        | ThreadAttachmentOwnerListRequest
+        | ThreadAttachmentRemoveRequest
+        | ThreadSectionMoveRequest
+        | ThreadUnarchiveRequest
+        | ThreadCompactStartRequest
+        | ThreadShellCommandRequest
+        | ThreadApproveGuardianDeniedActionRequest
+        | ThreadRevertRequest
+        | ThreadListRequest
+        | ThreadSectionListRequest
+        | ThreadSectionCreateRequest
+        | ThreadSectionUpdateRequest
+        | ThreadSectionDeleteRequest
+        | ThreadLoadedListRequest
+        | ThreadReadRequest
+        | ThreadTurnsListRequest
+        | ThreadItemsListRequest
+        | ThreadInjectItemsRequest
+        | SkillsListRequest
+        | SkillsExtraRootsSetRequest
+        | HooksListRequest
+        | MarketplaceAddRequest
+        | MarketplaceRemoveRequest
+        | MarketplaceUpgradeRequest
+        | PluginListRequest
+        | PluginInstalledRequest
+        | PluginReconcileRequest
+        | PluginReadRequest
+        | PluginSkillReadRequest
+        | PluginShareSaveRequest
+        | PluginShareUpdateTargetsRequest
+        | PluginShareListRequest
+        | PluginShareCheckoutRequest
+        | PluginShareDeleteRequest
+        | AppReadRequest
+        | AppListRequest
+        | AppInstalledRequest
+        | FsReadFileRequest
+        | FsWriteFileRequest
+        | FsCreateDirectoryRequest
+        | FsGetMetadataRequest
+        | FsReadDirectoryRequest
+        | FsRemoveRequest
+        | FsCopyRequest
+        | FsWatchRequest
+        | FsUnwatchRequest
+        | SkillsConfigWriteRequest
+        | PluginInstallRequest
+        | PluginUninstallRequest
+        | TurnStartRequest
+        | TurnStartIfIdleRequest
+        | TurnStartBoundedIfIdleRequest
+        | TurnSteerRequest
+        | TurnInterruptRequest
+        | ReviewStartRequest
+        | ModelListRequest
+        | AccountGatewayOAuthReadRequest
+        | AccountGatewayOAuthLoginRequest
+        | AccountGatewayOAuthCancelRequest
+        | ModelProviderCapabilitiesReadRequest
+        | ExperimentalFeatureListRequest
+        | PermissionProfileListRequest
+        | ExperimentalFeatureEnablementSetRequest
+        | McpServerOauthLoginRequest
+        | ConfigMcpServerReloadRequest
+        | McpServerStatusListRequest
+        | McpServerResourceReadRequest
+        | McpServerToolCallRequest
+        | WindowsSandboxSetupStartRequest
+        | WindowsSandboxReadinessRequest
+        | AccountLoginStartRequest
+        | AccountLoginCancelRequest
+        | AccountLogoutRequest
+        | AccountRateLimitsReadRequest
+        | AccountRateLimitResetCreditConsumeRequest
+        | AccountUsageReadRequest
+        | AccountWorkspaceMessagesReadRequest
+        | AccountSendAddCreditsNudgeEmailRequest
+        | FeedbackUploadRequest
+        | FeedbackSaveRequest
+        | CommandExecRequest
+        | CommandExecWriteRequest
+        | CommandExecTerminateRequest
+        | CommandExecResizeRequest
+        | ConfigReadRequest
+        | ExternalAgentConfigDetectRequest
+        | ExternalAgentConfigImportRequest
+        | ExternalAgentConfigImportRecordHistoryRequest
+        | ExternalAgentConfigImportReadHistoriesRequest
+        | ConfigValueWriteRequest
+        | ConfigBatchWriteRequest
+        | ConfigRequirementsReadRequest
+        | AccountReadRequest
+        | FuzzyFileSearchRequest,
+        Field(description="Request from the client to the server.", title="ClientRequest"),
     ]

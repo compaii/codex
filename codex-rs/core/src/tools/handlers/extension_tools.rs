@@ -65,6 +65,16 @@ impl ToolExecutor<ToolInvocation> for ExtensionToolAdapter {
         ToolInvocation: 'a,
     {
         Box::pin(async move {
+            let name = self.0.tool_name();
+            if name.is_default_namespace()
+                && matches!(name.name.as_str(), "create_goal" | "update_goal")
+                && crate::turn_inference::allowance(&invocation.turn).is_some()
+            {
+                return Err(codex_tools::FunctionCallError::RespondToModel(
+                    "Bounded attention cannot create or modify goals; human goal controls remain available."
+                        .into(),
+                ));
+            }
             let step = &invocation.step_context;
             let selected: Vec<_> = match &invocation.environments {
                 ToolEnvironments::Arguments(environments) => {

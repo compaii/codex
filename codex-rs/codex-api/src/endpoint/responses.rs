@@ -1,3 +1,4 @@
+use crate::InferenceAllowance;
 use crate::auth::SharedAuthProvider;
 use crate::common::ResponseStream;
 use crate::common::ResponsesApiRequest;
@@ -44,6 +45,14 @@ impl<T: HttpTransport> ResponsesClient<T> {
             session: EndpointSession::new(transport, provider, auth),
             sse_telemetry: None,
         }
+    }
+
+    /// Meter this execution with one already-reserved allowance. HTTP transports
+    /// must support single-attempt requests (for example `without_replays()`);
+    /// an unknown/replay-enabled transport is refused before sending.
+    pub fn with_inference_allowance(mut self, allowance: Arc<InferenceAllowance>) -> Self {
+        self.session = self.session.with_inference_allowance(allowance);
+        self
     }
 
     pub fn with_telemetry(
