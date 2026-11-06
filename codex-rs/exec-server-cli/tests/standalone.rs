@@ -25,10 +25,33 @@ use tokio::io::BufReader;
 #[tokio::test]
 async fn standalone_initializes_reports_version_and_runs_helpers() -> anyhow::Result<()> {
     let binary = cargo_bin("codex-exec-server")?;
+    exercise_standalone(&binary, "0.0.0").await
+}
+
+#[tokio::test]
+async fn packaged_standalone_initializes_reports_version_and_runs_helpers() -> anyhow::Result<()> {
+    let package = tempfile::tempdir()?;
+    let bin = package.path().join("bin");
+    std::fs::create_dir(&bin)?;
+    let binary = bin.join(format!("codex-exec-server{}", std::env::consts::EXE_SUFFIX));
+    codex_utils_cargo_bin::copy_executable(&cargo_bin("codex-exec-server")?, &binary)?;
+    // BuildInfo reads release identity from the package, not the CLI version flag.
+    // Match the minimal manifest fixture used by exec-server's initialize tests.
+    std::fs::write(
+        package.path().join("codex-package.json"),
+        serde_json::to_vec(&json!({"version": env!("CARGO_PKG_VERSION")}))?,
+    )?;
+    exercise_standalone(&binary, env!("CARGO_PKG_VERSION")).await
+}
+
+async fn exercise_standalone(
+    binary: &std::path::Path,
+    expected_version: &str,
+) -> anyhow::Result<()> {
     let directory = tempfile::tempdir()?;
     let cwd = url::Url::from_directory_path(directory.path())
         .map_err(|()| anyhow::anyhow!("file URI"))?;
-    let version = tokio::process::Command::from(background_command(&binary))
+    let version = tokio::process::Command::from(background_command(binary))
         .arg("--version")
         .env("CODEX_HOME", directory.path())
         .output()
@@ -71,7 +94,7 @@ async fn standalone_initializes_reports_version_and_runs_helpers() -> anyhow::Re
         sandboxes
     };
     for sandbox in sandboxes {
-        let mut child = tokio::process::Command::from(background_command(&binary))
+        let mut child = tokio::process::Command::from(background_command(binary))
             .args(["--listen", "stdio"])
             .current_dir(directory.path())
             .env("CODEX_HOME", directory.path())
@@ -90,7 +113,7 @@ async fn standalone_initializes_reports_version_and_runs_helpers() -> anyhow::Re
         assert_eq!(response["id"], 1);
         assert!(response["result"]["sessionId"].is_string(), "{response}");
         let environment = response["result"]["environmentInfo"].clone();
-        assert_eq!(environment["executorVersion"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(environment["executorVersion"], expected_version);
         let initialized = json!({"method": "initialized", "params": {}});
         let info = json!({"id": 2, "method": "environment/info", "params": {}});
         stdin

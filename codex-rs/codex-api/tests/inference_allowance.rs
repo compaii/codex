@@ -39,7 +39,9 @@ use wiremock::matchers::path;
 
 struct NoAuth;
 impl AuthProvider for NoAuth {
-    fn add_auth_headers(&self, _: &mut HeaderMap) {}
+    fn add_auth_headers(&self, _: &mut HeaderMap) -> Result<(), codex_api::AuthError> {
+        Ok(())
+    }
 }
 
 fn client(
@@ -383,7 +385,9 @@ async fn inference_allowance_deadline_covers_retry_after_wait() {
 
 struct EnlargingAuth;
 impl AuthProvider for EnlargingAuth {
-    fn add_auth_headers(&self, _: &mut HeaderMap) {}
+    fn add_auth_headers(&self, _: &mut HeaderMap) -> Result<(), codex_api::AuthError> {
+        Ok(())
+    }
     fn apply_auth(&self, request: codex_client::Request) -> codex_api::AuthProviderFuture<'_> {
         Box::pin(async move { Ok(request.with_json(&json!({"input":"x".repeat(4096)}))) })
     }

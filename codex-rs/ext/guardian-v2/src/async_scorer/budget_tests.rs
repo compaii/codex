@@ -351,6 +351,7 @@ async fn bounded_attention_invalidates_cached_scores_without_classification() ->
             root_turn_id: None,
             call_id: "bounded-review-action",
             originating_item_id: None,
+            serving_assessment: None,
             tool_name: &tool_name,
             mcp_tool: None,
             payload: &payload,
