@@ -59,6 +59,10 @@ impl InferenceAllowance {
         self.deadline
     }
 
+    pub fn max_request_bytes(&self) -> usize {
+        self.max_request_bytes
+    }
+
     /// Validate the complete logical request BEFORE compression or incremental
     /// WebSocket encoding. This does not consume an attempt.
     pub fn validate_request(&self, bytes: usize) -> Result<(), InferenceAllowanceError> {

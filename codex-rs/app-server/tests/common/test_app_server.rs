@@ -336,7 +336,14 @@ impl TestAppServer {
             tokio::spawn(async move {
                 while let Ok(Some(line)) = stderr_reader.next_line().await {
                     json_logs.record(line.clone());
-                    eprintln!("[mcp stderr] {line}");
+                    if line.len() <= 8192 {
+                        eprintln!("[mcp stderr] {line}");
+                    } else {
+                        eprintln!(
+                            "[mcp stderr] large diagnostic body omitted ({} bytes)",
+                            line.len()
+                        );
+                    }
                 }
             });
         }
@@ -1652,11 +1659,18 @@ impl TestAppServer {
     }
 
     async fn send_jsonrpc_message(&mut self, message: JSONRPCMessage) -> anyhow::Result<()> {
-        eprintln!("writing message to stdin: {message:?}");
         let Some(stdin) = self.stdin.as_mut() else {
             anyhow::bail!("mcp stdin closed");
         };
         let payload = serde_json::to_string(&message)?;
+        if payload.len() <= 8192 {
+            eprintln!("writing message to stdin: {message:?}");
+        } else {
+            eprintln!(
+                "writing large JSON-RPC message to stdin ({} bytes; body omitted)",
+                payload.len()
+            );
+        }
         stdin.write_all(payload.as_bytes()).await?;
         stdin.write_all(b"\n").await?;
         stdin.flush().await?;
@@ -1667,7 +1681,14 @@ impl TestAppServer {
         let mut line = String::new();
         self.stdout.read_line(&mut line).await?;
         let message = serde_json::from_str::<JSONRPCMessage>(&line)?;
-        eprintln!("read message from stdout: {message:?}");
+        if line.len() <= 8192 {
+            eprintln!("read message from stdout: {message:?}");
+        } else {
+            eprintln!(
+                "read large JSON-RPC message from stdout ({} bytes; body omitted)",
+                line.len()
+            );
+        }
         Ok(message)
     }
 
