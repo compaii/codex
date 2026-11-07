@@ -7,6 +7,10 @@
     }
   },
   "properties": {
+    "boundedIdleTurn": {
+      "description": "This server implements the finite, idle-only turn admission primitive. This advertises support only, never permission, funding, availability of a particular thread/provider or evidence that a turn was submitted. Older servers omit it; clients must treat omission as unsupported.",
+      "type": "boolean"
+    },
     "codexHome": {
       "allOf": [
         {

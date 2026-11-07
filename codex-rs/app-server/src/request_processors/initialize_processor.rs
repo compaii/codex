@@ -214,6 +214,7 @@ impl InitializeRequestProcessor {
         let user_agent = get_codex_user_agent();
         let response = InitializeResponse {
             user_agent,
+            bounded_idle_turn: true,
             codex_home,
             platform_family: std::env::consts::FAMILY.to_string(),
             platform_os: std::env::consts::OS.to_string(),

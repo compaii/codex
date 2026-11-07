@@ -809,3 +809,14 @@ Tracestate requirements merge individual fields within each member. For example,
 requiring `otel.tracestate.vendor.tenant` preserves an ordinary `vendor.region`.
 Only required fields and edits to their ancestors are protected; sibling fields
 retain their origins and remain writable.
+
+### Bounded idle-turn support observation
+
+The read-only `initialize` response includes `boundedIdleTurn: true` when this
+server implements `turn/startBoundedIfIdle`. Omission means unsupported; it must
+not trigger a mutation probe, ordinary-turn fallback or model call. This is an
+advertisement of the actual serving implementation, not permission, funding,
+provider health, idle capacity or proof of execution. A client reporting current
+operational readiness must separately inspect its selected thread/profile,
+finite resources, exact generation fences and live source observation. The
+existing bounded admission still revalidates the request atomically.
