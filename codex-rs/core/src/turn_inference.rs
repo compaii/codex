@@ -1,10 +1,12 @@
 //! Native turn-local allocation. Never saved as a reusable thread setting.
 use crate::client::ModelClientSession;
+use crate::client_common::Prompt;
 use crate::session::turn_context::TurnContext;
 use codex_api::InferenceAllowance;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
 use codex_protocol::turn_input::TurnInferenceAllowance;
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -42,6 +44,42 @@ pub(crate) fn allowance(ctx: &TurnContext) -> Option<Arc<InferenceAllowance>> {
     ctx.extension_data
         .get::<Arc<InferenceAllowance>>()
         .map(|value| Arc::clone(value.as_ref()))
+}
+
+/// Project only the request copy, after all prompt consumers have selected the
+/// original history. Compaction installation therefore keeps original images.
+/// The complete transport guard remains authoritative; this is no larger grant.
+pub(crate) async fn project_prompt<'a>(
+    prompt: &'a Prompt,
+    allowance: Option<&Arc<InferenceAllowance>>,
+    current_turn: Option<&str>,
+) -> Result<Cow<'a, Prompt>> {
+    let (Some(allowance), Some(current_turn)) = (allowance, current_turn) else {
+        return Ok(Cow::Borrowed(prompt));
+    };
+    // Reserve room for tools, instructions and framing. Text and current input
+    // are never truncated to manufacture a successful allowance check.
+    let budget = allowance.max_request_bytes() / 2;
+    if crate::utils::json::serialized_json_bytes(&prompt.input).unwrap_or(usize::MAX) <= budget {
+        return Ok(Cow::Borrowed(prompt));
+    }
+    let mut projected = prompt.clone();
+    let current_turn = current_turn.to_owned();
+    let projected = tokio::task::spawn_blocking(move || {
+        crate::context_manager::bound_historical_image_previews(
+            &mut projected.input,
+            &current_turn,
+            budget,
+        );
+        projected
+    })
+    .await
+    .map_err(|_| {
+        CodexErr::Stream(
+            "Bounded historical image projection unavailable; no request was sent".into(),
+        )
+    })?;
+    Ok(Cow::Owned(projected))
 }
 
 /// Agent starts need an owner-reserved child admission, not a copied root cap.

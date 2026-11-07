@@ -79,3 +79,29 @@ the execution owner must use the existing native cancellation path and retain
 terminal versus uncertain observation. These are request/input/time bounds,
 not a hard total-token, output-token or monetary ceiling. No model/provider,
 account, goal or tool authority is granted by this value.
+
+
+## Historical image previews in bounded requests
+
+A long-lived thread can retain inline historical images whose encoded bytes alone
+exceed a finite request allowance. Bounded model requests prepare reduced previews
+of images positively attributed to older turns through the existing image
+resizer/cache. This changes the model request copy only. Persisted native history,
+compaction installation inputs, all text, current-turn images and images without
+known turn provenance remain unchanged. A harness-attributed observation explains
+previews or explicit omission placeholders; it never invents human speech.
+
+Half the complete request bound is reserved for the history projection; the
+remaining space accommodates tools, instructions and final framing. Historical
+inline images share only the space remaining after preserved input. Existing
+finite resize modes are tried before an explicit placeholder. This heuristic
+cannot authorize a request: final complete HTTP/WebSocket size validation stays
+unchanged and still rejects any request that does not fit. Ordinary unbounded
+requests use their original prompt. Local and foreground remote compaction pass
+through the same request projection without installing reduced originals.
+
+Qualification must cover oversized historical images reaching the first bounded
+provider request within its original cap, unchanged current images/text, unknown
+provenance, original history preservation, ordinary requests and both transports.
+The source change alone is not installed receiving behavior or a successful
+message/reply journey.

@@ -590,6 +590,14 @@ async fn start_function_dynamic_tool_call_with_responses(
     call_id: &str,
     extra_responses: Vec<String>,
 ) -> Result<PendingDynamicToolCall> {
+    start_function_dynamic_tool_call_with_history_image(call_id, extra_responses, None).await
+}
+
+async fn start_function_dynamic_tool_call_with_history_image(
+    call_id: &str,
+    extra_responses: Vec<String>,
+    history_image: Option<&str>,
+) -> Result<PendingDynamicToolCall> {
     let tool_name = "demo_tool";
     let tool_args = json!({ "city": "Paris" });
     let tool_call_arguments = serde_json::to_string(&tool_args)?;
@@ -647,14 +655,23 @@ async fn start_function_dynamic_tool_call_with_responses(
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
     let thread_id = thread.id.clone();
 
+    let mut input = vec![V2UserInput::Text {
+        text: "Run the tool".to_string(),
+        text_elements: Vec::new(),
+    }];
+    if let Some(url) = history_image {
+        input.push(V2UserInput::Image {
+            image: codex_app_server_protocol::ImageReference::Inline {
+                url: url.to_owned(),
+            },
+            detail: None,
+        });
+    }
     let turn_req = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread_id.clone(),
             client_user_message_id: None,
-            input: vec![V2UserInput::Text {
-                text: "Run the tool".to_string(),
-                text_elements: Vec::new(),
-            }],
+            input,
             ..Default::default()
         })
         .await?;
@@ -1032,6 +1049,21 @@ async fn bounded_idle_turn_refuses_busy_then_starts_with_required_allocation() -
 }
 
 async fn exercise_idle_only_turn(bounded: bool) -> Result<()> {
+    // Valid PNG with substantial trailing bytes: ordinary requests retain the
+    // exact source; a bounded historical projection must fit its existing cap.
+    // Real textured-image preview quality has separate Core/retained-history tests.
+    let history_image = if bounded {
+        use base64::Engine;
+        let mut png = base64::engine::general_purpose::STANDARD
+            .decode(TINY_PNG_DATA_URL.split_once(',').unwrap().1)?;
+        png.resize(1024 * 1024, 0);
+        Some(format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(png)
+        ))
+    } else {
+        None
+    };
     let reply = if bounded {
         responses::sse(vec![
             responses::ev_response_created("bounded-reply"),
@@ -1047,7 +1079,19 @@ async fn exercise_idle_only_turn(bounded: bool) -> Result<()> {
         server,
         request_id,
         params,
-    } = start_function_dynamic_tool_call_with_responses("human-held-tool", vec![reply]).await?;
+    } = start_function_dynamic_tool_call_with_history_image(
+        "human-held-tool",
+        if bounded {
+            vec![
+                reply,
+                create_final_assistant_message_sse_response("Ordinary work preserved")?,
+            ]
+        } else {
+            vec![reply]
+        },
+        history_image.as_deref(),
+    )
+    .await?;
     let marker = "Exact heartbeat context: not a human utterance";
     let heartbeat = TurnStartParams {
         thread_id: params.thread_id.clone(),
@@ -1115,6 +1159,12 @@ async fn exercise_idle_only_turn(bounded: bool) -> Result<()> {
     .await??;
     let before = responses_bodies(&server).await?;
     assert_eq!(before.len(), 2);
+    if bounded {
+        assert!(
+            serde_json::to_vec(&before[0])?.len() > 1024 * 1024,
+            "Fixture must actually exceed the later bounded request cap"
+        );
+    }
     assert!(
         !serde_json::to_string(&before)?.contains(marker),
         "Refused input must not be queued or enter human context"
@@ -1167,6 +1217,12 @@ async fn exercise_idle_only_turn(bounded: bool) -> Result<()> {
     }
     let bodies = responses_bodies(&server).await?;
     assert_eq!(bodies.len(), 3);
+    if bounded {
+        assert!(
+            serde_json::to_vec(&bodies[2])?.len() <= 1024 * 1024,
+            "Complete first bounded model request must fit its unchanged allowance"
+        );
+    }
     let input = bodies[2]["input"]
         .as_array()
         .context("Model input missing")?;
@@ -1183,5 +1239,42 @@ async fn exercise_idle_only_turn(bounded: bool) -> Result<()> {
             .any(|item| item["role"] == "user" && item.to_string().contains(marker)),
         "Internal context must not impersonate human input"
     );
+    if let Some(original_image) = history_image {
+        let ordinary = mcp
+            .send_turn_start_request(TurnStartParams {
+                thread_id: params.thread_id.clone(),
+                input: vec![V2UserInput::Text {
+                    text: "Independent ordinary follow-up".into(),
+                    text_elements: vec![],
+                }],
+                ..Default::default()
+            })
+            .await?;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_response::<TurnStartResponse>(ordinary),
+        )
+        .await??;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("turn/completed"),
+        )
+        .await??;
+        let ordinary_bodies = responses_bodies(&server).await?;
+        assert_eq!(ordinary_bodies.len(), 4);
+        assert!(
+            serde_json::to_vec(&ordinary_bodies[3])?.len() > 1024 * 1024,
+            "Ordinary request must retain the original history rather than the reduced bounded projection"
+        );
+        assert!(
+            ordinary_bodies[3]["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item["content"].as_array())
+                .flatten()
+                .any(|part| part["image_url"] == original_image)
+        );
+    }
     Ok(())
 }

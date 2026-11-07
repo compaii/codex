@@ -2590,6 +2590,13 @@ impl ModelClientSession {
         responses_metadata: &CodexResponsesMetadata,
         inference_trace: &InferenceTraceContext,
     ) -> Result<ResponseStream> {
+        let projected_prompt = crate::turn_inference::project_prompt(
+            prompt,
+            self.inference_allowance.as_ref(),
+            responses_metadata.turn_id.as_deref(),
+        )
+        .await?;
+        let prompt = projected_prompt.as_ref();
         let wire_api = self.client.state.provider.info().wire_api;
         match wire_api {
             WireApi::Responses => {
