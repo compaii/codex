@@ -292,6 +292,26 @@ pub(super) async fn handle(
             )
             .await
         }
+        TurnInputMode::StartIfIdleAfter {
+            expected_previous_turn_id,
+        } => {
+            if !matches!(
+                &request.request.input,
+                SubmittedTurnInput::ResponseItem(_) | SubmittedTurnInput::AnnotatedResponseItem(_)
+            ) {
+                return Err(CodexErr::InvalidRequest(
+                    "checkpoint admission requires internal response input".into(),
+                ));
+            }
+            start_if_idle(
+                session,
+                request,
+                submission_id,
+                TurnStartKind::Automatic,
+                Some(expected_previous_turn_id),
+            )
+            .await
+        }
         TurnInputMode::ContinueIfIdle {
             expected_previous_turn_id,
         } => {
@@ -579,7 +599,8 @@ async fn start_if_idle(
                     reason: NotSubmittedReason::Superseded,
                 });
             }
-            if start.inference_allowance.is_none()
+            if kind == TurnStartKind::Recovery
+                && start.inference_allowance.is_none()
                 && state.turn_attribution.as_ref().is_some_and(|prior| {
                     prior.turn_id == expected && prior.inference_allowance.is_some()
                 })

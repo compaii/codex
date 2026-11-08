@@ -98,6 +98,12 @@ jobs:
         run: cargo test --locked --profile dev-small -j 2 -p codex-app-server-protocol --lib
       - name: Actual read-only bounded idle support advertisement
         run: cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all v2::initialize -- --nocapture
+      - name: Scoped goal checkpoints, human priority and physical supersession
+        run: |
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-core --lib goal_idle_checkpoints_are_scoped_bounded_and_optional
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-core --lib checkpoint_automatic_input_refuses_superseded_physical_turn_and_user_input
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-core --lib bounded_predecessor_refuses_an_unreserved_direct_continuation
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all goal_checkpoint_yields_without_pausing_or_blocking_human_input
       - name: State goal accounting and conditional transactions
         run: cargo test --locked --profile dev-small -j 2 -p codex-state --lib goals
       - name: Goal extension

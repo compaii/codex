@@ -991,6 +991,8 @@ pub struct Config {
 
     /// Maximum token budget allowed for a goal and default budget for new goals.
     pub max_goal_token_budget: Option<i64>,
+    /// Owner-selected per-thread idle checkpoints for automatic goal continuation.
+    pub goal_continuation_idle_seconds: BTreeMap<String, u16>,
 
     /// Memories subsystem settings.
     pub memories: MemoriesConfig,
@@ -4638,6 +4640,7 @@ impl Config {
                     })
                 })
                 .transpose()?,
+            goal_continuation_idle_seconds: validated_goal_continuation_idle_seconds(cfg.goals.as_ref())?,
             memories: memories_config,
             agent_interrupt_message_enabled,
             codex_home,
@@ -5261,3 +5264,24 @@ mod tests;
 #[cfg(test)]
 #[path = "config_loader_tests.rs"]
 mod config_loader_tests;
+
+fn validated_goal_continuation_idle_seconds(
+    goals: Option<&codex_config::config_toml::GoalsToml>,
+) -> std::io::Result<BTreeMap<String, u16>> {
+    let values = goals
+        .map(|g| g.continuation_idle_seconds.clone())
+        .unwrap_or_default();
+    if values.len() > 128
+        || values.iter().any(|(id, seconds)| {
+            *seconds > 300
+                || codex_protocol::ThreadId::from_string(id)
+                    .map_or(true, |thread| thread.to_string() != *id)
+        })
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "goals.continuation_idle_seconds requires at most 128 canonical thread IDs with 0..=300 seconds",
+        ));
+    }
+    Ok(values)
+}
