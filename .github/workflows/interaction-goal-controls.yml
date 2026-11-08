@@ -96,6 +96,8 @@ jobs:
         run: uv run --project ../sdk/python --frozen --only-group test python ../sdk/python/scripts/update_sdk_artifacts.py generate-types --schema-dir app-server-protocol/schema/json
       - name: Protocol exports and schema contracts
         run: cargo test --locked --profile dev-small -j 2 -p codex-app-server-protocol --lib
+      - name: Actual read-only bounded idle support advertisement
+        run: cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all v2::initialize -- --nocapture
       - name: State goal accounting and conditional transactions
         run: cargo test --locked --profile dev-small -j 2 -p codex-state --lib goals
       - name: Goal extension
