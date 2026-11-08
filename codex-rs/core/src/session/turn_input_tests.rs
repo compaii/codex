@@ -2343,3 +2343,57 @@ async fn host_command_environment_requires_explicit_bounded_non_profile_values()
             .is_ok()
     );
 }
+
+#[tokio::test]
+async fn checkpoint_automatic_input_refuses_superseded_physical_turn_and_user_input() {
+    let (session, _) = make_session_and_context().await;
+    let session = Arc::new(session);
+    session.state.lock().await.last_started_turn_id = Some("newer-completed-turn".into());
+    let input = TurnInputRequest::new(SubmittedTurnInput::ResponseItem(
+        ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: None,
+            name: Some("automatic_continuation".into()),
+            namespace: None,
+            output: codex_protocol::models::FunctionCallOutputPayload {
+                body: codex_protocol::models::FunctionCallOutputBody::Text("existing goal".into()),
+                success: None,
+            },
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ));
+    let outcome = handle(
+        &session,
+        input,
+        TurnInputMode::StartIfIdleAfter {
+            expected_previous_turn_id: "older-turn".into(),
+        },
+        "stale-checkpoint".into(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        outcome,
+        TurnInputSubmission::NotSubmitted {
+            reason: NotSubmittedReason::Superseded
+        }
+    ));
+    assert!(session.active_turn.lock().await.is_none());
+    let input = TurnInputRequest::new(SubmittedTurnInput::UserInput {
+        content: vec![],
+        client_id: None,
+    });
+    assert!(
+        handle(
+            &session,
+            input,
+            TurnInputMode::StartIfIdleAfter {
+                expected_previous_turn_id: "newer-completed-turn".into()
+            },
+            "fake-human".into()
+        )
+        .await
+        .is_err()
+    );
+    assert!(session.active_turn.lock().await.is_none());
+}

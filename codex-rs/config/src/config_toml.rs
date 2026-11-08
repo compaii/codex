@@ -759,6 +759,10 @@ where
 pub struct GoalsToml {
     /// Maximum token budget allowed for a goal and default budget for new goals.
     pub max_goal_token_budget: Option<NonZeroU64>,
+    /// Optional idle checkpoint before automatic continuation, keyed by canonical thread ID.
+    /// Values are seconds (0..=300); no goal definition, budget or direct-input change.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub continuation_idle_seconds: BTreeMap<String, u16>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]

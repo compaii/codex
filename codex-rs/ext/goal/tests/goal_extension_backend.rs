@@ -108,6 +108,7 @@ async fn installed_goal_tools_apply_maximum_token_budget() -> anyhow::Result<()>
     harness.thread_store.insert(GoalExtensionConfig {
         enabled: true,
         max_goal_token_budget: Some(100),
+        continuation_idle_seconds: Default::default(),
     });
     let tools = harness.tools();
     let create_tool = tool_by_name(&tools, "create_goal");
@@ -1665,6 +1666,7 @@ async fn installed_tools_with_start(
         |_| GoalExtensionConfig {
             enabled: true,
             max_goal_token_budget: None,
+            continuation_idle_seconds: Default::default(),
         },
     );
     let registry = builder.build();
@@ -1722,6 +1724,7 @@ impl GoalExtensionHarness {
             |_| GoalExtensionConfig {
                 enabled: true,
                 max_goal_token_budget: None,
+                continuation_idle_seconds: Default::default(),
             },
         );
         let registry = Arc::new(builder.build());

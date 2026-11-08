@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Weak;
 
@@ -54,6 +55,7 @@ use crate::tool::GoalToolExecutor;
 pub struct GoalExtensionConfig {
     pub enabled: bool,
     pub max_goal_token_budget: Option<i64>,
+    pub continuation_idle_seconds: BTreeMap<String, u16>,
 }
 
 #[derive(Clone)]
@@ -193,7 +195,19 @@ where
                 }
                 accounting.finish_turn(&turn_id);
             }
-            if let Err(err) = runtime.continue_if_idle().await {
+            let seconds = input
+                .thread_store
+                .get::<GoalExtensionConfig>()
+                .and_then(|c| {
+                    c.continuation_idle_seconds
+                        .get(&runtime.thread_id().to_string())
+                        .copied()
+                })
+                .unwrap_or_default();
+            if let Err(err) = runtime
+                .continue_after_idle_gap(std::time::Duration::from_secs(u64::from(seconds)))
+                .await
+            {
                 tracing::warn!(
                     "failed to continue active goal for idle thread {}: {err}",
                     runtime.thread_id()
@@ -205,6 +219,7 @@ where
     fn on_thread_stop<'a>(&'a self, input: ThreadStopInput<'a>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
             if let Some(runtime) = goal_runtime_handle(input.thread_store) {
+                runtime.cancel_idle_checkpoint();
                 self.goal_service.unregister_runtime(&runtime);
             }
         })
@@ -237,6 +252,9 @@ where
 {
     fn on_turn_start<'a>(&'a self, input: TurnStartInput<'a>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
+            if let Some(runtime) = goal_runtime_handle(input.thread_store) {
+                runtime.cancel_idle_checkpoint();
+            }
             if input
                 .turn_store
                 .get::<codex_protocol::turn_input::TurnInferenceAllowance>()
