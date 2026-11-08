@@ -192,7 +192,7 @@ command_windows = """Write-Output '{"continue":false}'"""
 #[test_case::test_case(true; "human_input_supersedes_checkpoint")]
 #[tokio::test]
 async fn goal_checkpoint_yields_without_pausing_or_blocking_human_input(human: bool) -> Result<()> {
-    let scripts = (1..=2)
+    let scripts = (1..=3)
         .map(|i| {
             responses::sse(vec![
                 responses::ev_response_created(&format!("checkpoint-{i}")),
@@ -216,6 +216,14 @@ async fn goal_checkpoint_yields_without_pausing_or_blocking_human_input(human: b
         .send_thread_start_request_with_auto_env(ThreadStartParams::default())
         .await?;
     let ThreadStartResponse { thread, .. } = app.read_response(request).await?;
+    // Empty threads have no persisted rollout: seed one genuine mock turn first.
+    let request=app.send_raw_request("turn/start",Some(json!({"threadId":thread.id,"input":[{"type":"text","text":"Seed durable checkpoint fixture","text_elements":[]}]}))).await?;
+    let _: serde_json::Value = app.read_response(request).await?;
+    let _: TurnCompletedNotification = timeout(
+        Duration::from_secs(30),
+        app.read_notification("turn/completed"),
+    )
+    .await??;
     app.shutdown_gracefully().await?;
     MockResponsesConfig::new(&server.uri())
         .with_model("gpt-5.4")
@@ -248,7 +256,7 @@ async fn goal_checkpoint_yields_without_pausing_or_blocking_human_input(human: b
             .await
             .expect("mock requests")
             .len(),
-        1
+        2
     );
     if human {
         let request=app.send_raw_request("turn/start",Some(json!({"threadId":thread.id,"input":[{"type":"text","text":"Direct human steering","text_elements":[]}]}))).await?;
@@ -284,7 +292,7 @@ async fn goal_checkpoint_yields_without_pausing_or_blocking_human_input(human: b
             .await
             .expect("mock requests")
             .len(),
-        2
+        3
     );
     app.shutdown_gracefully().await?;
     Ok(())
