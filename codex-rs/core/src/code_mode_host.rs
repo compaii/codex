@@ -65,6 +65,13 @@ impl CodeModeSessionProvider for LocalServerOutputProvider {
         self.create_session_with_limits(CodeModeSessionCellExecutionLimits::default())
     }
 
+    fn create_isolated_session_with_options<'a>(
+        &'a self,
+        options: CodeModeSessionOptions,
+    ) -> CodeModeSessionProviderFuture<'a> {
+        self.inner.create_isolated_session_with_options(options)
+    }
+
     fn create_session_with_limits<'a>(
         &'a self,
         limits: CodeModeSessionCellExecutionLimits,
@@ -87,6 +94,7 @@ impl CodeModeSessionProvider for LocalServerOutputProvider {
 pub struct ProcessOwnedGrpcCodeModeSessionProvider {
     host_program: PathBuf,
     provider: OnceLock<GrpcCodeModeSessionProvider>,
+    closed: Arc<AtomicBool>,
     current: Arc<Mutex<Option<HostChannel>>>,
 }
 
@@ -95,6 +103,7 @@ impl ProcessOwnedGrpcCodeModeSessionProvider {
         Self {
             host_program,
             provider: OnceLock::new(),
+            closed: Arc::new(AtomicBool::new(false)),
             current: Arc::new(Mutex::new(None)),
         }
     }
@@ -130,6 +139,18 @@ impl CodeModeSessionProvider for ProcessOwnedGrpcCodeModeSessionProvider {
         self.create_session_with_options(CodeModeSessionOptions::default())
     }
 
+    fn create_isolated_session_with_options<'a>(
+        &'a self,
+        options: CodeModeSessionOptions,
+    ) -> CodeModeSessionProviderFuture<'a> {
+        Box::pin(async move {
+            let owner = Arc::new(Self::with_host_program(self.host_program.clone()));
+            let inner = owner.create_session_with_options(options).await?;
+            Ok(Arc::new(IsolatedSession { inner, owner })
+                as Arc<dyn codex_code_mode::CodeModeSession>)
+        })
+    }
+
     fn create_session_with_limits<'a>(
         &'a self,
         limits: CodeModeSessionCellExecutionLimits,
@@ -150,6 +171,7 @@ impl CodeModeSessionProvider for ProcessOwnedGrpcCodeModeSessionProvider {
                 let transport = Arc::new(HostTransport {
                     host_program: self.host_program.clone(),
                     current: self.current.clone(),
+                    closed: self.closed.clone(),
                 });
                 GrpcCodeModeSessionProvider::with_transport(service_fn(move |request| {
                     let transport = transport.clone();
@@ -161,12 +183,67 @@ impl CodeModeSessionProvider for ProcessOwnedGrpcCodeModeSessionProvider {
     }
 }
 
+struct IsolatedSession {
+    inner: Arc<dyn codex_code_mode::CodeModeSession>,
+    owner: Arc<ProcessOwnedGrpcCodeModeSessionProvider>,
+}
+struct ClosePrivateHost<'a>(&'a ProcessOwnedGrpcCodeModeSessionProvider);
+impl Drop for ClosePrivateHost<'_> {
+    fn drop(&mut self) {
+        let mut current = self
+            .0
+            .current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.0.closed.store(true, Ordering::Release);
+        current.take();
+    }
+}
+impl Drop for IsolatedSession {
+    fn drop(&mut self) {
+        drop(ClosePrivateHost(&self.owner));
+    }
+}
+impl codex_code_mode::CodeModeSession for IsolatedSession {
+    fn output_truncation(&self) -> CodeModeOutputTruncation {
+        self.inner.output_truncation()
+    }
+    fn execute<'a>(
+        &'a self,
+        request: codex_code_mode::ExecuteRequest,
+        delegate: Arc<dyn codex_code_mode::CodeModeSessionDelegate>,
+        preempt: Option<tokio_util::sync::CancellationToken>,
+    ) -> CodeModeSessionResultFuture<'a, codex_code_mode::StartedCell> {
+        self.inner.execute(request, delegate, preempt)
+    }
+    fn wait<'a>(
+        &'a self,
+        request: codex_code_mode::WaitRequest,
+        preempt: Option<tokio_util::sync::CancellationToken>,
+    ) -> CodeModeSessionResultFuture<'a, codex_code_mode::WaitOutcome> {
+        self.inner.wait(request, preempt)
+    }
+    fn terminate<'a>(
+        &'a self,
+        request: codex_code_mode::TerminateRequest,
+    ) -> CodeModeSessionResultFuture<'a, codex_code_mode::WaitOutcome> {
+        self.inner.terminate(request)
+    }
+    fn shutdown<'a>(&'a self) -> CodeModeSessionResultFuture<'a, ()> {
+        Box::pin(async move {
+            let _close = ClosePrivateHost(&self.owner);
+            self.inner.shutdown().await
+        })
+    }
+}
+
 // Every channel gets exactly one child. Tonic's internal reconnect loop cannot
 // spawn a process, including if the child dies between a metrics liveness check
 // and dispatch. Session admission selects a new generation during recovery.
 struct HostTransport {
     host_program: PathBuf,
     current: Arc<Mutex<Option<HostChannel>>>,
+    closed: Arc<AtomicBool>,
 }
 
 struct HostChannel {
@@ -193,6 +270,9 @@ impl HostTransport {
     fn channel(&self, rpc_path: &str) -> Result<Channel, Status> {
         Ok({
             let mut current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
+            if self.closed.load(Ordering::Acquire) {
+                return Err(Status::unavailable("private code-mode host is closed"));
+            }
             if let Some(host) = current
                 .as_ref()
                 .filter(|host| host.alive.load(Ordering::Acquire))

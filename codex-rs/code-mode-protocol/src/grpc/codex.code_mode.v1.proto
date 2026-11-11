@@ -85,6 +85,8 @@ message SessionEvent {
 
 message SessionOpened {
   string session_id = 1;
+  // Positive resource enforcement acknowledgement; absent on older hosts.
+  optional SessionCellExecutionLimits applied_cell_execution_limits = 3;
   // Absent (including from an older host) means the client owns truncation.
   optional OutputTruncation output_truncation = 2;
 }

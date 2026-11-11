@@ -102,3 +102,69 @@ async fn shutdown_is_ordered_with_session_failure() {
     assert!(failed.stopped.is_cancelled());
     assert_eq!(wait_for_watch(failed.request_shutdown()).await, Ok(()));
 }
+
+#[tokio::test]
+async fn heap_limited_open_refuses_unacknowledged_or_mismatched_host() {
+    use codex_code_mode_protocol::CodeModeSessionCellExecutionLimits;
+    use codex_code_mode_protocol::CodeModeSessionOptions;
+    use codex_code_mode_protocol::CodeModeSessionProvider;
+    use codex_code_mode_protocol::grpc;
+    use prost::Message;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    for applied in [
+        None,
+        Some(grpc::SessionCellExecutionLimits {
+            max_yield_time_ms: Some(100),
+            max_heap_size_bytes: Some(64 * 1024 * 1024),
+        }),
+    ] {
+        let event = grpc::SessionEvent {
+            event: Some(grpc::session_event::Event::Opened(grpc::SessionOpened {
+                session_id: "unqualified-host".into(),
+                output_truncation: None,
+                applied_cell_execution_limits: applied,
+            })),
+        };
+        let encoded = event.encode_to_vec();
+        let mut frame = vec![0];
+        frame.extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&encoded);
+        let count = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&count);
+        let provider = crate::GrpcCodeModeSessionProvider::with_transport(service_fn(
+            move |request: tonic::codegen::http::Request<Body>| {
+                assert_eq!(
+                    request.uri().path(),
+                    "/codex.code_mode.v1.CodeModeHost/OpenSession"
+                );
+                observed.fetch_add(1, Ordering::Relaxed);
+                let frame = frame.clone();
+                async move {
+                    Ok::<_, tonic::Status>(
+                        Response::builder()
+                            .header("content-type", "application/grpc")
+                            .header("grpc-status", "0")
+                            .body(Body::new(Full::new(Bytes::from(frame))))
+                            .unwrap(),
+                    )
+                }
+            },
+        ));
+        let result = provider
+            .create_session_with_options(CodeModeSessionOptions {
+                cell_execution_limits: CodeModeSessionCellExecutionLimits {
+                    max_yield_time_ms: Some(100),
+                    max_heap_size_bytes: Some(32 * 1024 * 1024),
+                },
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(result, Err(error) if error.contains("did not acknowledge")));
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "no execution, subscription or fallback is sent"
+        );
+    }
+}

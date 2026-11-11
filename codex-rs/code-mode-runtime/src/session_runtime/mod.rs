@@ -51,6 +51,7 @@ struct Inner {
     shutdown_token: CancellationToken,
     task_failure_handler: Option<TaskFailureHandler>,
     next_cell_id: AtomicU64,
+    max_heap_size_bytes: Option<usize>,
 }
 
 impl SessionRuntime {
@@ -59,8 +60,16 @@ impl SessionRuntime {
         Self::new_with_task_failure_handler(/*task_failure_handler*/ None)
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_task_failure_handler(
         task_failure_handler: Option<TaskFailureHandler>,
+    ) -> Self {
+        Self::new_with_cell_heap_limit(task_failure_handler, None)
+    }
+
+    pub(crate) fn new_with_cell_heap_limit(
+        task_failure_handler: Option<TaskFailureHandler>,
+        max_heap_size_bytes: Option<usize>,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -70,6 +79,7 @@ impl SessionRuntime {
                 shutdown_token: CancellationToken::new(),
                 task_failure_handler,
                 next_cell_id: AtomicU64::new(1),
+                max_heap_size_bytes,
             }),
         }
     }
@@ -189,6 +199,7 @@ impl SessionRuntime {
             initial_observation,
             cell_state,
             self.inner.task_failure_handler.clone(),
+            self.inner.max_heap_size_bytes,
         )
         .map_err(Error::Runtime)?;
         cells.insert(cell_id.clone(), handle);

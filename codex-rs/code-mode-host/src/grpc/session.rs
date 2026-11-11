@@ -116,6 +116,13 @@ impl GrpcHostState {
         let (events, receiver) = mpsc::channel(OUTGOING_CHANNEL_CAPACITY);
         let closed = CancellationToken::new();
         let event_sender = EventSender::new(events.clone(), closed.clone());
+        let applied_cell_execution_limits = Some(proto::SessionCellExecutionLimits {
+            max_yield_time_ms: options.cell_execution_limits.max_yield_time_ms,
+            max_heap_size_bytes: options
+                .cell_execution_limits
+                .max_heap_size_bytes
+                .map(|n| n as u64),
+        });
         let session = GrpcSession::new(
             id,
             event_sender,
@@ -127,6 +134,7 @@ impl GrpcHostState {
             .try_send(Ok(proto::SessionEvent {
                 event: Some(proto::session_event::Event::Opened(proto::SessionOpened {
                     session_id: id.to_string(),
+                    applied_cell_execution_limits,
                     output_truncation: match session.runtime.output_truncation() {
                         CodeModeOutputTruncation::Server => {
                             Some(proto::OutputTruncation::Server.into())

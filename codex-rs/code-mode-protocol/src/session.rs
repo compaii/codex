@@ -236,6 +236,17 @@ pub trait CodeModeSessionProvider: Send + Sync {
 
     fn create_session(&self) -> CodeModeSessionProviderFuture<'_>;
 
+    /// Creates a session in an exclusively owned process. Sharing a host is not
+    /// an acceptable fallback: heap exhaustion must not destroy another session.
+    fn create_isolated_session_with_options<'a>(
+        &'a self,
+        _options: CodeModeSessionOptions,
+    ) -> CodeModeSessionProviderFuture<'a> {
+        Box::pin(async {
+            Err("code-mode provider does not support process-isolated sessions".into())
+        })
+    }
+
     /// Creates a session whose cells share the supplied execution limits.
     ///
     /// Existing providers remain compatible with unlimited sessions, but must

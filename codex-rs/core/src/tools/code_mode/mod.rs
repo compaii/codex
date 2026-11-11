@@ -1,3 +1,4 @@
+pub(crate) mod bounded_session;
 mod delegate;
 mod execute_handler;
 pub(crate) mod execute_spec;
@@ -127,7 +128,19 @@ impl CodeModeService {
         Arc::clone(&self.session_provider)
     }
 
-    fn output_truncation(&self) -> CodeModeOutputTruncation {
+    fn output_truncation(&self, turn: &TurnContext) -> CodeModeOutputTruncation {
+        if bounded_session::uses_isolated_session(turn) {
+            return turn
+                .extension_data
+                .get::<bounded_session::BoundedSessionState>()
+                .and_then(|state| {
+                    state
+                        .session
+                        .get()
+                        .map(|session| session.output_truncation())
+                })
+                .unwrap_or_default();
+        }
         self.session
             .get()
             .map(|session| session.output_truncation())
@@ -147,7 +160,7 @@ impl CodeModeService {
             broker: Arc::clone(&self.dispatch_broker),
             step_context,
         });
-        self.session()
+        self.session_for_turn(&delegate.step_context.turn)
             .await?
             .execute(request, delegate, preempt)
             .await
@@ -157,15 +170,23 @@ impl CodeModeService {
         &self,
         request: codex_code_mode::WaitRequest,
         preempt: Option<CancellationToken>,
+        turn: &TurnContext,
     ) -> Result<codex_code_mode::WaitOutcome, String> {
-        self.session().await?.wait(request, preempt).await
+        self.session_for_cell(turn, &request.cell_id)
+            .await?
+            .wait(request, preempt)
+            .await
     }
 
     pub(crate) async fn terminate(
         &self,
         request: codex_code_mode::TerminateRequest,
+        turn: &TurnContext,
     ) -> Result<codex_code_mode::WaitOutcome, String> {
-        self.session().await?.terminate(request).await
+        self.session_for_cell(turn, &request.cell_id)
+            .await?
+            .terminate(request)
+            .await
     }
 
     pub(crate) async fn interrupt_active_cells(&self) {
@@ -579,3 +600,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod bounded_session_tests;

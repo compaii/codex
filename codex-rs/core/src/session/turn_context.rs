@@ -1219,6 +1219,7 @@ impl Session {
             session_configuration.turn_extension_init.clone(),
         ));
         extension_data.insert(skills_snapshot);
+        crate::tools::code_mode::bounded_session::capture_options(&extension_data);
         TurnContext {
             sub_id,
             trace_id: current_span_trace_id(),
