@@ -889,6 +889,20 @@ impl ToolRegistry {
             Ok(environments) => environments,
             Err(err) => return Err(fail_before_execution(&invocation, err).await),
         };
+        if let Some(ceiling) = invocation.turn.permission_ceiling() {
+            let result = match &mut invocation.environments {
+                crate::tools::context::ToolEnvironments::Arguments(environments) => {
+                    environments.iter_mut().try_for_each(|(_, environment)| {
+                        Arc::make_mut(environment).restrict_permissions(&ceiling)
+                    })
+                }
+                _ => Ok(()),
+            };
+            if let Err(error) = result {
+                let error = FunctionCallError::RespondToModel(error.to_string());
+                return Err(fail_before_execution(&invocation, error).await);
+            }
+        }
         match apply_pre_tool_use(tool.as_ref(), &mut invocation).await {
             Ok(()) => {}
             Err(PreToolUseError::Blocked(message)) => {

@@ -502,7 +502,7 @@ impl Session {
                 .map(|environment| {
                     (
                         environment.selection.environment_id.clone(),
-                        environment.sandbox_context(/*additional_permissions*/ None),
+                        environment.sandbox_context(),
                     )
                 })
                 .collect::<HashMap<_, _>>()
@@ -584,7 +584,7 @@ impl Session {
             }
             let request = DiscoverV2CapabilitiesRequest {
                 cwd: selected.cwd().clone(),
-                sandbox: Some(selected.sandbox_context(/*additional_permissions*/ None)),
+                sandbox: Some(selected.sandbox_context()),
             };
             let result = cache
                 .discover(environment_id, &selected.environment, request)

@@ -41,8 +41,7 @@ impl PreparedPermissionRequest {
         arguments: &str,
         turn_environment: &TurnEnvironment,
     ) -> Result<Self, FunctionCallError> {
-        let sandbox_context =
-            turn_environment.sandbox_context(/*additional_permissions*/ None);
+        let sandbox_context = turn_environment.sandbox_context();
         let context = sandbox_context.policy_context();
         let mut arguments: Value = parse_arguments(arguments)?;
         resolve_permission_path_strings(&mut arguments, &context)?;

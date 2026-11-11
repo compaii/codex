@@ -53,7 +53,7 @@ pub(crate) fn decide_approval(
 ) -> futures::future::BoxFuture<'static, Option<ReviewDecision>> {
     let context: GuardianReviewContext = context.into();
     if crate::turn_inference::allowance(context.turn()).is_some() {
-        let cancellation = options.external_cancel.clone();
+        let cancellation = options.external_cancel;
         return Box::pin(async move {
             Some(
                 if cancellation

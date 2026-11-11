@@ -5085,7 +5085,8 @@ async fn resume_thread_subagent_restores_stored_metadata() {
     let parent_turn = parent_thread
         .session
         .new_turn_with_default_settings("parent-deselected".to_string(), Default::default())
-        .await;
+        .await
+        .expect("build turn context");
     assert_eq!(
         parent_turn.initial_environments.selected_capability_roots(),
         Vec::new()
@@ -5138,7 +5139,8 @@ async fn resume_thread_subagent_restores_stored_metadata() {
     let child_turn = resumed_thread
         .session
         .new_turn_with_default_settings("child-reselected".to_string(), Default::default())
-        .await;
+        .await
+        .expect("build turn context");
     assert_eq!(
         child_turn.initial_environments.selected_capability_roots(),
         roots

@@ -82,6 +82,7 @@ impl ToolOrchestrator {
             tool_name: tool_ctx.tool_name.clone(),
         };
         let attempt_with_network_approval = SandboxAttempt {
+            permission_ceiling: attempt.permission_ceiling,
             sandbox_override: attempt.sandbox_override,
             sandbox: attempt.sandbox,
             sandbox_requested: attempt.sandbox_requested,
@@ -141,6 +142,15 @@ impl ToolOrchestrator {
         let mut initial_approval_source = None;
 
         let environment = tool.turn_environment(req);
+        if environment.permission_ceiling().is_some()
+            && tool
+                .sandbox_permissions(req)
+                .requires_escalated_permissions()
+        {
+            return Err(ToolError::Rejected(
+                "host permission ceiling does not permit sandbox escalation".into(),
+            ));
+        }
         let sandbox_manager = SandboxManager::new();
         #[cfg(target_os = "macos")]
         let sandbox_manager = sandbox_manager.with_allowed_symlinked_codex_home(
@@ -234,16 +244,19 @@ impl ToolOrchestrator {
 
         // 2) First attempt under the selected sandbox.
         let unsandboxed_allowed = unsandboxed_execution_allowed(&file_system_sandbox_policy);
-        let sandbox_override = sandbox_override_for_first_attempt(
+        let mut sandbox_override = sandbox_override_for_first_attempt(
             tool.sandbox_permissions(req),
             &requirement,
             &file_system_sandbox_policy,
             /*already_approved*/ initial_approval_source.is_some(),
         );
+        if environment.permission_ceiling().is_some() {
+            sandbox_override = SandboxOverride::NoOverride;
+        }
         let (escalated_profile, writable_root_metadata) = if sandbox_override
             == SandboxOverride::EscalatedSandboxWithRestrictions
         {
-            let context = environment.sandbox_context(/*additional_permissions*/ None);
+            let context = environment.sandbox_context();
             let policy_context = context.policy_context();
             let baseline = permission_profile.file_system_sandbox_policy();
             let file_system = baseline.for_approved_command(&policy_context);
@@ -330,7 +343,11 @@ impl ToolOrchestrator {
         } else {
             turn_ctx.network.is_some()
         };
-        let sandbox_preference = tool.sandbox_preference();
+        let sandbox_preference = if environment.permission_ceiling().is_some() {
+            codex_sandboxing::SandboxablePreference::Auto
+        } else {
+            tool.sandbox_preference()
+        };
         let sandbox_requested = match sandbox_override {
             SandboxOverride::BypassSandboxFirstAttempt => false,
             SandboxOverride::NoOverride | SandboxOverride::EscalatedSandboxWithRestrictions => {
@@ -356,6 +373,11 @@ impl ToolOrchestrator {
             SandboxType::None
         };
         if !executor_managed_process_sandbox {
+            if environment.permission_ceiling().is_some() && initial_sandbox == SandboxType::None {
+                return Err(ToolError::Rejected(
+                    "host permission ceiling requires an available managed sandbox".into(),
+                ));
+            }
             ensure_native_sandbox(sandbox_override, initial_sandbox)?;
         }
 
@@ -369,6 +391,7 @@ impl ToolOrchestrator {
             turn_ctx.config.codex_linux_sandbox_exe.as_ref()
         };
         let initial_attempt = SandboxAttempt {
+            permission_ceiling: environment.permission_ceiling(),
             sandbox_override,
             sandbox: initial_sandbox,
             sandbox_requested,
@@ -391,6 +414,7 @@ impl ToolOrchestrator {
             Self::run_attempt(tool, req, tool_ctx, &initial_attempt, network_approval_spec).await;
         let initial_duration = initial_attempt_start.elapsed();
         match first_result {
+            Err(error) if environment.permission_ceiling().is_some() => Err(error),
             Ok(out) => {
                 // We have a successful initial result
                 Ok(OrchestratorRunResult {
@@ -576,6 +600,7 @@ impl ToolOrchestrator {
                     codex_sandbox_exe
                 };
                 let retry_attempt = SandboxAttempt {
+                    permission_ceiling: environment.permission_ceiling(),
                     sandbox_override,
                     sandbox: retry_sandbox,
                     sandbox_requested: retry_sandbox_requested,

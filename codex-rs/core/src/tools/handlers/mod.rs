@@ -338,7 +338,7 @@ pub(super) fn apply_granted_turn_permissions(
         additional_permissions.as_ref(),
         granted_permissions.as_ref(),
     );
-    let sandbox_context = environment.sandbox_context(/*additional_permissions*/ None);
+    let sandbox_context = environment.sandbox_context();
     let context = file_system_sandbox_policy_context_for_cwd(&sandbox_context, cwd);
     let preapproved_permissions = granted_permissions.as_ref().and_then(|granted| {
         if additional_permissions.is_none() {

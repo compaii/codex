@@ -155,7 +155,8 @@ async fn exec_command_with_tty(
                 SandboxPermissions::UseDefault,
                 /*additional_permissions*/ None,
                 /*internal_permissions*/ None,
-            ),
+            )
+            .expect("capture launch permissions"),
             network_approval: None,
             session: Arc::downgrade(session),
             last_used: started_at,
@@ -627,7 +628,8 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
                 SandboxPermissions::UseDefault,
                 /*additional_permissions*/ None,
                 /*internal_permissions*/ None,
-            ),
+            )
+            .expect("capture launch permissions"),
             network_approval: None,
             session: Arc::downgrade(&session),
             last_used: Instant::now(),
@@ -717,7 +719,8 @@ async fn terminating_during_stdin_poll_returns_exited_response(
                 SandboxPermissions::UseDefault,
                 /*additional_permissions*/ None,
                 /*internal_permissions*/ None,
-            ),
+            )
+            .expect("capture launch permissions"),
             network_approval: None,
             session: Arc::downgrade(&session),
             last_used,
@@ -916,7 +919,8 @@ async fn stdin_approval_preserves_the_reviewed_terminal() -> anyhow::Result<()> 
             SandboxPermissions::RequireEscalated,
             /*additional_permissions*/ None,
             /*internal_permissions*/ None,
-        );
+        )
+        .expect("capture launch permissions");
         entry.environment_id = "unselected-executor".to_string();
         entry.cwd = cwd.clone();
     }
@@ -1150,7 +1154,8 @@ async fn bounded_terminal_ownership_rejects_poll_write_and_interrupt_without_tou
                     ..Default::default()
                 },
             )
-            .await;
+            .await
+            .expect("build turn context");
         bounded
             .extension_data
             .insert(crate::turn_inference::prepare(
@@ -1207,7 +1212,8 @@ async fn bounded_terminal_ownership_rejects_poll_write_and_interrupt_without_tou
             "later-human-terminal".into(),
             NewTurnContextOptions::default(),
         )
-        .await;
+        .await
+        .expect("build turn context");
     let output = write_stdin(&session, &later_human, human_pid, "human\n", 100)
         .await?
         .truncated_output(1000);

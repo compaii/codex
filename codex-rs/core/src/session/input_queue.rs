@@ -435,6 +435,10 @@ impl InputQueue {
         std::mem::take(&mut turn_state.lock().await.pending_input).items
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "only a requested parent mismatch can refuse selection; this caller passes no parent"
+    )]
     pub(crate) async fn get_pending_input(
         &self,
         active_turn: &Mutex<Option<ActiveTurn>>,

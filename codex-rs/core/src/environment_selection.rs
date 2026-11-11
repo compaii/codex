@@ -1237,6 +1237,44 @@ pub struct TurnEnvironmentSnapshot {
 }
 
 impl TurnEnvironmentSnapshot {
+    /// Restrict a captured local execution view, never the thread-owned selection.
+    /// An unavailable selection does not block independent qualified environments.
+    pub(crate) fn restrict_permissions(mut self, ceiling: &PermissionProfile) -> CodexResult<Self> {
+        for state in &mut self.environments {
+            let failure = match state {
+                TurnEnvironmentState::Ready(environment) => environment
+                    .restrict_permissions(ceiling)
+                    .err()
+                    .map(|error| {
+                        (
+                            environment.selection.clone(),
+                            environment.environment.required_skills().to_vec(),
+                            error.to_string(),
+                        )
+                    }),
+                TurnEnvironmentState::Starting(environment) => Some((
+                    environment.selection.clone(),
+                    environment.environment.required_skills().to_vec(),
+                    "environment is not ready for this execution's permission ceiling".into(),
+                )),
+                TurnEnvironmentState::Failed { .. } => None,
+            };
+            if let Some((selection, required_skills, error)) = failure {
+                *state = TurnEnvironmentState::Failed {
+                    selection,
+                    required_skills,
+                    error,
+                };
+            }
+        }
+        if self.turn_environments().next().is_none() {
+            return Err(CodexErr::InvalidRequest(
+                "host permission ceiling has no qualified environment".into(),
+            ));
+        }
+        Ok(self)
+    }
+
     /// Keeps the original root order for child threads and saved history.
     pub(crate) fn selected_capability_roots(&self) -> Vec<SelectedCapabilityRoot> {
         EnvironmentCapabilityRoots::collect(self.environments.iter().map(|environment| {
@@ -1756,9 +1794,7 @@ url = "ws://127.0.0.1:8765"
         assert_eq!(environment.shell.as_ref(), Some(&local_shell));
         assert_eq!(environment.config(), &expected_config);
         assert_eq!(
-            environment
-                .sandbox_context(/*additional_permissions*/ None)
-                .policy_context(),
+            environment.sandbox_context().policy_context(),
             FileSystemSandboxPolicyContext {
                 cwd: environment.cwd(),
                 workspace_roots: &[],
@@ -2164,9 +2200,7 @@ url = "ws://127.0.0.1:8765"
         let expected_temporary_directories =
             [PathUri::parse("file:///tmp/remote").expect("remote temporary directory")];
         assert_eq!(
-            environment
-                .sandbox_context(/*additional_permissions*/ None)
-                .policy_context(),
+            environment.sandbox_context().policy_context(),
             FileSystemSandboxPolicyContext {
                 cwd: environment.cwd(),
                 workspace_roots: &[],
@@ -2459,16 +2493,11 @@ url = "ws://127.0.0.1:8765"
         assert!(Arc::ptr_eq(&inherited.environment, &inherited_environment));
         assert_eq!(inherited.config(), &child_config);
         assert_eq!(
-            inherited
-                .sandbox_context(/*additional_permissions*/ None)
-                .user_home_dir,
+            inherited.sandbox_context().user_home_dir,
             Some(PathUri::parse("file:///home/inherited").expect("home directory")),
         );
         assert_eq!(
-            inherited
-                .sandbox_context(/*additional_permissions*/ None)
-                .temporary_directories
-                .as_deref(),
+            inherited.sandbox_context().temporary_directories.as_deref(),
             Some(
                 [PathUri::parse("file:///tmp/inherited").expect("temporary directory")].as_slice()
             )

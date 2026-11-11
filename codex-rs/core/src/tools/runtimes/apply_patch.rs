@@ -90,16 +90,27 @@ impl ApplyPatchRuntime {
     fn file_system_sandbox_context_for_attempt(
         req: &ApplyPatchRequest,
         attempt: &SandboxAttempt<'_>,
-    ) -> Option<FileSystemSandboxContext> {
+    ) -> Result<Option<FileSystemSandboxContext>, ToolError> {
+        if attempt.permission_ceiling.is_some()
+            && (!attempt.sandbox_requested
+                || attempt.sandbox_override != codex_protocol::sandbox::SandboxOverride::NoOverride)
+        {
+            return Err(ToolError::Rejected(
+                "host permission ceiling requires filesystem sandbox enforcement without override"
+                    .into(),
+            ));
+        }
         if !attempt.sandbox_requested {
-            return None;
+            return Ok(None);
         }
 
-        let permissions = effective_permission_profile(
-            attempt.exec_server_permissions,
-            req.additional_permissions.as_ref(),
-        );
-        Some(FileSystemSandboxContext {
+        let permissions = attempt
+            .cap_permissions(effective_permission_profile(
+                attempt.exec_server_permissions,
+                req.additional_permissions.as_ref(),
+            ))
+            .map_err(ToolError::Codex)?;
+        Ok(Some(FileSystemSandboxContext {
             sandbox_override: attempt.sandbox_override,
             permissions,
             cwd: attempt.sandbox_cwd.clone(),
@@ -113,7 +124,7 @@ impl ApplyPatchRuntime {
             ),
             windows_sandbox_proxy_settings_mode: None,
             use_legacy_landlock: attempt.use_legacy_landlock,
-        })
+        }))
     }
 }
 
@@ -177,7 +188,7 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
     ) -> Result<ApplyPatchRuntimeOutput, ToolError> {
         let started_at = Instant::now();
         let fs = req.turn_environment.environment.get_filesystem();
-        let sandbox = Self::file_system_sandbox_context_for_attempt(req, attempt);
+        let sandbox = Self::file_system_sandbox_context_for_attempt(req, attempt)?;
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let result = codex_apply_patch::apply_patch_with_options(

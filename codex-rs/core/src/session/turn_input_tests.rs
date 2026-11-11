@@ -1025,7 +1025,8 @@ async fn rejects_non_regular_turns() {
             .set_root_turn_id("incoming-root".to_string());
         let turn_context = session
             .new_turn_with_default_settings("turn".to_string(), Default::default())
-            .await;
+            .await
+            .expect("build turn context");
         turn_context
             .turn_metadata_state
             .set_root_turn_id("active-root".to_string());
@@ -1745,4 +1746,272 @@ async fn host_tool_ceiling_cannot_be_discarded_by_steering() {
                 .is_err()
         );
     }
+}
+
+#[tokio::test]
+async fn host_permission_ceiling_requires_finite_managed_explicit_tool_admission() {
+    use codex_protocol::models::PermissionProfile;
+    let (session, _, _rx) = make_session_and_context_with_rx().await;
+    let allowance = codex_protocol::turn_input::TurnInferenceAllowance {
+        max_provider_attempts: 1,
+        max_request_bytes: 4096,
+        deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+    };
+    for options in [
+        TurnStartOptions {
+            permission_ceiling: Some(PermissionProfile::read_only()),
+            ..Default::default()
+        },
+        TurnStartOptions {
+            permission_ceiling: Some(PermissionProfile::read_only()),
+            inference_allowance: Some(allowance.clone()),
+            ..Default::default()
+        },
+        TurnStartOptions {
+            permission_ceiling: Some(PermissionProfile::Disabled),
+            inference_allowance: Some(allowance.clone()),
+            tool_ceiling: Some(vec![]),
+            ..Default::default()
+        },
+    ] {
+        assert!(
+            PreparedTurnInputSettings::prepare(
+                &session,
+                ThreadSettingsOverrides::default(),
+                options
+            )
+            .await
+            .is_err()
+        );
+    }
+}
+
+#[ctor::ctor]
+fn dispatch_permission_test_filesystem_helpers() {
+    use codex_test_binary_support::TestBinaryDispatchMode;
+    use codex_test_binary_support::configure_test_binary_dispatch;
+    configure_test_binary_dispatch("codex-core-unit-permissions", |name, argument| {
+        if argument == Some(codex_exec_server::CODEX_FS_HELPER_ARG1)
+            || name == codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0
+        {
+            TestBinaryDispatchMode::DispatchArg0Only
+        } else {
+            // No aliases, environment changes or helper startup for ordinary tests.
+            TestBinaryDispatchMode::Skip
+        }
+    });
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn host_permission_ceiling_enforces_real_files_after_old_and_new_grants_without_changing_human_defaults()
+-> anyhow::Result<()> {
+    use crate::session::step_context::StepContext;
+    use crate::session::tests::make_session_and_context_with_auth_and_config_and_rx;
+    use codex_file_system::EnvironmentAccess;
+    use codex_file_system::ReadFileOptions;
+    use codex_file_system::WriteFileOptions;
+    use codex_protocol::models::AdditionalPermissionProfile;
+    use codex_protocol::models::FileSystemPermissions;
+    use codex_protocol::models::NetworkPermissions;
+    use codex_protocol::models::PermissionProfile;
+    use codex_protocol::permissions::FileSystemAccessMode;
+    use codex_protocol::permissions::FileSystemSandboxEntry;
+    use codex_protocol::permissions::FileSystemSandboxPolicy;
+    use codex_protocol::permissions::NetworkSandboxPolicy;
+    use codex_utils_path_uri::PathUri;
+    let directory = tempfile::tempdir()?;
+    let root = AbsolutePathBuf::from_absolute_path(directory.path())?;
+    let writable = root.join("work");
+    std::fs::create_dir_all(&writable)?;
+    let secret = root.join("private.txt");
+    std::fs::write(&secret, "private fixture")?;
+    let outside = PathUri::from_abs_path(&root.join("outside.txt"));
+    let inside = PathUri::from_abs_path(&writable.join("inside.txt"));
+    let secret_uri = PathUri::from_abs_path(&secret);
+    let selected_root = root.clone();
+    let executable = std::env::current_exe()?;
+    #[cfg(target_os = "linux")]
+    let sandbox_alias = {
+        let path = directory.path().join("codex-linux-sandbox");
+        std::os::unix::fs::symlink(&executable, &path)?;
+        Some(path)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let sandbox_alias = None;
+    let (session, original, _rx) = make_session_and_context_with_auth_and_config_and_rx(
+        codex_login::CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        move |config| {
+            config.codex_self_exe = Some(executable);
+            config.codex_linux_sandbox_exe = sandbox_alias;
+            config.cwd = selected_root.clone();
+            config
+                .permissions
+                .set_workspace_roots(vec![selected_root.clone()]);
+            config
+                .permissions
+                .set_permission_profile(PermissionProfile::Disabled)
+                .expect("full-access fixture");
+        },
+    )
+    .await;
+    let mut policy = FileSystemSandboxPolicy::read_only();
+    policy.entries.push(FileSystemSandboxEntry::new(
+        writable.clone().into(),
+        FileSystemAccessMode::Write,
+    ));
+    policy.entries.push(FileSystemSandboxEntry::new(
+        secret.clone().into(),
+        FileSystemAccessMode::Deny,
+    ));
+    let ceiling =
+        PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Restricted);
+    let grant = AdditionalPermissionProfile {
+        network: Some(NetworkPermissions {
+            enabled: Some(true),
+        }),
+        file_system: Some(FileSystemPermissions {
+            entries: vec![
+                FileSystemSandboxEntry::new(root.into(), FileSystemAccessMode::Write),
+                FileSystemSandboxEntry::new(secret.clone().into(), FileSystemAccessMode::Read),
+            ],
+            glob_scan_max_depth: None,
+        }),
+    };
+    let environment_id = original
+        .initial_environments
+        .primary()
+        .expect("original environment")
+        .selection
+        .environment_id
+        .clone();
+    session
+        .services
+        .record_granted_permissions(&environment_id, grant.clone());
+    let bounded = PreparedTurnInputSettings::prepare(
+        &session,
+        ThreadSettingsOverrides::default(),
+        TurnStartOptions {
+            permission_ceiling: Some(ceiling),
+            tool_ceiling: Some(vec![codex_protocol::ToolName::plain("exec_command")]),
+            inference_allowance: Some(codex_protocol::turn_input::TurnInferenceAllowance {
+                max_provider_attempts: 1,
+                max_request_bytes: 4096,
+                deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+            }),
+            ..Default::default()
+        },
+    )
+    .await?
+    .apply_started(
+        &session,
+        "restricted-file-access".into(),
+        TurnStartKind::User,
+    )
+    .await?
+    .expect("admitted context");
+    bounded.record_granted_permissions(&environment_id, grant.clone(), false);
+    let cancellation = CancellationToken::new();
+    let step = session
+        .capture_speculative_step_context(Arc::clone(&bounded), &cancellation)
+        .await?;
+    let environment = step.environments.primary().expect("restricted environment");
+    assert_eq!(
+        environment
+            .sandbox_context_with_permissions(Some(grant))?
+            .permissions
+            .network_sandbox_policy(),
+        NetworkSandboxPolicy::Restricted
+    );
+    // Use the broader pre-existing environment explicitly: the accessor must
+    // still apply its originating turn's immutable ceiling after live grants.
+    let files = step.fs_accessor(
+        original
+            .initial_environments
+            .primary()
+            .expect("broader environment"),
+    )?;
+    assert!(
+        files
+            .read_file(&secret_uri, ReadFileOptions::default())
+            .await
+            .is_err()
+    );
+    assert!(
+        files
+            .write_file(&outside, b"forbidden".to_vec(), WriteFileOptions::default())
+            .await
+            .is_err()
+    );
+    files
+        .write_file(&inside, b"allowed".to_vec(), WriteFileOptions::default())
+        .await?;
+    assert_eq!(std::fs::read(writable.join("inside.txt"))?, b"allowed");
+    let ordinary = PreparedTurnInputSettings::prepare(
+        &session,
+        ThreadSettingsOverrides::default(),
+        TurnStartOptions::default(),
+    )
+    .await?
+    .apply_started(&session, "ordinary-file-access".into(), TurnStartKind::User)
+    .await?
+    .expect("ordinary context");
+    assert!(ordinary.permission_ceiling().is_none());
+    assert_eq!(ordinary.permission_profile(), PermissionProfile::Disabled);
+    assert!(
+        ordinary.granted_permissions(&environment_id).is_some(),
+        "existing grants were not deleted"
+    );
+    let ordinary_step = StepContext::for_test(Arc::clone(&ordinary));
+    let files = ordinary_step.fs_accessor(
+        ordinary_step
+            .environments
+            .primary()
+            .expect("ordinary environment"),
+    )?;
+    assert_eq!(
+        files
+            .read_file(&secret_uri, ReadFileOptions::default())
+            .await?,
+        b"private fixture"
+    );
+    files
+        .write_file(&outside, b"human".to_vec(), WriteFileOptions::default())
+        .await?;
+    assert_eq!(
+        files
+            .read_file(&outside, ReadFileOptions::default())
+            .await?,
+        b"human"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn host_permission_ceiling_does_not_wait_for_an_unrelated_unavailable_environment()
+-> anyhow::Result<()> {
+    use crate::environment_selection::TurnEnvironmentState;
+    use codex_protocol::models::PermissionProfile;
+    let (_, context, _rx) = make_session_and_context_with_rx().await;
+    let mut environments = context.initial_environments.clone();
+    let mut selection = environments
+        .primary()
+        .expect("qualified environment")
+        .selection
+        .clone();
+    selection.environment_id = "unavailable-fixture".into();
+    environments
+        .environments
+        .push(TurnEnvironmentState::Failed {
+            selection,
+            required_skills: Vec::new(),
+            error: "fixture unavailable".into(),
+        });
+    let restricted = environments.restrict_permissions(&PermissionProfile::read_only())?;
+    assert_eq!(restricted.turn_environments().count(), 1);
+    assert!(
+        matches!(&restricted.environments[1], TurnEnvironmentState::Failed { error, .. } if error == "fixture unavailable")
+    );
+    Ok(())
 }

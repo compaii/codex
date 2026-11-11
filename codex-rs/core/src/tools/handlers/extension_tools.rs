@@ -7,6 +7,7 @@ use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_tools::ConversationHistory;
 use codex_tools::ExtensionTurnItem;
+use codex_tools::FunctionCallError;
 use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ToolCall as ExtensionToolCall;
 use codex_tools::ToolEnvironment;
@@ -84,8 +85,9 @@ impl ToolExecutor<ToolInvocation> for ExtensionToolAdapter {
             };
             let accessors: Vec<_> = selected
                 .into_iter()
-                .map(|env| (env, step.fs_accessor(env)))
-                .collect();
+                .map(|env| step.fs_accessor(env).map(|fs| (env, fs)))
+                .collect::<Result<_, _>>()
+                .map_err(|error| FunctionCallError::RespondToModel(error.to_string()))?;
             let environments = accessors
                 .iter()
                 .map(|(environment, fs)| {

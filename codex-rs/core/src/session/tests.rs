@@ -5560,7 +5560,23 @@ async fn resolved_environments_for_configuration(
     session_configuration: &SessionConfiguration,
     environment_selections: &[TurnEnvironmentSelection],
 ) -> (Arc<EnvironmentManager>, TurnEnvironmentSnapshot) {
-    let environment_manager = Arc::new(EnvironmentManager::default_for_tests());
+    let runtime = &session_configuration.original_config_do_not_use;
+    let environment_manager = Arc::new(match runtime.codex_self_exe.clone() {
+        Some(executable) => {
+            EnvironmentManager::create_for_tests(
+                None,
+                Some(
+                    codex_exec_server::ExecServerRuntimeOptions::new(
+                        executable,
+                        runtime.codex_linux_sandbox_exe.clone(),
+                    )
+                    .expect("test runtime paths"),
+                ),
+            )
+            .await
+        }
+        None => EnvironmentManager::default_for_tests(),
+    });
     let turn_environments = ThreadEnvironments::new(
         Arc::clone(&environment_manager),
         default_user_shell(),
@@ -5993,7 +6009,8 @@ enabled = false
 
     let child_turn = session
         .new_turn_with_default_settings("role-skill-turn".to_string(), Default::default())
-        .await;
+        .await
+        .expect("build turn context");
     let skills_snapshot = child_turn.skills_snapshot();
     let child_skill = skills_snapshot
         .outcome()
@@ -6709,6 +6726,7 @@ async fn permission_profile_updates_apply_to_next_turn_environment() {
                     Default::default(),
                 )
                 .await
+                .expect("build turn context")
         };
         let next_environment = next_turn
             .initial_environments
@@ -7941,21 +7959,19 @@ async fn request_permissions_tool_resolves_legacy_paths_against_selected_environ
         .expect("primary environment")
         .clone();
     let current_environment_config = current_environment.config().clone();
-    let environment = TurnEnvironment {
-        user_home_dir: Some(PathUri::from_abs_path(&environment_home)),
-        ..TurnEnvironment::new(
-            TurnEnvironmentSelection {
-                selected_capability_roots: Default::default(),
-                environment_id: "remote".to_string(),
-                cwd: PathUri::from_abs_path(&environment_cwd),
-                workspace_roots: Vec::new(),
-                config: EnvironmentConfigState::Ready(current_environment_config),
-            },
-            current_environment.config_origin,
-            current_environment.environment,
-            current_environment.shell,
-        )
-    };
+    let mut environment = TurnEnvironment::new(
+        TurnEnvironmentSelection {
+            selected_capability_roots: Default::default(),
+            environment_id: "remote".to_string(),
+            cwd: PathUri::from_abs_path(&environment_cwd),
+            workspace_roots: Vec::new(),
+            config: EnvironmentConfigState::Ready(current_environment_config),
+        },
+        current_environment.config_origin,
+        current_environment.environment,
+        current_environment.shell,
+    );
+    environment.user_home_dir = Some(PathUri::from_abs_path(&environment_home));
     let call_id = "call-1".to_string();
     let arguments = json!({
         "environment_id": "remote",
@@ -8534,7 +8550,8 @@ async fn new_task_does_not_change_an_already_running_tasks_environments() {
 
     let candidate = session
         .new_turn_with_default_settings("candidate".into(), Default::default())
-        .await;
+        .await
+        .expect("build turn context");
     assert_eq!(candidate.config.cwd, current_cwd);
     assert_eq!(candidate.config.workspace_roots, vec![current_cwd.clone()]);
     assert_eq!(
@@ -8546,7 +8563,8 @@ async fn new_task_does_not_change_an_already_running_tasks_environments() {
     recv_terminal_event(&events, TerminalEventKind::TurnComplete).await;
     let next = session
         .new_turn_with_default_settings("next".into(), Default::default())
-        .await;
+        .await
+        .expect("build turn context");
     assert_eq!(next.config.cwd, next_cwd);
     assert_eq!(next.config.workspace_roots, vec![next_cwd]);
 }
@@ -8569,7 +8587,8 @@ async fn task_turn_does_not_overlay_legacy_fallback_cwd_onto_stored_thread_envir
         .expect("environment selection update should succeed");
     let turn_context = session
         .new_turn_with_default_settings("task".into(), Default::default())
-        .await;
+        .await
+        .expect("build turn context");
 
     let turn_environments = &turn_context.initial_environments;
     assert_eq!(turn_environments.turn_environments().count(), 1);
@@ -8607,7 +8626,8 @@ async fn task_turn_honors_empty_stored_thread_environments() {
         .expect("environment selection update should succeed");
     let turn_context = session
         .new_turn_with_default_settings("task".into(), Default::default())
-        .await;
+        .await
+        .expect("build turn context");
 
     assert!(turn_context.initial_environments.primary().is_none());
     assert!(
@@ -10069,7 +10089,8 @@ async fn mcp_elicitation_reviewer_uses_active_reviewer_and_latest_runtime_policy
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
     let restricted_turn = session
         .new_turn_with_default_settings("owner-restricted".to_string(), Default::default())
-        .await;
+        .await
+        .expect("build turn context");
     session.spawn_task(restricted_turn, Vec::new(), task).await;
     session.refresh_mcp_if_dirty().await;
     assert_eq!(

@@ -12,9 +12,11 @@ use crate::session::turn_context::TurnEnvironment;
 use crate::tools::router::ToolRouter;
 use codex_extension_api::ExtensionData;
 use codex_file_system::EnvironmentAccess;
+use codex_file_system::FileSystemEnvironmentAccessor;
 use codex_mcp::McpBinding;
 use codex_otel::SessionTelemetry;
 use codex_plugin::ExecutorPluginHookSource;
+use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::ModelInvocationContext;
 use codex_protocol::protocol::TurnContextItem;
 use tokio_util::sync::CancellationToken;
@@ -62,21 +64,34 @@ impl StepContext {
     }
 
     /// Pairs the step's environments with access using current session and originating-turn grants.
-    pub(crate) fn environments(&self) -> Vec<(&TurnEnvironment, impl EnvironmentAccess + '_)> {
+    pub(crate) fn environments(
+        &self,
+    ) -> CodexResult<Vec<(&TurnEnvironment, impl EnvironmentAccess + '_)>> {
         self.environments
             .turn_environments()
-            .map(|environment| (environment, self.fs_accessor(environment)))
+            .map(|environment| self.fs_accessor(environment).map(|fs| (environment, fs)))
             .collect()
     }
 
     pub(crate) fn fs_accessor<'a>(
         &self,
         environment: &'a TurnEnvironment,
-    ) -> impl EnvironmentAccess + 'a + use<'a> {
+    ) -> CodexResult<impl EnvironmentAccess + 'a + use<'a>> {
         let grants = self
             .turn
             .granted_permissions(&environment.selection.environment_id);
-        environment.fs_accessor(grants)
+        let context = match self.turn.permission_ceiling() {
+            None => environment.sandbox_context_with_permissions(grants)?,
+            Some(ceiling) => {
+                let mut restricted = environment.clone();
+                restricted.restrict_permissions(&ceiling)?;
+                restricted.sandbox_context_with_permissions(grants)?
+            }
+        };
+        Ok(FileSystemEnvironmentAccessor::new(
+            environment.environment.filesystem_ref(),
+            context,
+        ))
     }
 
     /// Persist the context captured for this request, even after a live update.

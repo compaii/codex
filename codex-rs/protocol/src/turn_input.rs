@@ -234,6 +234,9 @@ pub struct TurnInferenceAllowance {
 /// child input, Core also compares root lineage to detect ambiguity.
 #[derive(Clone, Debug, Default)]
 pub struct TurnStartOptions {
+    /// Resolved host-only permission ceiling for one bounded turn. Requires an
+    /// explicit tool ceiling; this never changes persistent thread permissions.
+    pub permission_ceiling: Option<crate::models::PermissionProfile>,
     /// Host-only, turn-local tool ceiling. None preserves the session policy;
     /// an empty vector permits no tools. Requires an already reserved allowance.
     /// This is not an execution sandbox or credential-isolation claim.

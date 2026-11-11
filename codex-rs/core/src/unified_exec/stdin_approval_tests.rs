@@ -124,7 +124,8 @@ async fn captured_network_changes_require_review() -> anyhow::Result<()> {
         SandboxPermissions::UseDefault,
         /*additional_permissions*/ None,
         /*internal_permissions*/ None,
-    );
+    )
+    .expect("capture launch permissions");
 
     proxy.mode = NetworkMode::Limited;
     Arc::make_mut(&mut turn.config).permissions.network =
@@ -138,7 +139,8 @@ async fn captured_network_changes_require_review() -> anyhow::Result<()> {
         &turn,
         TerminalSandboxSource::Native,
         /*additional_permissions*/ None,
-    );
+    )
+    .expect("capture current policy");
     let expected = SandboxPermissions::RequireEscalated;
     assert_eq!(
         permissions.review_requirement(&current, environment.permission_profile()),
@@ -154,7 +156,8 @@ async fn captured_network_changes_require_review() -> anyhow::Result<()> {
         &turn,
         TerminalSandboxSource::Native,
         /*additional_permissions*/ None,
-    );
+    )
+    .expect("capture current policy");
     assert_eq!(
         permissions.review_requirement(&current, environment.permission_profile()),
         Ok(SandboxPermissions::RequireEscalated)
@@ -200,7 +203,8 @@ async fn internal_grants_do_not_require_review_or_hide_agent_grants() -> anyhow:
             SandboxPermissions::UseDefault,
             additional_permissions.as_ref(),
             Some(&grants),
-        );
+        )
+        .expect("capture launch permissions");
         assert_eq!(
             permissions.review_requirement(&permissions.policy, environment.permission_profile()),
             Ok(expected)
@@ -243,7 +247,8 @@ async fn readable_snapshot_does_not_require_stdin_approval() -> anyhow::Result<(
         SandboxPermissions::UseDefault,
         /*additional_permissions*/ None,
         grant.as_ref(),
-    );
+    )
+    .expect("capture launch permissions");
     assert_eq!(
         permissions.review_requirement(&permissions.policy, environment.permission_profile()),
         Ok(SandboxPermissions::UseDefault)
@@ -286,13 +291,15 @@ async fn enabling_windows_sandbox_respects_the_launch_backend(
         SandboxPermissions::UseDefault,
         /*additional_permissions*/ None,
         /*internal_permissions*/ None,
-    );
+    )
+    .expect("capture launch permissions");
     let current = TerminalPolicy::capture(
         &environment,
         &turn,
         source,
         /*additional_permissions*/ None,
-    );
+    )
+    .expect("capture current policy");
     assert_eq!(
         permissions.review_requirement(&current, environment.permission_profile()),
         Ok(SandboxPermissions::UseDefault)
@@ -303,7 +310,8 @@ async fn enabling_windows_sandbox_respects_the_launch_backend(
         &turn,
         source,
         /*additional_permissions*/ None,
-    );
+    )
+    .expect("capture current policy");
     assert_eq!(
         permissions.review_requirement(&current, environment.permission_profile()),
         Ok(expected)

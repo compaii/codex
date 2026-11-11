@@ -557,6 +557,7 @@ impl Session {
                 .and_then(|context| context.cyber_access_program);
         }
         let options = NewTurnContextOptions {
+            permission_ceiling: start_options.permission_ceiling,
             tool_ceiling: start_options.tool_ceiling,
             final_output_json_schema: start_options.final_output_json_schema,
             cyber_access_program: start_options.cyber_access_program,
@@ -567,6 +568,14 @@ impl Session {
                     .await
             }
             None => self.new_turn_with_default_settings(sub_id, options).await,
+        };
+        let turn_context = match turn_context {
+            Ok(context) => context,
+            Err(error) => {
+                tracing::warn!(%error, "pending work permission qualification failed");
+                self.clear_reserved_idle_turn(&turn_state).await;
+                return;
+            }
         };
         if let Some(trigger) = start_options.turn_trigger {
             turn_context.turn_metadata_state.set_turn_trigger(trigger);

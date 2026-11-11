@@ -285,9 +285,32 @@ Rejected borrowing neither consumes output nor writes, interrupts or terminates
 the other turn's process. Ordinary human turns keep their existing cross-turn
 terminal access and approval policy.
 
+A host can also set `TurnStartOptions.permission_ceiling` to an already resolved
+`PermissionProfile` (including a profile resolved from the existing named-profile
+configuration). This requires managed restrictive permissions, explicit tools and
+a finite allowance. It remains host-only; app-server starts leave it unset.
+
+The ceiling intersects the captured local environment's original permissions,
+then is captured privately with the turn. Each new step and resolved tool
+argument reapplies it to the current environment view. Grants remain stored with
+their original scope: filesystem access and native/executor command preparation
+reapply the ceiling **after** merging session, turn, requested and internal grants.
+Patch writes use the same final intersection. Cached approvals and exec-policy
+skip rules cannot remove the required sandbox, broaden permissions or trigger an
+unsandboxed retry. Missing platform enforcement refuses execution. An offline
+ceiling removes managed proxy exceptions as well as network grants.
+
+Captured shell snapshots and rebuilders from the broader environment are not
+imported into the restricted view. Unqualified or starting environments retain
+an attributed unavailable state for that step; they do not gate independent
+qualified environments. A later step recaptures and qualifies the current view.
+No qualified environment causes admission to fail. Remote executor qualification
+for this host-local intersection is still unsupported. The next ordinary human
+turn retains its original settings, grants and terminal access.
+
 This is a tool-selection and dispatch boundary, not complete financial isolation.
-An allowed tool still needs its own enforceable permission/resource boundary.
-Running-process lifetime, Code Mode resources, local credential files,
+This does not qualify every route used by an allowed tool or trusted host.
+Running-process lifetime, Code Mode resources, trusted hooks/startup, local credential files,
 AF_UNIX sockets, owner RPCs and provider reauthentication routes need separate
 qualification. Restricting advertised names alone does not prove these routes
 are inaccessible. No public bounded-start field, receiver configuration, paid
