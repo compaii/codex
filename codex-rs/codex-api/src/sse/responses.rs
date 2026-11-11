@@ -675,6 +675,15 @@ async fn process_sse_with_treatment(
                 _=observer.observe(event, model.clone().or_else(|| last_server_model.clone()))=>{},
             }
         }
+        if let Err(ResponsesEventError::Api(ApiError::ResponseIncomplete(error))) = &processed
+            && let Some(observer) = &observer
+        {
+            tokio::select! {
+                biased;
+                _=tx_event.closed()=>return,
+                _=observer.observe_incomplete(error, model.clone().or_else(|| last_server_model.clone()))=>{},
+            }
+        }
         if let Some(model) = model
             && last_server_model.as_deref() != Some(model.as_str())
         {

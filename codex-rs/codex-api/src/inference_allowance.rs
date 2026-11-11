@@ -52,6 +52,30 @@ impl AttemptObserver {
             initial_model: None,
         })
     }
+    pub async fn observe_incomplete(
+        &self,
+        error: &codex_protocol::error::ResponseIncompleteError,
+        model: Option<String>,
+    ) {
+        // A failed response may still consume tokens. Keep its existing error
+        // semantics; this owner-only observation is never a completion/refund.
+        if let Some(id) = &error.response_id
+            && !id.is_empty()
+            && id.len() <= 200
+            && let Some(gate) = &self.allowance.provider_attempt_gate
+        {
+            let usage = ProviderAttemptUsage {
+                attempt_id: self.attempt.id,
+                ordinal: self.attempt.ordinal,
+                response_id: id.clone(),
+                model: model.or_else(|| self.initial_model.clone()),
+                token_usage: error.token_usage.clone(),
+                usage_metadata: None,
+            };
+            let _ =
+                tokio::time::timeout_at(self.attempt.deadline, gate.0.observe_usage(usage)).await;
+        }
+    }
     pub async fn observe(&self, event: &crate::common::ResponseEvent, model: Option<String>) {
         if let crate::common::ResponseEvent::Completed {
             response_id,

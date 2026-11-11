@@ -20,6 +20,7 @@ use crate::responses_headers::json_headers_to_http_headers;
 use crate::safety_buffering::treatment_from_headers;
 use crate::sse::ResponsesStreamEvent;
 use crate::sse::process_responses_event;
+use crate::sse::responses::ResponsesEventError;
 use crate::telemetry::WebsocketTelemetry;
 use codex_client::TransportError;
 use codex_http_client::HttpClientFactory;
@@ -1076,6 +1077,31 @@ async fn run_websocket_response_stream(
                             observer.observe(event, model.clone()).await;
                         }
                         Ok(None)
+                    }
+                    Err(ResponsesEventError::Api(ApiError::ResponseIncomplete(error))) => {
+                        if let Some(id) = &error.response_id {
+                            let valid = !id.is_empty() && id.len() <= 200;
+                            if observer.is_some()
+                                && (!valid
+                                    || ws_stream.completed_responses.contains(id)
+                                    || response_id.as_ref().is_some_and(|expected| expected != id))
+                            {
+                                return Err(ApiError::Stream(
+                                    "provider incomplete identity is stale or conflicting".into(),
+                                ));
+                            }
+                            if valid && ws_stream.completed_responses.len() < 1024 {
+                                ws_stream.completed_responses.insert(id.clone());
+                            }
+                            if let Some(observer) = &observer
+                                && response_id.as_ref() == Some(id)
+                            {
+                                observer.observe_incomplete(&error, model.clone()).await;
+                            }
+                        }
+                        Err(ResponsesEventError::Api(ApiError::ResponseIncomplete(
+                            error,
+                        )))
                     }
                     Ok(Some(event @ ResponseEvent::Created { .. })) => {
                         if let ResponseEvent::Created {

@@ -210,6 +210,15 @@ completion delivery remains compatible. The reported WebSocket model comes only
 from that terminal's response headers, never unrelated socket metadata or an
 assumed requested model. HTTP may use its request-bound response header.
 
+Terminal `ResponseIncomplete` errors (for example `max_output_tokens`) also
+report their exact response ID and reported token usage to the same owner before
+the failed stream returns. They remain errors; no `Completed` event or zero-cost
+settlement is synthesized. HTTP uses its own request binding. WebSocket requires
+the same matching `response.created` witness and bounded terminal-ID history as
+completion; an unbound incomplete response remains an error without a usage
+association. Missing raw billing metadata remains unknown, never inferred from
+tokens. Content-filter and explicit-interruption semantics remain unchanged.
+
 Remote compaction v2 uses this Responses stream path: foreground through the
 client session and background with the same inherited turn allowance. The unary
 `EndpointSession::execute_with` route does not provide this completion observer.

@@ -312,13 +312,25 @@ async fn websocket_peer_mode(
                         } else {
                             format!("verified-response-{ordinal}")
                         };
-                        if matches!(mode, "verified" | "stale" | "output-bound") {
+                        if matches!(mode, "verified" | "stale" | "output-bound" | "incomplete") {
                             let created=Message::Text(json!({"type":"response.created","response":{"id":id,"status":"in_progress"}}).to_string().into());
                             if ws.send(created).await.is_err() {
                                 break;
                             }
                         }
-                        let terminal=Message::Text(json!({"type":"response.completed","response":{"id":id,"status":"completed","output":[]}}).to_string().into());
+                        let terminal = if mode.starts_with("incomplete") {
+                            Message::Text(
+                                json!({"type":"response.incomplete","response":{
+                                    "id":id,"status":"incomplete","output":[],
+                                    "incomplete_details":{"reason":"max_output_tokens"},
+                                    "usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}
+                                }})
+                                .to_string()
+                                .into(),
+                            )
+                        } else {
+                            Message::Text(json!({"type":"response.completed","response":{"id":id,"status":"completed","output":[]}}).to_string().into())
+                        };
                         if ws.send(terminal.clone()).await.is_err() {
                             break;
                         }
@@ -1047,4 +1059,97 @@ async fn websocket_output_bound_counts_new_field_in_complete_request_and_real_wr
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn incomplete_http_response_reports_consumption_but_remains_failed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(format!(
+                    "data: {}\n\n",
+                    json!({
+                        "type":"response.incomplete","response":{
+                            "id":"limited-response","status":"incomplete","output":[],
+                            "incomplete_details":{"reason":"max_output_tokens"},
+                            "usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}
+                        }
+                    })
+                )),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let gate = Arc::new(ReservationGate {
+        permitted: 1,
+        ..Default::default()
+    });
+    let allowance = Arc::new(
+        InferenceAllowance::new(1, 4096, Instant::now() + Duration::from_secs(5))
+            .unwrap()
+            .with_provider_attempt_gate(gate.clone()),
+    );
+    let mut stream = client(&server, allowance)
+        .stream(
+            json!({"model":"loopback"}),
+            HeaderMap::new(),
+            Compression::None,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut failed = false;
+    while let Some(event) = stream.next().await {
+        assert!(!matches!(event, Ok(ResponseEvent::Completed { .. })));
+        failed |= matches!(event, Err(ApiError::ResponseIncomplete(_)));
+    }
+    assert!(failed);
+    let claims = gate.claims.lock().unwrap();
+    let usage = gate.usage.lock().unwrap();
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].attempt_id, claims[0].0);
+    assert_eq!(usage[0].response_id, "limited-response");
+    assert_eq!(usage[0].token_usage.as_ref().unwrap().total_tokens, 10);
+    assert!(usage[0].usage_metadata.is_none());
+}
+
+#[tokio::test]
+async fn incomplete_websocket_usage_requires_matching_creation_and_remains_failed() {
+    for mode in ["incomplete", "incomplete-no-created"] {
+        let (connection, _, server) = websocket_peer_mode(true, mode).await;
+        let gate = Arc::new(ReservationGate {
+            permitted: 1,
+            ..Default::default()
+        });
+        let allowance = Arc::new(
+            InferenceAllowance::new(1, 4096, Instant::now() + Duration::from_secs(5))
+                .unwrap()
+                .with_provider_attempt_gate(gate.clone()),
+        );
+        let mut stream = connection
+            .stream_request_with_allowance(ws_request(), false, None, 512, allowance)
+            .await
+            .unwrap();
+        let mut failed = false;
+        while let Some(event) = stream.next().await {
+            assert!(!matches!(event, Ok(ResponseEvent::Completed { .. })));
+            failed |= matches!(event, Err(ApiError::ResponseIncomplete(_)));
+        }
+        assert!(failed);
+        {
+            let usage = gate.usage.lock().unwrap();
+            if mode == "incomplete" {
+                assert_eq!(usage.len(), 1);
+                assert_eq!(usage[0].attempt_id, gate.claims.lock().unwrap()[0].0);
+                assert_eq!(usage[0].token_usage.as_ref().unwrap().total_tokens, 10);
+            } else {
+                assert!(usage.is_empty());
+            }
+        }
+        drop(connection);
+        server.await.unwrap();
+    }
 }
