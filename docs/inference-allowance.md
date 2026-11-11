@@ -382,3 +382,14 @@ Final sandbox enforcement remains mandatory. This closes proxy-assisted credenti
 preparation, not inherited environment values, private credential files, arbitrary
 IPC or provider routes; those still require complete-profile qualification. Human
 and network-enabled host policies retain their existing behavior.
+
+### Restricted broker fallback
+
+Host-permission-ceiling Unified Exec turns refuse local fallback that restores
+real brokered credentials when protected shell startup is missing or unsupported.
+The rejection occurs before environment restoration and before process
+launch. When the broker remains active, the existing unmasked-credential `Error`
+mode also checks the final command environment. Ordinary turns retain their
+existing fallback and warnings. Remote environments remain unsupported for this
+host permission profile; this does not qualify arbitrary credentials/files/IPC,
+shell startup, provider routes or the full funded profile.
