@@ -165,7 +165,10 @@ impl CodeModeExecuteHandler {
             &step_context.settings.model_info,
             response,
             args.max_output_tokens,
-            exec.session.services.code_mode_service.output_truncation(),
+            exec.session
+                .services
+                .code_mode_service
+                .output_truncation(&exec.turn),
             wall_time,
             exec.turn.config.code_mode.experimental_show_cell_overhead,
         ))

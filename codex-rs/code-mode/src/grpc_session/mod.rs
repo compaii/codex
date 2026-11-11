@@ -207,6 +207,13 @@ impl GrpcCodeModeSessionProvider {
             return Err("gRPC code-mode session lease omitted its opening event".to_string());
         };
         validate_identifier(&opened.session_id, "session ID")?;
+        if options.cell_execution_limits.max_heap_size_bytes.is_some()
+            && opened.applied_cell_execution_limits != cell_execution_limits
+        {
+            return Err(
+                "gRPC code-mode host did not acknowledge the requested heap/resource limits".into(),
+            );
+        }
         let host_mode =
             grpc::OutputTruncation::try_from(opened.output_truncation.unwrap_or_default())
                 .map_err(|_| "gRPC code-mode host returned an unknown output truncation mode")?;

@@ -37,7 +37,7 @@ use crate::runtime::RuntimeControlCommand;
 use crate::runtime::RuntimeEvent;
 use crate::runtime::RuntimeEventReceiver;
 use crate::runtime::runtime_event_channel;
-use crate::runtime::spawn_runtime;
+use crate::runtime::spawn_runtime_with_heap_limit;
 use crate::session_runtime::CellEvent;
 use crate::session_runtime::CreateCellRequest as CellRequest;
 use crate::session_runtime::Observation;
@@ -54,6 +54,7 @@ impl CellActor {
         initial_observation: Observation,
         cell_state: Arc<CellState>,
         task_failure_handler: Option<TaskFailureHandler>,
+        max_heap_size_bytes: Option<usize>,
     ) -> Result<
         (
             CellHandle,
@@ -66,13 +67,15 @@ impl CellActor {
         let output = OutputCollector::new(request.output_truncation);
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (initial_response_tx, initial_response_rx) = oneshot::channel();
-        let (runtime_tx, runtime_control_tx, runtime_terminate_handle) = spawn_runtime(
-            stored_values,
-            runtime_request(request),
-            event_tx,
-            PendingRuntimeMode::PauseUntilResumed,
-            task_failure_handler.clone(),
-        )?;
+        let (runtime_tx, runtime_control_tx, runtime_terminate_handle) =
+            spawn_runtime_with_heap_limit(
+                stored_values,
+                runtime_request(request),
+                event_tx,
+                PendingRuntimeMode::PauseUntilResumed,
+                task_failure_handler.clone(),
+                max_heap_size_bytes,
+            )?;
         let handle = CellHandle::new(command_tx, Arc::clone(&cell_state));
         let task = run_cell(
             host,

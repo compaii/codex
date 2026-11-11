@@ -1034,6 +1034,10 @@ impl Session {
         error: Option<ErrorEvent>,
     ) {
         let sub_id = task.turn_context.sub_id.clone();
+        let bounded = crate::turn_inference::allowance(&task.turn_context);
+        if let Some(allowance) = &bounded {
+            allowance.close();
+        }
         if task.cancellation_token.is_cancelled() {
             self.emit_turn_abort_lifecycle(reason, task.turn_context.extension_data.as_ref())
                 .await;
@@ -1043,6 +1047,7 @@ impl Session {
         trace!(task_kind = ?task.kind, sub_id, "aborting running task");
         task.cancellation_token.cancel();
         if reason == TurnAbortReason::Interrupted
+            && bounded.is_none()
             && task
                 .turn_context
                 .config

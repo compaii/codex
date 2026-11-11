@@ -331,3 +331,41 @@ AF_UNIX sockets, owner RPCs and provider reauthentication routes need separate
 qualification. Restricting advertised names alone does not prove these routes
 are inaccessible. No public bounded-start field, receiver configuration, paid
 call, account change or production activation is introduced by this host option.
+
+### Bounded Code Mode sessions
+
+A trusted embedding host supplies `BoundedCodeModeOptions(CodeModeSessionOptions)`
+through the existing `WithTurnExtensionData` initializer. Core privately captures
+that policy for each new turn; later attachment changes cannot replace its limits.
+A bounded Code Mode execution requires positive heap and observation limits. An
+ordinary turn ignores this bounded policy and keeps its existing thread session.
+This is not a model-selected option or a public bounded-start JSON field.
+
+Bounded turns use the provider's process-isolated session operation. Unsupported
+providers refuse before opening an ordinary/shared session. Core's local gRPC
+provider gives each bounded turn its own host process. Session close, turn drop,
+service shutdown and the original allocation deadline close only that session;
+private host teardown also prevents transport re-spawn. Bounded task interruption
+must not interrupt the older human session's cells.
+
+Cell identifiers, responses and nested-tool/notification callbacks carry a
+turn-specific namespace. Wait and terminate reject another execution's identifiers
+before contacting its host, even when separate runtime sessions both use numeric
+cell IDs such as `1`. Output truncation follows the selected session's actual mode.
+
+The existing heap option now reaches each V8 isolate instead of being discarded.
+The gRPC opening event acknowledges the applied limits; a heap-limited client
+rejects an older host that omits or changes that acknowledgement. V8 heap exhaustion
+can abort a host process, which is why a shared-host fallback is forbidden here.
+The isolate heap limit does not bound total host RSS, external buffers or retained
+JSON state; owning process/container resource qualification remains necessary.
+Credentials/IPC, trusted startup/hooks and exclusive provider routes remain
+separate unfinished requirements before claiming complete financial isolation.
+
+Local Code Mode host builds use the Codex-owned V8 artifacts selected by
+`.github/actions/setup-rusty-v8/action.yml`, with the release manifest pinned in
+`third_party/v8`. Set `RUSTY_V8_ARCHIVE` and `RUSTY_V8_SRC_BINDING_PATH` to those
+checksum-verified artifacts, as CI does; the generic Deno release does not publish
+this Codex sandbox variant. Retain a single useful version in bounded build
+storage. Do not substitute an unverified artifact or start a source rebuild merely
+because the generic downloader fails.

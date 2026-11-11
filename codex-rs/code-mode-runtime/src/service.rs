@@ -61,14 +61,11 @@ impl InProcessCodeModeSession {
         task_failure_handler: Option<TaskFailureHandler>,
     ) -> Self {
         Self {
-            runtime: SessionRuntime::new_with_task_failure_handler(task_failure_handler),
-            options: CodeModeSessionOptions {
-                cell_execution_limits: CodeModeSessionCellExecutionLimits {
-                    max_heap_size_bytes: None,
-                    ..options.cell_execution_limits
-                },
-                ..options
-            },
+            runtime: SessionRuntime::new_with_cell_heap_limit(
+                task_failure_handler,
+                options.cell_execution_limits.max_heap_size_bytes,
+            ),
+            options,
         }
     }
 

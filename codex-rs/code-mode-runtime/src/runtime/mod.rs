@@ -72,6 +72,7 @@ pub(crate) enum RuntimeEvent {
     ThreadPanicked,
 }
 
+#[cfg(test)]
 pub(crate) fn spawn_runtime(
     stored_values: HashMap<String, Arc<JsonValue>>,
     request: ExecuteRequest,
@@ -86,6 +87,34 @@ pub(crate) fn spawn_runtime(
     ),
     String,
 > {
+    spawn_runtime_with_heap_limit(
+        stored_values,
+        request,
+        event_tx,
+        pending_mode,
+        task_failure_handler,
+        None,
+    )
+}
+
+pub(crate) fn spawn_runtime_with_heap_limit(
+    stored_values: HashMap<String, Arc<JsonValue>>,
+    request: ExecuteRequest,
+    event_tx: impl Into<RuntimeEventSender>,
+    pending_mode: PendingRuntimeMode,
+    task_failure_handler: Option<TaskFailureHandler>,
+    max_heap_size_bytes: Option<usize>,
+) -> Result<
+    (
+        std_mpsc::Sender<RuntimeCommand>,
+        std_mpsc::Sender<RuntimeControlCommand>,
+        v8::IsolateHandle,
+    ),
+    String,
+> {
+    if max_heap_size_bytes == Some(0) {
+        return Err("code-mode heap limit must be positive".into());
+    }
     let event_tx = event_tx.into();
     ensure_v8_initialized()?;
 
@@ -108,6 +137,7 @@ pub(crate) fn spawn_runtime(
         enabled_tools,
         source: request.source,
         stored_values,
+        max_heap_size_bytes,
     };
 
     let runtime_handle = tokio::runtime::Handle::current();
@@ -148,6 +178,7 @@ fn spawn_supervised_runtime_thread(
 
 #[derive(Clone)]
 struct RuntimeConfig {
+    max_heap_size_bytes: Option<usize>,
     tool_call_id: String,
     enabled_tools: Vec<EnabledToolMetadata>,
     source: String,
@@ -188,7 +219,11 @@ fn run_runtime(
     isolate_handle_tx: std_mpsc::SyncSender<v8::IsolateHandle>,
     runtime_command_tx: std_mpsc::Sender<RuntimeCommand>,
 ) {
-    let isolate = &mut v8::Isolate::new(v8::CreateParams::default());
+    let params = match config.max_heap_size_bytes {
+        Some(limit) => v8::CreateParams::default().heap_limits(0, limit),
+        None => v8::CreateParams::default(),
+    };
+    let isolate = &mut v8::Isolate::new(params);
     let isolate_handle = isolate.thread_safe_handle();
     if isolate_handle_tx.send(isolate_handle).is_err() {
         return;
