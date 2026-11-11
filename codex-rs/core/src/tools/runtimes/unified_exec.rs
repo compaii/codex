@@ -43,6 +43,7 @@ use crate::unified_exec::UnifiedExecProcessManager;
 use codex_core_plugins::PluginMetricsSidecar;
 use codex_features::Feature;
 use codex_network_proxy::CREDENTIAL_BROKER_ACTIVE_ENV_KEY;
+use codex_network_proxy::CredentialMaskingFailureMode;
 use codex_network_proxy::ManagedNetworkSandboxContext;
 use codex_network_proxy::NetworkProxy;
 use codex_network_proxy::RemoteCredentialMasking;
@@ -507,7 +508,12 @@ impl<'a> ToolRuntime<UnifiedExecRequest<'_>, UnifiedExecAttempt> for UnifiedExec
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.exists());
         if brokered_shell_snapshot_missing && let Some(network) = managed_network {
-            network.restore_and_disable_brokered_credentials(&mut env, &mut command);
+            restore_broker_fallback(
+                network,
+                &mut env,
+                &mut command,
+                attempt.permission_ceiling.is_some(),
+            )?;
             let message = "Credential masking is unavailable because a protected shell snapshot could not be created. This command will run with unmasked credentials.";
             tracing::warn!("{message}");
             ctx.session
@@ -541,7 +547,12 @@ impl<'a> ToolRuntime<UnifiedExecRequest<'_>, UnifiedExecAttempt> for UnifiedExec
                 .is_some_and(|active| active == "1")
             && let Some(network) = managed_network
         {
-            network.restore_and_disable_brokered_credentials(&mut env, &mut command);
+            restore_broker_fallback(
+                network,
+                &mut env,
+                &mut command,
+                attempt.permission_ceiling.is_some(),
+            )?;
         }
         // The executor selection is Disabled for non-Windows target paths, so this
         // preparation is a no-op for PowerShell on other platforms.
@@ -614,6 +625,21 @@ impl<'a> ToolRuntime<UnifiedExecRequest<'_>, UnifiedExecAttempt> for UnifiedExec
             permissions
         };
 
+        if attempt.permission_ceiling.is_some()
+            && env
+                .get(CREDENTIAL_BROKER_ACTIVE_ENV_KEY)
+                .is_some_and(|active| active == "1")
+            && let Some(network) = managed_network
+        {
+            network
+                .handle_unmasked_credentials(&mut env, CredentialMaskingFailureMode::Error)
+                .map_err(|_| {
+                    ToolError::Rejected(
+                        "host-restricted execution could not protect command credentials".into(),
+                    )
+                })?;
+        }
+
         let command = build_unified_exec_sandbox_command(
             &command,
             &prepared.cwd,
@@ -654,6 +680,23 @@ impl<'a> ToolRuntime<UnifiedExecRequest<'_>, UnifiedExecAttempt> for UnifiedExec
             permissions,
         })
     }
+}
+
+// A host-restricted command may not silently regain real credentials when a
+// protected startup is unavailable. Check before mutating either trusted input.
+fn restore_broker_fallback(
+    network: &NetworkProxy,
+    env: &mut HashMap<String, String>,
+    command: &mut [String],
+    host_restricted: bool,
+) -> Result<(), ToolError> {
+    if host_restricted {
+        return Err(ToolError::Rejected(
+            "host-restricted execution requires protected credential startup".into(),
+        ));
+    }
+    network.restore_and_disable_brokered_credentials(env, command);
+    Ok(())
 }
 
 async fn warn_if_remote_credential_masking_unavailable(
@@ -872,5 +915,32 @@ mod tests {
                 proposed_execpolicy_amendment: None,
             },
         }
+    }
+    #[tokio::test]
+    async fn restricted_broker_fallback_refuses_before_restoring_real_credentials()
+    -> anyhow::Result<()> {
+        let proxy = crate::tools::runtimes::tests::test_credential_broker_network_proxy().await?;
+        let original = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let mut env = HashMap::from([("GH_TOKEN".to_string(), original.to_string())]);
+        proxy.apply_to_env(&mut env);
+        assert_ne!(env["GH_TOKEN"], original);
+        let mut command = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!("printf %s {}", env["GH_TOKEN"]),
+        ];
+        let protected_env = env.clone();
+        let protected_command = command.clone();
+        assert!(matches!(
+            restore_broker_fallback(&proxy, &mut env, &mut command, true),
+            Err(ToolError::Rejected(_))
+        ));
+        assert_eq!(env, protected_env);
+        assert_eq!(command, protected_command);
+        assert!(restore_broker_fallback(&proxy, &mut env, &mut command, false).is_ok());
+        assert_eq!(env["GH_TOKEN"], original);
+        assert_eq!(command, protected_command);
+        assert!(!env.contains_key(CREDENTIAL_BROKER_ACTIVE_ENV_KEY));
+        Ok(())
     }
 }
