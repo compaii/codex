@@ -778,6 +778,7 @@ impl TurnRequestProcessor {
         let request = TurnInputRequest::new(input)
             .with_thread_settings(thread_settings)
             .on_start(TurnStartOptions {
+                tool_ceiling: None,
                 inference_allowance,
                 provider_attempt_gate: reservation
                     .map(codex_protocol::provider_attempt::ProviderAttemptGateSelection),

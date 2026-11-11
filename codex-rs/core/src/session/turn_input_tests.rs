@@ -1617,3 +1617,132 @@ async fn per_turn_caller_cannot_replace_an_existing_host_reservation_policy() {
             .is_none()
     );
 }
+
+#[test]
+fn host_tool_ceiling_intersection_never_widens_either_policy() {
+    use codex_extension_api::ToolPolicy;
+    use codex_protocol::ToolName;
+    let plain = ToolName {
+        namespace: None,
+        name: "exec".into(),
+    };
+    let alias = ToolName {
+        namespace: Some("functions".into()),
+        name: "exec".into(),
+    };
+    let external = ToolName {
+        namespace: Some("remote".into()),
+        name: "exec".into(),
+    };
+    let base = ToolPolicy {
+        allowed_tools: Some(vec![plain.clone(), external.clone()]),
+        ..Default::default()
+    };
+    let ceiling = ToolPolicy {
+        allowed_tools: Some(vec![alias.clone()]),
+        require_managed_sandbox: true,
+        require_unified_exec: true,
+        expose_additional_permissions: false,
+    };
+    for policy in [base.intersect(&ceiling), ceiling.intersect(&base)] {
+        assert!(policy.allows(&plain));
+        assert!(policy.allows(&alias));
+        assert!(!policy.allows(&external));
+        assert!(policy.require_managed_sandbox);
+        assert!(policy.require_unified_exec);
+        assert!(!policy.expose_additional_permissions);
+        assert!(
+            !policy
+                .intersect(&ToolPolicy {
+                    allowed_tools: Some(vec![]),
+                    ..Default::default()
+                })
+                .allows(&plain)
+        );
+    }
+}
+
+#[tokio::test]
+async fn host_tool_ceiling_is_transient_and_requires_finite_allowance() {
+    let (session, _, _rx) = make_session_and_context_with_rx().await;
+    let tool = codex_protocol::ToolName {
+        namespace: None,
+        name: "exec".into(),
+    };
+    assert!(
+        PreparedTurnInputSettings::prepare(
+            &session,
+            ThreadSettingsOverrides::default(),
+            TurnStartOptions {
+                tool_ceiling: Some(vec![tool.clone()]),
+                ..Default::default()
+            }
+        )
+        .await
+        .is_err()
+    );
+    let bounded = PreparedTurnInputSettings::prepare(
+        &session,
+        ThreadSettingsOverrides::default(),
+        TurnStartOptions {
+            tool_ceiling: Some(vec![tool.clone()]),
+            inference_allowance: Some(codex_protocol::turn_input::TurnInferenceAllowance {
+                max_provider_attempts: 2,
+                max_request_bytes: 4096,
+                deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("prepare bounded tools")
+    .apply_started(&session, "restricted-tools".into(), TurnStartKind::User)
+    .await
+    .expect("admit")
+    .expect("context");
+    assert!(bounded.has_tool_ceiling());
+    let policy = bounded.effective_tool_policy(&session.tool_policy);
+    assert!(policy.allows(&tool));
+    assert!(!policy.allows(&codex_protocol::ToolName {
+        namespace: None,
+        name: "other".into()
+    }));
+    assert!(!policy.expose_additional_permissions);
+    let ordinary = PreparedTurnInputSettings::prepare(
+        &session,
+        ThreadSettingsOverrides::default(),
+        TurnStartOptions::default(),
+    )
+    .await
+    .expect("prepare human turn")
+    .apply_started(&session, "ordinary-tools".into(), TurnStartKind::User)
+    .await
+    .expect("admit human")
+    .expect("context");
+    assert!(!ordinary.has_tool_ceiling());
+    assert!(Arc::ptr_eq(
+        &ordinary.effective_tool_policy(&session.tool_policy),
+        &session.tool_policy
+    ));
+}
+
+#[tokio::test]
+async fn host_tool_ceiling_cannot_be_discarded_by_steering() {
+    let (session, _, _rx) = make_session_and_context_with_rx().await;
+    for mode in [
+        TurnInputMode::StartOrSteer,
+        TurnInputMode::Steer {
+            expected_turn_id: "restricted-target".into(),
+        },
+    ] {
+        let request = TurnInputRequest::user_input(vec![]).on_start(TurnStartOptions {
+            tool_ceiling: Some(vec![]),
+            ..Default::default()
+        });
+        assert!(
+            handle(&session, request, mode, "restricted-steering".into())
+                .await
+                .is_err()
+        );
+    }
+}

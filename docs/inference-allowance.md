@@ -253,3 +253,33 @@ only. It grants no provider call and settles no money. Signing/verifying exact
 usage under the existing accounting authority, full exposure/credential-route
 qualification and receiving adoption remain unfinished. No new balance, signer,
 account, provider selection, model call or runtime activation follows here.
+
+
+## Host-only transient tool ceiling
+
+An embedding host can additionally set `TurnStartOptions.tool_ceiling` to an
+explicit list of `ToolName` values. `None` preserves ordinary selection; an empty
+list exposes no tools. This option requires a finite inference allowance and
+idle-only admission. It is not currently an app-server JSON option.
+
+Core captures the list in a private turn attachment, intersects it with the
+startup `ToolPolicy`, and uses that intersection before constructing core,
+extension, hosted, dynamic and MCP tool exposure. Generated Code Mode tools must
+also be explicitly included. Restrictive sandbox/unified-exec requirements are
+combined with OR; exposing additional permissions requires both policies to allow
+it. The ceiling never changes persistent thread configuration or the next
+independent human turn. Review-context construction retains the attachment.
+
+Dispatch checks the effective policy before invocation reservation, environment
+selection, hooks or handlers. A retained restricted context requires the same
+currently active turn; an older unrestricted context cannot use its authority
+while a restricted turn is active. Existing unrestricted dispatch remains
+compatible when neither context is restricted.
+
+This is a tool-selection and dispatch boundary, not complete financial isolation.
+An allowed tool still needs its own enforceable permission/resource boundary.
+Previously started terminals, Code Mode resources, local credential files,
+AF_UNIX sockets, owner RPCs and provider reauthentication routes need separate
+qualification. Restricting advertised names alone does not prove these routes
+are inaccessible. No public bounded-start field, receiver configuration, paid
+call, account change or production activation is introduced by this host option.

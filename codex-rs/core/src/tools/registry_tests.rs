@@ -887,3 +887,129 @@ fn test_invocation(
         },
     }
 }
+
+#[tokio::test]
+async fn host_tool_ceiling_rejects_cached_registry_before_handler_and_hooks() {
+    let (mut session, _) = crate::session::tests::make_session_and_context().await;
+    let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+    builder.tool_lifecycle_contributor(Arc::new(ToolLifecycleRecorder {
+        records: Arc::clone(&records),
+    }));
+    session.services.extensions = Arc::new(builder.build());
+    let session = Arc::new(session);
+    let denied_tool = codex_tools::ToolName::plain("cached_human_tool");
+    let registry = ToolRegistry::from_tools([Arc::new(TestHandler {
+        tool_name: denied_tool.clone(),
+    }) as Arc<dyn CoreToolRuntime>]);
+    let turn = session
+        .new_turn_with_default_settings(
+            "restricted-dispatch".into(),
+            crate::session::turn_context::NewTurnContextOptions {
+                tool_ceiling: Some(vec![]),
+                ..Default::default()
+            },
+        )
+        .await;
+    let result = registry
+        .dispatch_any_with_state(
+            test_invocation(Arc::clone(&session), turn, "blocked-call", denied_tool),
+            None,
+        )
+        .await;
+    assert_eq!(
+        result.err().expect("deny cached tool").to_string(),
+        "tool is outside this turn's host ceiling"
+    );
+    assert!(records.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn host_tool_ceiling_rejects_retained_context_without_active_owner() {
+    let (session, _) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let tool = codex_tools::ToolName::plain("allowed_tool");
+    let registry = ToolRegistry::from_tools([Arc::new(TestHandler {
+        tool_name: tool.clone(),
+    }) as Arc<dyn CoreToolRuntime>]);
+    let turn = session
+        .new_turn_with_default_settings(
+            "retired-restricted-dispatch".into(),
+            crate::session::turn_context::NewTurnContextOptions {
+                tool_ceiling: Some(vec![tool.clone()]),
+                ..Default::default()
+            },
+        )
+        .await;
+    let result = registry
+        .dispatch_any_with_state(test_invocation(session, turn, "retained-call", tool), None)
+        .await;
+    assert_eq!(
+        result.err().expect("deny retired authority").to_string(),
+        "retained tool context is not the active restricted turn"
+    );
+}
+
+struct HostCeilingWaitingTask;
+impl crate::tasks::SessionTask for HostCeilingWaitingTask {
+    fn kind(&self) -> crate::state::TaskKind {
+        crate::state::TaskKind::Regular
+    }
+    fn span_name(&self) -> &'static str {
+        "host_ceiling_test"
+    }
+    async fn run(
+        self: Arc<Self>,
+        _: Arc<Session>,
+        _: Arc<crate::session::turn_context::TurnContext>,
+        _: Vec<crate::session::TurnInput>,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> crate::tasks::SessionTaskResult {
+        cancellation.cancelled().await;
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn host_tool_ceiling_allows_current_owner_but_rejects_older_human_context() {
+    let (session, old_turn, _rx) = crate::session::tests::make_session_and_context_with_rx().await;
+    let tool = codex_tools::ToolName::plain("allowed_tool");
+    let registry = ToolRegistry::from_tools([Arc::new(TestHandler {
+        tool_name: tool.clone(),
+    }) as Arc<dyn CoreToolRuntime>]);
+    let turn = session
+        .new_turn_with_default_settings(
+            "current-restricted-owner".into(),
+            crate::session::turn_context::NewTurnContextOptions {
+                tool_ceiling: Some(vec![tool.clone()]),
+                ..Default::default()
+            },
+        )
+        .await;
+    session
+        .spawn_task(Arc::clone(&turn), Vec::new(), HostCeilingWaitingTask)
+        .await;
+    let allowed = registry
+        .dispatch_any_with_state(
+            test_invocation(Arc::clone(&session), turn, "owned-call", tool.clone()),
+            None,
+        )
+        .await;
+    assert!(allowed.is_ok(), "current owner must retain allowed tools");
+    let stale = registry
+        .dispatch_any_with_state(
+            test_invocation(Arc::clone(&session), old_turn, "old-human-call", tool),
+            None,
+        )
+        .await;
+    assert_eq!(
+        stale
+            .err()
+            .expect("deny earlier human authority")
+            .to_string(),
+        "retained tool context is not the active restricted turn"
+    );
+    session
+        .abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted)
+        .await;
+}

@@ -117,6 +117,24 @@ impl PreparedTurnInputSettings {
                 "provider reservation requires a finite allowance".into(),
             ));
         }
+        if let Some(tools) = &start_options.tool_ceiling {
+            if start_options.inference_allowance.is_none()
+                || tools.len() > 256
+                || tools.iter().any(|tool| {
+                    tool.name.is_empty()
+                        || tool.name.len() > 200
+                        || tool.name.chars().any(char::is_control)
+                        || tool.namespace.as_ref().is_some_and(|namespace| {
+                            namespace.len() > 200 || namespace.chars().any(char::is_control)
+                        })
+                })
+            {
+                return Err(CodexErr::InvalidRequest(
+                    "bounded host tool ceiling requires a finite allowance and bounded names"
+                        .into(),
+                ));
+            }
+        }
         let inference_allowance = start_options
             .inference_allowance
             .as_ref()
@@ -160,6 +178,7 @@ impl PreparedTurnInputSettings {
         kind: TurnStartKind,
     ) -> CodexResult<Option<Arc<TurnContext>>> {
         let TurnStartOptions {
+            tool_ceiling,
             inference_allowance: inference_spec,
             provider_attempt_gate,
             turn_trigger,
@@ -180,6 +199,7 @@ impl PreparedTurnInputSettings {
         updates.service_tier_for_turn = service_tier;
 
         let options = NewTurnContextOptions {
+            tool_ceiling,
             final_output_json_schema,
             cyber_access_program,
         };
@@ -305,6 +325,11 @@ pub(super) async fn handle(
         .values()
         .try_for_each(AdditionalContextEntry::validate)
         .map_err(|message| CodexErr::InvalidRequest(message.to_owned()))?;
+    if request.request.start.tool_ceiling.is_some() && !matches!(mode, TurnInputMode::StartIfIdle) {
+        return Err(CodexErr::InvalidRequest(
+            "a host tool ceiling requires idle-only turn admission".into(),
+        ));
+    }
     let result = match mode {
         TurnInputMode::StartOrSteer => start_or_steer(session, request, submission_id).await,
         TurnInputMode::StartIfIdle => {

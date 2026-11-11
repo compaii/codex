@@ -315,9 +315,14 @@ impl std::fmt::Debug for TurnEnvironment {
 /// Request options for one turn, separate from persistent thread settings.
 #[derive(Default)]
 pub(crate) struct NewTurnContextOptions {
+    pub(crate) tool_ceiling: Option<Vec<codex_protocol::ToolName>>,
     pub(crate) final_output_json_schema: Option<Value>,
     pub(crate) cyber_access_program: Option<CyberAccessProgram>,
 }
+
+/// Private attachment: extensions cannot replace this host-captured ceiling.
+#[derive(Clone, Debug)]
+struct TurnToolCeiling(codex_extension_api::ToolPolicy);
 
 /// The context needed for a single turn of the thread.
 #[derive(Debug)]
@@ -400,6 +405,20 @@ enum TurnContextBuildMode {
 }
 
 impl TurnContext {
+    pub(crate) fn has_tool_ceiling(&self) -> bool {
+        self.extension_data.get::<TurnToolCeiling>().is_some()
+    }
+
+    pub(crate) fn effective_tool_policy(
+        &self,
+        session_policy: &Arc<codex_extension_api::ToolPolicy>,
+    ) -> Arc<codex_extension_api::ToolPolicy> {
+        match self.extension_data.get::<TurnToolCeiling>() {
+            Some(ceiling) => Arc::new(session_policy.intersect(&ceiling.0)),
+            None => Arc::clone(session_policy),
+        }
+    }
+
     /// Returns the resolved causal root for this admitted turn.
     pub(crate) fn root_turn_id(&self) -> String {
         self.turn_metadata_state
@@ -419,6 +438,9 @@ impl TurnContext {
         let session_telemetry = step_settings.telemetry(&self.session_telemetry);
         let extension_data = Arc::new(codex_extension_api::ExtensionData::new(sub_id.clone()));
         extension_data.insert(self.skills_snapshot().as_ref().clone());
+        if let Some(ceiling) = self.extension_data.get::<TurnToolCeiling>() {
+            extension_data.insert_arc(ceiling);
+        }
 
         Self {
             sub_id,
@@ -1390,6 +1412,16 @@ impl Session {
         );
         turn_context.realtime_active = self.conversation.running_state().await.is_some();
 
+        if let Some(allowed_tools) = options.tool_ceiling {
+            turn_context
+                .extension_data
+                .insert(TurnToolCeiling(codex_extension_api::ToolPolicy {
+                    allowed_tools: Some(allowed_tools),
+                    require_managed_sandbox: true,
+                    require_unified_exec: true,
+                    expose_additional_permissions: false,
+                }));
+        }
         turn_context.final_output_json_schema = options.final_output_json_schema;
         turn_context.cyber_access_program =
             cyber_access_program::for_provider(&turn_context.config, options.cyber_access_program);
