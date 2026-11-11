@@ -6,6 +6,9 @@ use codex_protocol::ThreadId;
 
 pub(super) fn server_request_thread_id(request: &ServerRequest) -> Option<ThreadId> {
     match request {
+        ServerRequest::ProviderAttemptReservation { params, .. } => {
+            ThreadId::from_string(&params.thread_id).ok()
+        }
         ServerRequest::CommandExecutionRequestApproval { params, .. } => {
             ThreadId::from_string(&params.thread_id).ok()
         }

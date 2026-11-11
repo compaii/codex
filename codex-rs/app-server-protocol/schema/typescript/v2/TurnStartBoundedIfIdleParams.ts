@@ -8,4 +8,10 @@ import type { TurnStartParams } from "./TurnStartParams";
  * Mandatory bounded idle-only admission. An older server must reject this
  * method rather than ignore an optional field on ordinary turn/start.
  */
-export type TurnStartBoundedIfIdleParams = { turn: TurnStartParams, allowance: TurnInferenceAllowance, };
+export type TurnStartBoundedIfIdleParams = { turn: TurnStartParams, allowance: TurnInferenceAllowance,
+/**
+ * Owner journal cycle whose exact physical attempts require a reservation
+ * response from this initiating connection. This is not a budget grant.
+ * Older bounded-start servers reject this field rather than ignore it.
+ */
+providerReservationCycleId?: string, };

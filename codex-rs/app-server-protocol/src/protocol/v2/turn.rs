@@ -315,6 +315,36 @@ pub struct TurnStartBoundedIfIdleParams {
     #[experimental(nested)]
     pub turn: TurnStartParams,
     pub allowance: codex_protocol::turn_input::TurnInferenceAllowance,
+    /// Owner journal cycle whose exact physical attempts require a reservation
+    /// response from this initiating connection. This is not a budget grant.
+    /// Older bounded-start servers reject this field rather than ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub provider_reservation_cycle_id: Option<String>,
+}
+
+/// Host accounting request, never a model tool or human approval ceremony.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct ProviderAttemptReservationParams {
+    pub thread_id: String,
+    pub cycle_id: String,
+    pub attempt_id: String,
+    pub ordinal: u32,
+    pub max_request_bytes: u32,
+    pub deadline_unix_ms: i64,
+}
+
+/// Authorizes only the exact retained journal operation. A lost response must
+/// retain exposure; repeating this request must never mint a replacement call.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct ProviderAttemptReservationResponse {
+    pub cycle_id: String,
+    pub attempt_id: String,
+    pub authorized: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

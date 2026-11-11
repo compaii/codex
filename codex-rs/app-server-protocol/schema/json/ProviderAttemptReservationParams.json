@@ -1,0 +1,40 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "description": "Host accounting request, never a model tool or human approval ceremony.",
+  "properties": {
+    "attemptId": {
+      "type": "string"
+    },
+    "cycleId": {
+      "type": "string"
+    },
+    "deadlineUnixMs": {
+      "format": "int64",
+      "type": "integer"
+    },
+    "maxRequestBytes": {
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "ordinal": {
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "threadId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "attemptId",
+    "cycleId",
+    "deadlineUnixMs",
+    "maxRequestBytes",
+    "ordinal",
+    "threadId"
+  ],
+  "title": "ProviderAttemptReservationParams",
+  "type": "object"
+}

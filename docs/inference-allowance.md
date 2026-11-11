@@ -80,6 +80,37 @@ terminal versus uncertain observation. These are request/input/time bounds,
 not a hard total-token, output-token or monetary ceiling. No model/provider,
 account, goal or tool authority is granted by this value.
 
+## Owner-connected per-attempt reservations
+
+A bounded idle start may additionally select `providerReservationCycleId`, the
+canonical UUID of an already authorized owner journal cycle. Older bounded-start
+readers reject this unknown field; clients must never retry without it. Core
+attaches the resulting gate to this physical turn only, not to saved thread
+settings or a future human turn. An existing persistent host reservation policy
+cannot be replaced by a caller's per-turn gate. The host-only callback types are
+shared through `codex_protocol::provider_attempt` and reexported by `codex_api`;
+they are not serializable provider or model input.
+
+Before each physical provider send, `turn/providerAttempt/reserve` carries the
+thread/cycle/attempt UUID, attempt ordinal, complete configured request-byte
+ceiling and original absolute deadline to the initiating connection only. That
+owner must use its existing durable accounting journal and verified conservative
+cost contract before returning the exact cycle/attempt and `authorized: true`.
+An unrelated subscriber cannot answer, reject, adopt or receive a reconnect
+replay of the request. Missing/negative/malformed/mismatched responses, owner
+disconnect or the original deadline refuse submission; callback cancellation
+also covers a backpressured outgoing channel. Ordinary human approvals and
+their replay semantics are unchanged. Exec/TUI clients do not implement the
+account owner and refuse this request rather than presenting a human prompt.
+
+Authorization is not proof that provider bytes were sent or that usage settled.
+A lost response retains journal exposure and the original attempt identity.
+This bridge neither creates accounts/prices nor authenticates a provider usage
+receipt. Actual owner integration, trusted per-attempt usage, output/exposure
+qualification and exclusive credential/tool routes remain separate requirements
+before claiming monetary enforcement. No receiving package or account is selected
+by this source interface.
+
 
 ## Historical image previews in bounded requests
 

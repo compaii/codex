@@ -195,6 +195,12 @@ impl PendingAppServerRequests {
                 );
                 None
             }
+            ServerRequest::ProviderAttemptReservation { request_id, .. } => {
+                Some(UnsupportedAppServerRequest {
+                    request_id: request_id.clone(),
+                    message: "Provider accounting owner is not configured in TUI.".to_string(),
+                })
+            }
             ServerRequest::DynamicToolCall { .. } => None,
             ServerRequest::ChatgptAuthTokensRefresh { .. } => None,
             ServerRequest::AttestationGenerate { request_id, .. } => {
@@ -528,7 +534,8 @@ impl PendingAppServerRequests {
                 })
             }
             ServerRequest::ChatgptAuthTokensRefresh { .. } => None,
-            ServerRequest::DynamicToolCall { .. }
+            ServerRequest::ProviderAttemptReservation { .. }
+            | ServerRequest::DynamicToolCall { .. }
             | ServerRequest::AttestationGenerate { .. }
             | ServerRequest::CurrentTimeRead { .. }
             | ServerRequest::ApplyPatchApproval { .. }

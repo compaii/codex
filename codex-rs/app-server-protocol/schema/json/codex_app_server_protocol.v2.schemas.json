@@ -25087,6 +25087,13 @@
         "allowance": {
           "$ref": "#/definitions/TurnInferenceAllowance"
         },
+        "providerReservationCycleId": {
+          "description": "Owner journal cycle whose exact physical attempts require a reservation response from this initiating connection. This is not a budget grant. Older bounded-start servers reject this field rather than ignore it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "turn": {
           "$ref": "#/definitions/TurnStartParams"
         }
