@@ -34,7 +34,21 @@ async fn context(
                 turn_extension_init: Some(init),
                 ..Default::default()
             },
-            Default::default(),
+            crate::session::turn_context::NewTurnContextOptions {
+                permission_ceiling: Some(codex_protocol::models::PermissionProfile::read_only()),
+                tool_ceiling: Some(vec![]),
+                command_environment_policy: Some(
+                    codex_protocol::config_types::ShellEnvironmentPolicy {
+                        inherit: codex_protocol::config_types::ShellEnvironmentPolicyInherit::None,
+                        r#set: std::collections::HashMap::from([
+                            ("PATH".into(), "/usr/bin:/bin".into()),
+                            ("BOUNDED_HOST_MARKER".into(), "selected-fixture".into()),
+                        ]),
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            },
         )
         .await?;
     let allowance = Arc::new(codex_api::InferenceAllowance::new(
@@ -132,7 +146,22 @@ fn bounded_code_mode_native_sessions_isolate_heap_names_state_and_lifetime() -> 
         let (_, response) =
             run(&service, &human, "store('human',42); text(load('human'));").await?;
         assert_eq!(result_text(&response), "42");
+        let ambient_key = ["HOME", "USER", "LANG"]
+            .into_iter()
+            .find(|key| std::env::var_os(key).is_some())
+            .expect("native host fixture has an ambient environment");
+        let has_env = |pid: u32, key: &str, value: Option<&str>| -> anyhow::Result<bool> {
+            let raw = std::fs::read(format!("/proc/{pid}/environ"))?;
+            let prefix = format!("{key}=");
+            Ok(raw.split(|byte| *byte == 0).any(|entry| {
+                entry.strip_prefix(prefix.as_bytes()).is_some_and(|actual| {
+                    value.is_none_or(|expected| actual == expected.as_bytes())
+                })
+            }))
+        };
         let human_pid = recorder.pid()?;
+        assert!(has_env(human_pid, ambient_key, None)?);
+        assert!(!has_env(human_pid, "BOUNDED_HOST_MARKER", None)?);
         let human_session = service.session().await.map_err(anyhow::Error::msg)?;
         let (legacy, _) = session
             .new_turn_with_sub_id(
@@ -200,6 +229,14 @@ fn bounded_code_mode_native_sessions_isolate_heap_names_state_and_lifetime() -> 
             );
             let private_pid = recorder.pid()?;
             assert_ne!(private_pid, human_pid);
+            assert!(has_env(
+                private_pid,
+                "BOUNDED_HOST_MARKER",
+                Some("selected-fixture")
+            )?);
+            assert!(!has_env(private_pid, ambient_key, None)?);
+            assert!(has_env(human_pid, ambient_key, None)?);
+            assert!(!has_env(human_pid, "BOUNDED_HOST_MARKER", None)?);
             let refused = service
                 .wait(
                     codex_code_mode::WaitRequest {
