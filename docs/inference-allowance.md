@@ -447,3 +447,19 @@ This binds shell preparation to a host selection; it does not sanitize arbitrary
 host-provided values or prove every runtime-added variable, descriptor, startup
 hook, Code Mode host, provider route or receiving funded profile. Those remain
 explicit parts of complete-profile qualification and accounting authority.
+
+### Private Code Mode host environment
+
+The same private turn command policy also supplies the environment for a
+process-isolated Code Mode host. Core derives the explicit map with the existing
+shell-policy helper and passes it through the isolated-session provider API.
+The built-in owner clears process inheritance before applying the map and the
+existing non-inheritable launch-token scrub. The map is host input, not a gRPC
+OpenSession field or model-visible session option. Unsupported providers keep
+refusing isolated admission instead of creating a shared/default session.
+
+An omitted policy retains the existing ordinary/shared and legacy allowance-only
+behavior. Private-host lifetime, cell namespace, heap acknowledgment and cleanup
+use their existing controls. This is environment selection, not an OS filesystem,
+IPC, descriptor or total-RSS sandbox for the Code Mode host; those and the exact
+receiving provider/accounting profile remain separately unqualified.

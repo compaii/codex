@@ -2,6 +2,7 @@
 //! HTTP/2 connection. Only session admission can replace a dead host; metrics
 //! use the current generation and cannot reconnect. Dropping its I/O reaps the child.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
@@ -68,8 +69,10 @@ impl CodeModeSessionProvider for LocalServerOutputProvider {
     fn create_isolated_session_with_options<'a>(
         &'a self,
         options: CodeModeSessionOptions,
+        host_environment: Option<HashMap<String, String>>,
     ) -> CodeModeSessionProviderFuture<'a> {
-        self.inner.create_isolated_session_with_options(options)
+        self.inner
+            .create_isolated_session_with_options(options, host_environment)
     }
 
     fn create_session_with_limits<'a>(
@@ -93,6 +96,7 @@ impl CodeModeSessionProvider for LocalServerOutputProvider {
 
 pub struct ProcessOwnedGrpcCodeModeSessionProvider {
     host_program: PathBuf,
+    host_environment: Option<Arc<HashMap<String, String>>>,
     provider: OnceLock<GrpcCodeModeSessionProvider>,
     closed: Arc<AtomicBool>,
     current: Arc<Mutex<Option<HostChannel>>>,
@@ -102,6 +106,7 @@ impl ProcessOwnedGrpcCodeModeSessionProvider {
     pub fn with_host_program(host_program: PathBuf) -> Self {
         Self {
             host_program,
+            host_environment: None,
             provider: OnceLock::new(),
             closed: Arc::new(AtomicBool::new(false)),
             current: Arc::new(Mutex::new(None)),
@@ -142,9 +147,12 @@ impl CodeModeSessionProvider for ProcessOwnedGrpcCodeModeSessionProvider {
     fn create_isolated_session_with_options<'a>(
         &'a self,
         options: CodeModeSessionOptions,
+        host_environment: Option<HashMap<String, String>>,
     ) -> CodeModeSessionProviderFuture<'a> {
         Box::pin(async move {
-            let owner = Arc::new(Self::with_host_program(self.host_program.clone()));
+            let mut owner = Self::with_host_program(self.host_program.clone());
+            owner.host_environment = host_environment.map(Arc::new);
+            let owner = Arc::new(owner);
             let inner = owner.create_session_with_options(options).await?;
             Ok(Arc::new(IsolatedSession { inner, owner })
                 as Arc<dyn codex_code_mode::CodeModeSession>)
@@ -170,6 +178,7 @@ impl CodeModeSessionProvider for ProcessOwnedGrpcCodeModeSessionProvider {
             let provider = self.provider.get_or_init(|| {
                 let transport = Arc::new(HostTransport {
                     host_program: self.host_program.clone(),
+                    host_environment: self.host_environment.clone(),
                     current: self.current.clone(),
                     closed: self.closed.clone(),
                 });
@@ -242,6 +251,7 @@ impl codex_code_mode::CodeModeSession for IsolatedSession {
 // and dispatch. Session admission selects a new generation during recovery.
 struct HostTransport {
     host_program: PathBuf,
+    host_environment: Option<Arc<HashMap<String, String>>>,
     current: Arc<Mutex<Option<HostChannel>>>,
     closed: Arc<AtomicBool>,
 }
@@ -282,8 +292,9 @@ impl HostTransport {
                 if rpc_path != "/codex.code_mode.v1.CodeModeHost/OpenSession" {
                     return Err(Status::unavailable("code-mode host is not running"));
                 }
-                let connection = HostConnection::spawn(&self.host_program)
-                    .map_err(|error| Status::unavailable(error.to_string()))?;
+                let connection =
+                    HostConnection::spawn(&self.host_program, self.host_environment.as_deref())
+                        .map_err(|error| Status::unavailable(error.to_string()))?;
                 let alive = connection.alive.clone();
                 let connection = Arc::new(Mutex::new(Some(connection)));
                 // Preserve execution liveness detection independently of metrics cadence.
@@ -322,8 +333,14 @@ struct HostConnection {
 }
 
 impl HostConnection {
-    fn spawn(host_program: &Path) -> io::Result<Self> {
+    fn spawn(
+        host_program: &Path,
+        host_environment: Option<&HashMap<String, String>>,
+    ) -> io::Result<Self> {
         let mut command = Command::from(background_command(host_program));
+        if let Some(environment) = host_environment {
+            command.env_clear().envs(environment);
+        }
         #[cfg(unix)]
         command.process_group(/*pgroup*/ 0);
         command

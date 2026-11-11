@@ -135,8 +135,10 @@ async fn grpc_stdio_sessions_share_a_host_and_isolate_state() -> Result<()> {
 
 #[tokio::test]
 async fn grpc_stdio_host_exits_when_stdin_closes() -> Result<()> {
-    let mut connection =
-        HostConnection::spawn(&codex_utils_cargo_bin::cargo_bin("codex-code-mode-host")?)?;
+    let mut connection = HostConnection::spawn(
+        &codex_utils_cargo_bin::cargo_bin("codex-code-mode-host")?,
+        None,
+    )?;
     let mut child = connection.child.take().context("host process")?;
     drop(connection);
     let status = timeout(TEST_TIMEOUT, child.wait())

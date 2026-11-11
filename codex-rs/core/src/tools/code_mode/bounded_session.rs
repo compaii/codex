@@ -126,12 +126,15 @@ impl CodeModeService {
         .unwrap_or(u64::MAX)
         .max(1);
         limits.max_yield_time_ms = limits.max_yield_time_ms.map(|n| n.min(remaining));
+        let host_environment = turn
+            .command_environment_policy()
+            .map(|policy| crate::exec_env::create_env(&policy, None));
         state.session.get_or_try_init(|| async {
             let inner = tokio::select! {
                 biased;
                 _ = allowance.execution_finished() => return Err("bounded code mode execution ended".into()),
                 _ = self.shutdown_token.cancelled() => return Err("code mode session is shutting down".into()),
-                result = self.session_provider.create_isolated_session_with_options(options) => result?,
+                result = self.session_provider.create_isolated_session_with_options(options, host_environment) => result?,
             };
             let closed = state.closed.clone();
             let shutdown = self.shutdown_token.clone();

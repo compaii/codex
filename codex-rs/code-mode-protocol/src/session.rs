@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -238,9 +239,12 @@ pub trait CodeModeSessionProvider: Send + Sync {
 
     /// Creates a session in an exclusively owned process. Sharing a host is not
     /// an acceptable fallback: heap exhaustion must not destroy another session.
+    /// A supplied host environment replaces process inheritance before launch;
+    /// it is trusted host input, never part of the session's gRPC payload.
     fn create_isolated_session_with_options<'a>(
         &'a self,
         _options: CodeModeSessionOptions,
+        _host_environment: Option<HashMap<String, String>>,
     ) -> CodeModeSessionProviderFuture<'a> {
         Box::pin(async {
             Err("code-mode provider does not support process-isolated sessions".into())
