@@ -557,6 +557,7 @@ impl Session {
                 .and_then(|context| context.cyber_access_program);
         }
         let options = NewTurnContextOptions {
+            tool_ceiling: start_options.tool_ceiling,
             final_output_json_schema: start_options.final_output_json_schema,
             cyber_access_program: start_options.cyber_access_program,
         };

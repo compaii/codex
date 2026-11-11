@@ -234,6 +234,10 @@ pub struct TurnInferenceAllowance {
 /// child input, Core also compares root lineage to detect ambiguity.
 #[derive(Clone, Debug, Default)]
 pub struct TurnStartOptions {
+    /// Host-only, turn-local tool ceiling. None preserves the session policy;
+    /// an empty vector permits no tools. Requires an already reserved allowance.
+    /// This is not an execution sandbox or credential-isolation claim.
+    pub tool_ceiling: Option<Vec<crate::ToolName>>,
     /// Host-only reservation for this physical turn; never a sticky thread setting.
     pub provider_attempt_gate: Option<crate::provider_attempt::ProviderAttemptGateSelection>,
     /// Finite already-reserved inference limits for this physical execution only.
