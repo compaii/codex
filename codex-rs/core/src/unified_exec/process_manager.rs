@@ -910,6 +910,9 @@ impl UnifiedExecProcessManager {
         context: &UnifiedExecContext,
         request: WriteStdinRequest<'_>,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
+        request
+            .terminal
+            .check_turn_access(&context.step_context.turn)?;
         let process_id = request.terminal.process_id;
         let locked_process = &request.terminal.process;
         if let Some(call_id) = trace_id(&request.terminal.call_id) {
@@ -1821,18 +1824,22 @@ impl UnifiedExecProcessManager {
     pub(crate) async fn resolve_terminal(
         &self,
         process_id: i32,
+        turn: &crate::session::turn_context::TurnContext,
     ) -> Result<TerminalSession, UnifiedExecError> {
         let store = self.process_store.lock().await;
         let entry = store
             .processes
             .get(&process_id)
             .ok_or(UnifiedExecError::UnknownProcessId { process_id })?;
-        Ok(TerminalSession {
+        let terminal = TerminalSession {
             process_id,
             process: Arc::clone(&entry.process),
             call_id: entry.call_id.clone(),
+            owner_turn_id: entry.permissions.owner_turn_id.clone(),
             environment_id: entry.environment_id.clone(),
-        })
+        };
+        terminal.check_turn_access(turn)?;
+        Ok(terminal)
     }
 
     pub(crate) async fn list_processes(&self) -> Vec<BackgroundTerminalInfo> {

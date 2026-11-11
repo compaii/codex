@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 fn terminal_permissions(profile: &PermissionProfile) -> TerminalPermissions {
     TerminalPermissions {
+        owner_turn_id: "fixture-launch".into(),
         policy: TerminalPolicy {
             sandbox: FileSystemSandboxContext::from_permission_profile(
                 effective_permission_profile(profile, /*additional_permissions*/ None),
