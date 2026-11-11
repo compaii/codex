@@ -409,7 +409,11 @@ impl OutgoingMessageSender {
     ) -> (RequestId, oneshot::Receiver<ClientRequestResult>) {
         let outgoing_message_id = id.clone();
         let request = request.request_with_id(outgoing_message_id.clone());
-        let is_reservation = matches!(&request, ServerRequest::ProviderAttemptReservation { .. });
+        let is_reservation = matches!(
+            &request,
+            ServerRequest::ProviderAttemptReservation { .. }
+                | ServerRequest::ProviderAttemptUsage { .. }
+        );
         let reservation_owner = if is_reservation {
             match connection_ids {
                 Some([owner]) => Some(*owner),

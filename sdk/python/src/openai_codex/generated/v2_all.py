@@ -13833,11 +13833,26 @@ class TurnStartBoundedIfIdleParams(BaseModel):
         populate_by_name=True,
     )
     allowance: TurnInferenceAllowance
+    provider_max_output_tokens: Annotated[
+        int | None,
+        Field(
+            alias="providerMaxOutputTokens",
+            description="Owner-selected output ceiling, applied at HTTP/WS request construction. Requires the same reservation cycle; older closed readers reject it.",
+            ge=0,
+        ),
+    ] = None
     provider_reservation_cycle_id: Annotated[
         str | None,
         Field(
             alias="providerReservationCycleId",
             description="Owner journal cycle whose exact physical attempts require a reservation response from this initiating connection. This is not a budget grant. Older bounded-start servers reject this field rather than ignore it.",
+        ),
+    ] = None
+    provider_usage_observations: Annotated[
+        bool | None,
+        Field(
+            alias="providerUsageObservations",
+            description="Opt in to owner-only completion observations. Older closed readers reject this field; legacy reservation-only clients omit it.",
         ),
     ] = None
     turn: TurnStartParams

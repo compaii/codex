@@ -184,6 +184,8 @@ impl TurnRequestProcessor {
             only_if_idle,
             None,
             None,
+            false,
+            None,
         )
         .await
         .map(|response| {
@@ -211,6 +213,21 @@ impl TurnRequestProcessor {
                 ));
             }
         }
+        if params.provider_usage_observations == Some(true)
+            && params.provider_reservation_cycle_id.is_none()
+        {
+            return Err(invalid_request(
+                "Usage observations require the existing owner reservation cycle",
+            ));
+        }
+        if params.provider_max_output_tokens == Some(0)
+            || (params.provider_max_output_tokens.is_some()
+                && params.provider_reservation_cycle_id.is_none())
+        {
+            return Err(invalid_request(
+                "Positive owner output ceiling requires its reservation cycle",
+            ));
+        }
         self.turn_start_inner(
             request_id,
             params.turn,
@@ -219,6 +236,8 @@ impl TurnRequestProcessor {
             true,
             Some(params.allowance),
             params.provider_reservation_cycle_id,
+            params.provider_usage_observations.unwrap_or(false),
+            params.provider_max_output_tokens,
         )
         .await
         .map(|response| Some(ClientResponsePayload::TurnStartBoundedIfIdle(response)))
@@ -593,6 +612,8 @@ impl TurnRequestProcessor {
         only_if_idle: bool,
         inference_allowance: Option<codex_protocol::turn_input::TurnInferenceAllowance>,
         provider_reservation_cycle_id: Option<String>,
+        provider_usage_observations: bool,
+        provider_max_output_tokens: Option<u32>,
     ) -> Result<TurnStartResponse, JSONRPCErrorError> {
         let (thread_id, thread) =
             self.load_thread(&params.thread_id)
@@ -746,6 +767,8 @@ impl TurnRequestProcessor {
                 owner: request_id.connection_id,
                 thread_id,
                 cycle_id,
+                usage_observations: provider_usage_observations,
+                max_output_tokens: provider_max_output_tokens,
                 deadline_unix_ms: inference_allowance
                     .as_ref()
                     .expect("bounded reservation start")

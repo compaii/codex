@@ -2191,7 +2191,8 @@ async fn handle_server_request(
             )
             .await
         }
-        ServerRequest::ProviderAttemptReservation { request_id, .. } => {
+        ServerRequest::ProviderAttemptReservation { request_id, .. }
+        | ServerRequest::ProviderAttemptUsage { request_id, .. } => {
             reject_server_request(
                 client,
                 request_id,

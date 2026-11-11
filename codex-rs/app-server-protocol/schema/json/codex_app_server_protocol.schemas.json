@@ -4748,6 +4748,88 @@
       "title": "ProviderAttemptReservationResponse",
       "type": "object"
     },
+    "ProviderAttemptUsageParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "description": "Exact physical response evidence, not a financial settlement or grant.",
+      "properties": {
+        "attemptId": {
+          "type": "string"
+        },
+        "cycleId": {
+          "type": "string"
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ordinal": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "responseId": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "tokenUsage": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/v2/TokenUsageBreakdown"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "usageMetadata": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/v2/ResponseUsageMetadata"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "attemptId",
+        "cycleId",
+        "ordinal",
+        "responseId",
+        "threadId"
+      ],
+      "title": "ProviderAttemptUsageParams",
+      "type": "object"
+    },
+    "ProviderAttemptUsageResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "description": "True acknowledges retained evidence only. A missing/false acknowledgment never proves absence or authorizes releasing conservative exposure.",
+      "properties": {
+        "attemptId": {
+          "type": "string"
+        },
+        "cycleId": {
+          "type": "string"
+        },
+        "recorded": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "attemptId",
+        "cycleId",
+        "recorded"
+      ],
+      "title": "ProviderAttemptUsageResponse",
+      "type": "object"
+    },
     "RequestId": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "anyOf": [
@@ -6639,6 +6721,31 @@
             "params"
           ],
           "title": "Turn/providerAttempt/reserveRequest",
+          "type": "object"
+        },
+        {
+          "description": "Exact usage observation for the initiating accounting owner only.",
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "turn/providerAttempt/usage"
+              ],
+              "title": "Turn/providerAttempt/usageRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/ProviderAttemptUsageParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Turn/providerAttempt/usageRequest",
           "type": "object"
         },
         {
@@ -27476,10 +27583,26 @@
           "allowance": {
             "$ref": "#/definitions/v2/TurnInferenceAllowance"
           },
+          "providerMaxOutputTokens": {
+            "description": "Owner-selected output ceiling, applied at HTTP/WS request construction. Requires the same reservation cycle; older closed readers reject it.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "providerReservationCycleId": {
             "description": "Owner journal cycle whose exact physical attempts require a reservation response from this initiating connection. This is not a budget grant. Older bounded-start servers reject this field rather than ignore it.",
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "providerUsageObservations": {
+            "description": "Opt in to owner-only completion observations. Older closed readers reject this field; legacy reservation-only clients omit it.",
+            "type": [
+              "boolean",
               "null"
             ]
           },

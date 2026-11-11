@@ -49,6 +49,7 @@ impl ChatWidget {
                 self.on_request_user_input(params);
             }
             ServerRequest::ProviderAttemptReservation { .. }
+            | ServerRequest::ProviderAttemptUsage { .. }
             | ServerRequest::DynamicToolCall { .. }
             | ServerRequest::AttestationGenerate { .. }
             | ServerRequest::CurrentTimeRead { .. }

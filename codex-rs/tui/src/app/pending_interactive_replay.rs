@@ -357,7 +357,8 @@ impl PendingInteractiveReplayState {
 
     pub(super) fn should_replay_snapshot_request(&self, request: &ServerRequest) -> bool {
         match request {
-            ServerRequest::ProviderAttemptReservation { .. } => false,
+            ServerRequest::ProviderAttemptReservation { .. }
+            | ServerRequest::ProviderAttemptUsage { .. } => false,
             ServerRequest::CommandExecutionRequestApproval { params, .. } => self
                 .exec_approval_call_ids
                 .contains(params.approval_id.as_ref().unwrap_or(&params.item_id)),

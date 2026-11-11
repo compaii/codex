@@ -27,8 +27,88 @@ pub enum InferenceAllowanceError {
 
 use codex_protocol::provider_attempt::ProviderAttemptGateSelection as SelectedProviderAttemptGate;
 pub use codex_protocol::provider_attempt::{
-    ProviderAttempt, ProviderAttemptGate, ProviderAttemptReservation,
+    ProviderAttempt, ProviderAttemptGate, ProviderAttemptObservation, ProviderAttemptReservation,
+    ProviderAttemptUsage,
 };
+
+/// Witness returned by the same boundary that authorizes the physical send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedProviderAttempt {
+    pub attempt: ProviderAttempt,
+    pub remaining: Duration,
+}
+
+pub(crate) struct AttemptObserver {
+    pub allowance: Arc<InferenceAllowance>,
+    pub attempt: ProviderAttempt,
+    pub initial_model: Option<String>,
+}
+impl AttemptObserver {
+    pub fn new(allowance: Arc<InferenceAllowance>, attempt: ProviderAttempt) -> Option<Self> {
+        allowance.provider_attempt_gate.as_ref()?;
+        Some(Self {
+            allowance,
+            attempt,
+            initial_model: None,
+        })
+    }
+    pub async fn observe_incomplete(
+        &self,
+        error: &codex_protocol::error::ResponseIncompleteError,
+        model: Option<String>,
+        usage_metadata: Option<codex_protocol::ResponseUsageMetadata>,
+    ) {
+        // A failed response may still consume tokens. Keep its existing error
+        // semantics; this owner-only observation is never a completion/refund.
+        if let Some(id) = &error.response_id
+            && !id.is_empty()
+            && id.len() <= 200
+            && let Some(gate) = &self.allowance.provider_attempt_gate
+        {
+            let usage = ProviderAttemptUsage {
+                attempt_id: self.attempt.id,
+                ordinal: self.attempt.ordinal,
+                response_id: id.clone(),
+                model: model.or_else(|| self.initial_model.clone()),
+                token_usage: error.token_usage.clone(),
+                usage_metadata,
+            };
+            let _ =
+                tokio::time::timeout_at(self.attempt.deadline, gate.0.observe_usage(usage)).await;
+        }
+    }
+    pub async fn observe(&self, event: &crate::common::ResponseEvent, model: Option<String>) {
+        if let crate::common::ResponseEvent::Completed {
+            response_id,
+            token_usage,
+            usage_metadata,
+            ..
+        } = event
+            && let Some(gate) = &self.allowance.provider_attempt_gate
+        {
+            let usage = ProviderAttemptUsage {
+                attempt_id: self.attempt.id,
+                ordinal: self.attempt.ordinal,
+                response_id: response_id.clone(),
+                model: model.or_else(|| self.initial_model.clone()),
+                token_usage: token_usage.clone(),
+                usage_metadata: usage_metadata.clone(),
+            };
+            // Reporting cannot renew the original physical-attempt horizon or
+            // hold the provider stream indefinitely. Loss conserves exposure.
+            let _ =
+                tokio::time::timeout_at(self.attempt.deadline, gate.0.observe_usage(usage)).await;
+        }
+    }
+}
+
+/// Preserve typed/raw nested payloads while adding only the owner field.
+#[derive(serde::Serialize)]
+pub(crate) struct OutputBoundRequest<'a, T: ?Sized> {
+    #[serde(flatten)]
+    request: &'a T,
+    max_output_tokens: u32,
+}
 
 #[derive(Debug, Default)]
 struct State {
@@ -75,21 +155,22 @@ impl InferenceAllowance {
     /// Reserve at the actual physical-send boundary under the original absolute
     /// deadline. Refusal/unknown closes this allowance before any provider bytes;
     /// auth retries, WS writes and HTTP fallback cannot bypass the refusal.
-    pub async fn claim_authorized_attempt(&self) -> Result<Duration, InferenceAllowanceError> {
-        let (ordinal, remaining) = self.claim_attempt_number()?;
-        let Some(gate) = &self.provider_attempt_gate else {
-            return Ok(remaining);
-        };
+    pub async fn claim_authorized_attempt(
+        &self,
+    ) -> Result<AuthorizedProviderAttempt, InferenceAllowanceError> {
+        let (ordinal, _) = self.claim_attempt_number()?;
         let attempt = ProviderAttempt {
             id: uuid::Uuid::new_v4(),
             ordinal,
             max_request_bytes: self.max_request_bytes,
             deadline: self.deadline,
         };
-        if !matches!(
-            tokio::time::timeout_at(self.deadline, gate.0.reserve(attempt)).await,
-            Ok(true)
-        ) {
+        if let Some(gate) = &self.provider_attempt_gate
+            && !matches!(
+                tokio::time::timeout_at(self.deadline, gate.0.reserve(attempt.clone())).await,
+                Ok(true)
+            )
+        {
             self.close();
             return Err(InferenceAllowanceError::Reservation);
         }
@@ -100,11 +181,61 @@ impl InferenceAllowance {
         if state.closed {
             return Err(InferenceAllowanceError::Closed);
         }
-        self.remaining_time()
+        Ok(AuthorizedProviderAttempt {
+            attempt,
+            remaining: self.remaining_time()?,
+        })
     }
 
     pub fn deadline(&self) -> Instant {
         self.deadline
+    }
+
+    pub fn max_output_tokens(&self) -> Option<u32> {
+        self.provider_attempt_gate
+            .as_ref()
+            .and_then(|gate| gate.0.max_output_tokens())
+    }
+
+    pub(crate) fn output_bound_request<'a, T: ?Sized>(
+        &self,
+        request: &'a T,
+    ) -> Result<Option<OutputBoundRequest<'a, T>>, InferenceAllowanceError> {
+        match self.max_output_tokens() {
+            None => Ok(None),
+            Some(0) => Err(InferenceAllowanceError::InvalidLimits),
+            Some(max_output_tokens) => Ok(Some(OutputBoundRequest {
+                request,
+                max_output_tokens,
+            })),
+        }
+    }
+
+    /// Apply only the selected owner's ceiling, preserving a tighter caller
+    /// ceiling. Must run before compression, byte validation and physical sends.
+    pub(crate) fn bound_output(
+        &self,
+        body: &mut serde_json::Value,
+    ) -> Result<(), InferenceAllowanceError> {
+        let Some(limit) = self.max_output_tokens() else {
+            return Ok(());
+        };
+        if limit == 0 {
+            return Err(InferenceAllowanceError::InvalidLimits);
+        }
+        let object = body
+            .as_object_mut()
+            .ok_or(InferenceAllowanceError::InvalidLimits)?;
+        let selected = match object.get("max_output_tokens") {
+            None | Some(serde_json::Value::Null) => u64::from(limit),
+            Some(value) => value
+                .as_u64()
+                .filter(|value| *value > 0)
+                .ok_or(InferenceAllowanceError::InvalidLimits)?
+                .min(u64::from(limit)),
+        };
+        object.insert("max_output_tokens".into(), serde_json::json!(selected));
+        Ok(())
     }
 
     pub fn max_request_bytes(&self) -> usize {

@@ -50,24 +50,29 @@ impl<T: HttpTransport> EndpointSession<T> {
         self
     }
 
-    async fn claim_inference_attempt(&self, request: &mut Request) -> Result<(), TransportError> {
+    async fn claim_inference_attempt(
+        &self,
+        request: &mut Request,
+    ) -> Result<Option<crate::ProviderAttempt>, TransportError> {
         if let Some(allowance) = &self.inference_allowance {
             if !self.transport.supports_single_attempt() {
                 return Err(TransportError::Build(
                     "metered inference requires a transport without hidden replays".into(),
                 ));
             }
-            let remaining = allowance
+            let claimed = allowance
                 .claim_authorized_attempt()
                 .await
                 .map_err(|e| TransportError::Build(e.to_string()))?;
+            let remaining = claimed.remaining;
             request.timeout = Some(
                 request
                     .timeout
                     .map_or(remaining, |timeout| timeout.min(remaining)),
             );
+            return Ok(Some(claimed.attempt));
         }
-        Ok(())
+        Ok(None)
     }
 
     async fn within_allowance_deadline<R>(
@@ -136,6 +141,10 @@ impl<T: HttpTransport> EndpointSession<T> {
             }
             other => other.into(),
         }
+    }
+
+    pub(crate) fn inference_allowance(&self) -> Option<&Arc<InferenceAllowance>> {
+        self.inference_allowance.as_ref()
     }
 
     pub(crate) fn provider(&self) -> &Provider {
@@ -238,7 +247,7 @@ impl<T: HttpTransport> EndpointSession<T> {
         extra_headers: HeaderMap,
         body: Option<EncodedJsonBody>,
         configure: C,
-    ) -> Result<StreamResponse, ApiError>
+    ) -> Result<(StreamResponse, Option<crate::ProviderAttempt>), ApiError>
     where
         C: Fn(&mut Request),
     {
@@ -265,12 +274,13 @@ impl<T: HttpTransport> EndpointSession<T> {
                 let transport = &self.transport;
                 async move {
                     let mut req = self.authorize_request(req).await?;
-                    self.claim_inference_attempt(&mut req).await?;
-                    transport.stream(req).await
+                    let attempt = self.claim_inference_attempt(&mut req).await?;
+                    let response = transport.stream(req).await?;
+                    Ok((response, attempt))
                 }
             },
         );
-        let mut stream = self.within_allowance_deadline(operation).await?;
+        let (mut stream, attempt) = self.within_allowance_deadline(operation).await?;
         if let Some(allowance) = &self.inference_allowance {
             let deadline = allowance.deadline();
             // Keep the original absolute deadline while consuming the body too;
@@ -286,6 +296,6 @@ impl<T: HttpTransport> EndpointSession<T> {
             .boxed();
         }
 
-        Ok(stream)
+        Ok((stream, attempt))
     }
 }

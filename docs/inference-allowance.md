@@ -182,3 +182,74 @@ provided and qualified together before claiming real economic fencing. No new
 budget, signer, API credential, account/provider switch, service, model attention
 or production activation is supplied by this source increment. Legacy callers
 without a selected gate retain their attempt/byte/deadline behavior.
+
+## Exact-attempt completion evidence
+
+`claim_authorized_attempt` returns an `AuthorizedProviderAttempt`, keeping the
+same UUID and ordinal that the owner reserved, alongside the remaining duration.
+The successful HTTP retry returns its own witness with its response stream;
+failed physical attempts do not acquire the following response's usage.
+The WebSocket writer pump returns the witness for that exact response-create
+write. Non-inference control frames do not consume a provider attempt.
+
+A selected host gate may implement `observe_usage(ProviderAttemptUsage)`.
+Responses streaming reports the exact attempt/response IDs, optional server model,
+optional token usage and unchanged provider usage metadata before model-side
+interceptors. These fields are observations, not a signed financial settlement.
+No usage, an absent observer or a lost callback retains maximum exposure.
+Reporting inherits the original absolute attempt deadline; HTTP consumer closure
+cancels it. Parsed WebSocket completion is retained before the callback so a
+shorter cancellation-cleanup deadline cannot erase it.
+
+For accounting on a reused WebSocket, a matching `response.created` is required;
+a terminal without it remains visible but produces no usage association. Stale
+or conflicting response IDs are refused before the observer. Each socket retains
+at most1024 completed IDs of at most200bytes; saturation requires a fresh
+connection for bounded execution instead of forgetting IDs. Ordinary unmetered
+completion delivery remains compatible. The reported WebSocket model comes only
+from that terminal's response headers, never unrelated socket metadata or an
+assumed requested model. HTTP may use its request-bound response header.
+
+Terminal `ResponseIncomplete` errors (for example `max_output_tokens`) also
+report their exact response ID, reported tokens, optional upstream amount string
+and raw usage metadata to the same owner before
+the failed stream returns. They remain errors; no `Completed` event or zero-cost
+settlement is synthesized. HTTP uses its own request binding. WebSocket requires
+the same matching `response.created` witness and bounded terminal-ID history as
+completion; an unbound incomplete response remains an error without a usage
+association. Amount units/meaning require the selected accounting authority;
+no price, currency or billed status is inferred from a string. Missing metadata
+remains unknown, never inferred from tokens. Content-filter and explicit-interruption semantics remain unchanged.
+
+Remote compaction v2 uses this Responses stream path: foreground through the
+client session and background with the same inherited turn allowance. The unary
+`EndpointSession::execute_with` route does not provide this completion observer.
+Source routing is not a real-model or compaction acceptance claim.
+
+A bounded start may explicitly select `providerUsageObservations: true` together
+with its existing `providerReservationCycleId`. The app-server then sends
+`turn/providerAttempt/usage` only to the initiating reservation owner. The closed
+payload contains thread/cycle/attempt/ordinal/response identity and optional model,
+token usage and provider metadata, capped at32KiB. Other subscribers cannot list,
+replay or acknowledge it. Cancellation retires the outstanding callback; all
+reporting remains inside the original deadline. Omission retains Core17 behavior;
+older readers reject the explicit new field instead of silently accepting a
+requested observation contract.
+
+A funded owner can additionally select positive `providerMaxOutputTokens` on
+that same bounded start. Its immutable gate applies `max_output_tokens` before
+HTTP/WS compression, byte validation and sends, including retries and remote
+compaction v2's inherited Responses stream. Raw HTTP callers keep a tighter
+explicit ceiling; malformed ceilings refuse before a physical attempt. Typed
+request serialization preserves raw tool payloads. WebSocket byte admission adds
+the inserted-field delta to the complete logical request size, even when its
+wire packet carries only a continuation. Old bounded readers reject the new
+option; ordinary callers without it retain their prior behavior. An actual
+provider must still be qualified to honor the requested ceiling: a synthetically
+observed field does not prove real endpoint billing enforcement.
+
+The exact `cycleId`/`attemptId`/`recorded` reply acknowledges retained observation
+only. It grants no provider call and settles no money. Signing/verifying exact
+usage under the existing accounting authority, full exposure/credential-route
+qualification and receiving adoption remain unfinished. No new balance, signer,
+account, provider selection, model call or runtime activation follows here.
