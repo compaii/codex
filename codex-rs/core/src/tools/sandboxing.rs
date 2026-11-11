@@ -501,8 +501,14 @@ impl<'a> SandboxAttempt<'a> {
         &'b self,
         fallback: Option<&'b NetworkProxy>,
     ) -> Option<&'b NetworkProxy> {
-        // Execution-only proxies need no fallback; offline attempts must not revive one.
-        if self.enforce_managed_network {
+        // Apply the host ceiling before credential/snapshot preparation, not only
+        // when the final sandbox request is built. Neither a retained execution
+        // proxy nor the thread fallback may restore an offline turn's broker.
+        if self.enforce_managed_network
+            && self
+                .permission_ceiling
+                .is_none_or(|ceiling| ceiling.network_sandbox_policy().is_enabled())
+        {
             self.network_proxy.or(fallback)
         } else {
             None
