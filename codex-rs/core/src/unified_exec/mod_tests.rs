@@ -316,7 +316,7 @@ async fn write_stdin(
     yield_time_ms: u64,
 ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
     let manager = &session.services.unified_exec_manager;
-    let terminal = manager.resolve_terminal(process_id).await?;
+    let terminal = manager.resolve_terminal(process_id, &turn).await?;
     manager
         .write_stdin(
             &UnifiedExecContext::new(
@@ -920,7 +920,7 @@ async fn stdin_approval_preserves_the_reviewed_terminal() -> anyhow::Result<()> 
         entry.environment_id = "unselected-executor".to_string();
         entry.cwd = cwd.clone();
     }
-    let original = manager.resolve_terminal(process_id).await?;
+    let original = manager.resolve_terminal(process_id, &turn).await?;
     assert_eq!(original.environment_id, "unselected-executor");
     // Empty polling must complete without an approval response.
     // The test deadline must allow the minimum empty-poll wait.
@@ -1073,7 +1073,7 @@ async fn stdin_approval_observes_strict_review_enabled_while_queued() -> anyhow:
     )
     .await?;
     let process_id = opened.process_id.expect("running terminal");
-    let terminal = manager.resolve_terminal(process_id).await?;
+    let terminal = manager.resolve_terminal(process_id, &turn).await?;
     let context = UnifiedExecContext::new(
         Arc::clone(&session),
         StepContext::for_test(turn),
@@ -1107,5 +1107,115 @@ async fn stdin_approval_observes_strict_review_enabled_while_queued() -> anyhow:
             if reason.contains("NUL byte")
     ));
     assert!(session.terminate_background_terminal(process_id).await);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bounded_terminal_ownership_rejects_poll_write_and_interrupt_without_touching_human_work()
+-> anyhow::Result<()> {
+    use crate::session::step_context::StepContext;
+    use crate::session::tests::make_session_and_context_with_auth_and_config_and_rx;
+    use crate::session::turn_context::NewTurnContextOptions;
+    use crate::tools::sandboxing::ToolError;
+    use codex_features::Feature;
+
+    skip_if_sandbox!(Ok(()));
+    let (session, human, _events) = make_session_and_context_with_auth_and_config_and_rx(
+        codex_login::CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            config
+                .features
+                .disable(Feature::WriteStdinApproval)
+                .unwrap();
+        },
+    )
+    .await;
+    let manager = &session.services.unified_exec_manager;
+    let command = r#"while IFS= read -r -t 20 line; do printf 'received:%s\n' "$line"; done"#;
+    let opened = exec_command_with_tty(&session, &human, command, 100, None, true).await?;
+    let human_pid = opened.process_id.expect("human terminal remains running");
+    let retained = manager.resolve_terminal(human_pid, &human).await?;
+    for with_tool_ceiling in [false, true] {
+        let bounded = session
+            .new_turn_with_default_settings(
+                format!("bounded-terminal-{with_tool_ceiling}"),
+                NewTurnContextOptions {
+                    tool_ceiling: with_tool_ceiling.then(|| {
+                        vec![
+                            codex_protocol::ToolName::plain("exec_command"),
+                            codex_protocol::ToolName::plain("write_stdin"),
+                        ]
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await;
+        bounded
+            .extension_data
+            .insert(crate::turn_inference::prepare(
+                &codex_protocol::turn_input::TurnInferenceAllowance {
+                    max_provider_attempts: 1,
+                    max_request_bytes: 4096,
+                    deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+                },
+            )?);
+        assert!(manager.resolve_terminal(human_pid, &bounded).await.is_err());
+        let context = UnifiedExecContext::new(
+            Arc::clone(&session),
+            StepContext::for_test(Arc::clone(&bounded)),
+            tokio_util::sync::CancellationToken::new(),
+            "restricted-stdin".into(),
+        );
+        // Even a retained handle and a busy terminal cannot bypass ownership or
+        // make the rejected call wait for an unrelated human interaction.
+        let interaction = retained.process.interaction_lock().lock_owned().await;
+        for input in ["", "\u{3}", "forbidden\n"] {
+            let result = tokio::time::timeout(
+                Duration::from_millis(250),
+                manager.write_stdin(
+                    &context,
+                    WriteStdinRequest {
+                        terminal: &retained,
+                        input,
+                        yield_time_ms: 100,
+                        max_output_tokens: None,
+                        truncation_policy: TruncationPolicy::Tokens(1000),
+                        interaction_event: None,
+                    },
+                ),
+            )
+            .await?;
+            assert!(
+                matches!(result, Err(UnifiedExecError::StdinApproval(ToolError::Rejected(reason))) if reason.contains("another turn"))
+            );
+        }
+        drop(interaction);
+        assert!(!retained.process.has_exited());
+        let current = manager.resolve_terminal(human_pid, &human).await?;
+        assert!(Arc::ptr_eq(&current.process, &retained.process));
+        let owned = exec_command_with_tty(&session, &bounded, command, 100, None, true).await?;
+        let owned_pid = owned.process_id.expect("owned terminal remains running");
+        let output = write_stdin(&session, &bounded, owned_pid, "owned\n", 100)
+            .await?
+            .truncated_output(1000);
+        assert!(output.contains("received:owned"), "{output}");
+        assert!(session.terminate_background_terminal(owned_pid).await);
+    }
+    let later_human = session
+        .new_turn_with_default_settings(
+            "later-human-terminal".into(),
+            NewTurnContextOptions::default(),
+        )
+        .await;
+    let output = write_stdin(&session, &later_human, human_pid, "human\n", 100)
+        .await?
+        .truncated_output(1000);
+    assert!(output.contains("received:human"), "{output}");
+    assert!(
+        !output.contains("forbidden"),
+        "rejected input must never reach the process: {output}"
+    );
+    assert!(session.terminate_background_terminal(human_pid).await);
     Ok(())
 }

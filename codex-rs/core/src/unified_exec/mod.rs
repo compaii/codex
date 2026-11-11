@@ -116,6 +116,7 @@ pub(crate) struct TerminalSession {
     pub(crate) process_id: i32,
     process: Arc<UnifiedExecProcess>,
     call_id: String,
+    owner_turn_id: String,
     pub(crate) environment_id: String,
 }
 

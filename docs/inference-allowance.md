@@ -276,9 +276,18 @@ currently active turn; an older unrestricted context cannot use its authority
 while a restricted turn is active. Existing unrestricted dispatch remains
 compatible when neither context is restricted.
 
+Bounded turns, including allowance-only starts, can resolve and interact with
+only terminals launched under their exact originating turn ID. Ownership is
+captured privately at launch. Resolution checks it before returning a terminal
+handle; use checks it again for cached handles before acquiring the terminal's
+interaction lock or taking empty-poll, interrupt or disabled-approval shortcuts.
+Rejected borrowing neither consumes output nor writes, interrupts or terminates
+the other turn's process. Ordinary human turns keep their existing cross-turn
+terminal access and approval policy.
+
 This is a tool-selection and dispatch boundary, not complete financial isolation.
 An allowed tool still needs its own enforceable permission/resource boundary.
-Previously started terminals, Code Mode resources, local credential files,
+Running-process lifetime, Code Mode resources, local credential files,
 AF_UNIX sockets, owner RPCs and provider reauthentication routes need separate
 qualification. Restricting advertised names alone does not prove these routes
 are inaccessible. No public bounded-start field, receiver configuration, paid

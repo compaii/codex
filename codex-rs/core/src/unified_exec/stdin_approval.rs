@@ -5,6 +5,7 @@
 //! Runtime-internal grants alone do not require review; agent grants and policy drift do.
 
 use super::ProcessEntry;
+use super::TerminalSession;
 use super::UnifiedExecContext;
 use super::UnifiedExecError;
 use crate::config::NetworkProxySpec;
@@ -31,6 +32,7 @@ pub(crate) enum TerminalSandboxSource {
 }
 
 pub(crate) struct TerminalPermissions {
+    pub(super) owner_turn_id: String,
     policy: TerminalPolicy,
     sandbox_source: TerminalSandboxSource,
     launch_permissions: SandboxPermissions,
@@ -95,6 +97,7 @@ impl TerminalPermissions {
         internal_permissions: Option<&AdditionalPermissionProfile>,
     ) -> Self {
         Self {
+            owner_turn_id: turn.sub_id.clone(),
             policy: TerminalPolicy::capture(
                 environment,
                 turn,
@@ -184,6 +187,21 @@ impl TerminalPermissions {
             ));
         }
         Ok(reason)
+    }
+}
+
+impl TerminalSession {
+    /// A bounded execution cannot borrow a terminal launched with another turn's
+    /// authority. Check before locks, output collection, writes or approval bypasses.
+    pub(crate) fn check_turn_access(&self, turn: &TurnContext) -> Result<(), UnifiedExecError> {
+        if (turn.has_tool_ceiling() || crate::turn_inference::allowance(turn).is_some())
+            && self.owner_turn_id != turn.sub_id
+        {
+            return Err(approval_error(
+                "this execution cannot access a terminal from another turn; start a new terminal",
+            ));
+        }
+        Ok(())
     }
 }
 
