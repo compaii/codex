@@ -2015,3 +2015,183 @@ async fn host_permission_ceiling_does_not_wait_for_an_unrelated_unavailable_envi
     );
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn host_profile_raw_process_enforces_private_files_offline_ipc_and_empty_inheritance()
+-> anyhow::Result<()> {
+    core_test_support::test_codex::run_test_with_large_stack("host-profile-process", || async {
+        use crate::tools::handlers::unified_exec::preparation::ExecCommandLifetime;
+        use crate::tools::handlers::unified_exec::preparation::ParsedExecCommand;
+        use crate::unified_exec::ExecCommandRequest;
+        use crate::unified_exec::UnifiedExecContext;
+        use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
+        use codex_protocol::models::PermissionProfile;
+        use codex_protocol::permissions::FileSystemAccessMode;
+        use codex_protocol::permissions::FileSystemSandboxEntry;
+        use codex_protocol::permissions::FileSystemSandboxPolicy;
+        use codex_protocol::permissions::NetworkSandboxPolicy;
+        async fn launch(
+            session: &Arc<Session>,
+            turn: Arc<TurnContext>,
+            script: &str,
+        ) -> anyhow::Result<String> {
+            let context = UnifiedExecContext::new(
+                Arc::clone(session),
+                crate::session::step_context::StepContext::for_test(Arc::clone(&turn)),
+                CancellationToken::new(),
+                "profile-process-call".into(),
+            );
+            let arguments = serde_json::json!({
+                "cmd": format!("/usr/bin/python3 - <<'PY'\n{script}\nPY"),
+                "login": false, "tty": false, "yield_time_ms": 1000,
+            })
+            .to_string();
+            let prepared = ParsedExecCommand::parse(
+                &arguments,
+                session,
+                &context.step_context,
+                turn.initial_environments.primary().expect("environment"),
+            )?
+            .prepare(ExecCommandLifetime::OneShot)?;
+            let manager = &session.services.unified_exec_manager;
+            let output = Box::pin(manager.exec_command(
+                ExecCommandRequest {
+                    prepared,
+                    process_id: manager.allocate_process_id().await,
+                    network: None,
+                },
+                &context,
+            ))
+            .await?;
+            assert_eq!(
+                output.exit_code,
+                Some(0),
+                "{}",
+                output.truncated_output(2000)
+            );
+            Ok(output.truncated_output(2000))
+        }
+        let directory = tempfile::tempdir()?;
+        let root = AbsolutePathBuf::from_absolute_path(directory.path())?;
+        let work = root.join("work");
+        std::fs::create_dir(&work)?;
+        let secret = root.join("credential.txt");
+        std::fs::write(&secret, "private fixture")?;
+        let socket = root.join("owner.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket)?;
+        let executable = std::env::current_exe()?;
+        let alias = directory.path().join("codex-linux-sandbox");
+        std::os::unix::fs::symlink(&executable, &alias)?;
+        let cwd = root.clone();
+        let (session, _initial, _events) = Box::pin(
+            crate::session::tests::make_session_and_context_with_auth_and_config_and_rx(
+                codex_login::CodexAuth::from_api_key("Test API Key"),
+                Vec::new(),
+                move |config| {
+                    config.codex_self_exe = Some(executable);
+                    config.codex_linux_sandbox_exe = Some(alias);
+                    config.cwd = cwd.clone();
+                    config.permissions.set_workspace_roots(vec![cwd]);
+                    config
+                        .permissions
+                        .set_permission_profile(PermissionProfile::Disabled)
+                        .expect("fixture permissions");
+                    config.permissions.approval_policy =
+                        Constrained::allow_any(AskForApproval::Never);
+                    config.permissions.shell_environment_policy.inherit =
+                        ShellEnvironmentPolicyInherit::None;
+                    config
+                        .permissions
+                        .shell_environment_policy
+                        .r#set
+                        .insert("PATH".into(), "/usr/bin:/bin".into());
+                },
+            ),
+        )
+        .await;
+        let mut policy = FileSystemSandboxPolicy::read_only();
+        policy.entries.push(FileSystemSandboxEntry::new(
+            secret.clone().into(),
+            FileSystemAccessMode::Deny,
+        ));
+        policy.entries.push(FileSystemSandboxEntry::new(
+            work.clone().into(),
+            FileSystemAccessMode::Write,
+        ));
+        let ceiling =
+            PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Restricted);
+        let bounded = PreparedTurnInputSettings::prepare(
+            &session,
+            ThreadSettingsOverrides::default(),
+            TurnStartOptions {
+                permission_ceiling: Some(ceiling),
+                tool_ceiling: Some(vec![codex_protocol::ToolName::plain("exec_command")]),
+                inference_allowance: Some(codex_protocol::turn_input::TurnInferenceAllowance {
+                    max_provider_attempts: 1,
+                    max_request_bytes: 4096,
+                    deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+                }),
+                ..Default::default()
+            },
+        )
+        .await?
+        .apply_started(&session, "profile-process".into(), TurnStartKind::User)
+        .await?
+        .expect("bounded turn");
+        let script = format!(
+            r#"import errno, os, socket
+assert os.environ['PATH'] == '/usr/bin:/bin'
+for key in ('HOME', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN'):
+    assert key not in os.environ, key
+for path in ({secret}, '/proc/{parent_pid}/environ'):
+    try:
+        open(path, 'rb').read()
+    except OSError as e:
+        assert e.errno in (errno.EPERM, errno.EACCES, errno.ENOENT), (path, e.errno)
+    else:
+        raise AssertionError('protected file readable')
+s = socket.socket(socket.AF_UNIX)
+try:
+    s.connect({socket})
+except OSError as e:
+    assert e.errno in (errno.EPERM, errno.EACCES), e.errno
+else:
+    raise AssertionError('offline owner IPC connected')
+finally:
+    s.close()
+open({allowed}, 'w').write('useful work')
+print('private-files-denied ipc-denied inheritance-empty work-written')"#,
+            secret = serde_json::to_string(secret.as_path())?,
+            socket = serde_json::to_string(socket.as_path())?,
+            parent_pid = std::process::id(),
+            allowed = serde_json::to_string(work.join("result.txt").as_path())?
+        );
+        let output = launch(&session, bounded, &script).await?;
+        assert!(output.contains("private-files-denied ipc-denied inheritance-empty work-written"));
+        assert_eq!(
+            std::fs::read_to_string(work.join("result.txt"))?,
+            "useful work"
+        );
+        let ordinary = PreparedTurnInputSettings::prepare(
+            &session,
+            ThreadSettingsOverrides::default(),
+            TurnStartOptions::default(),
+        )
+        .await?
+        .apply_started(&session, "profile-human".into(), TurnStartKind::User)
+        .await?
+        .expect("human turn");
+        let script = format!(
+            "import socket\nassert open({secret}).read() == 'private fixture'\ns=socket.socket(socket.AF_UNIX)\ns.connect({socket})\ns.close()\nprint('human-access-preserved')",
+            secret = serde_json::to_string(secret.as_path())?,
+            socket = serde_json::to_string(socket.as_path())?
+        );
+        assert!(
+            launch(&session, ordinary, &script)
+                .await?
+                .contains("human-access-preserved")
+        );
+        Ok(())
+    })
+}

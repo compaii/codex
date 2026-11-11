@@ -393,3 +393,28 @@ mode also checks the final command environment. Ordinary turns retain their
 existing fallback and warnings. Remote environments remain unsupported for this
 host permission profile; this does not qualify arbitrary credentials/files/IPC,
 shell startup, provider routes or the full funded profile.
+
+### Actual Linux raw-process profile witness
+
+The Core unit journey
+`host_profile_raw_process_enforces_private_files_offline_ipc_and_empty_inheritance`
+uses the real Unified Exec preparation, sandbox launcher and child process. An
+existing finite host permission ceiling combines a denied fixture credential
+file, one writable work directory and restricted networking. The ordinary shell
+environment policy selects `inherit = "none"` with an explicit trusted
+`PATH = "/usr/bin:/bin"`, and the command selects non-login startup. Empty
+inheritance alone is insufficient when a development package relies on system
+bubblewrap: removing PATH made launcher discovery fail before the command ran.
+Do not restore the whole parent environment to repair that dependency.
+
+The actual process cannot read the denied file or its parent's process environment,
+cannot connect to the existing Unix owner-socket fixture, and can produce its
+permitted work file. The following ordinary turn can read the fixture and connect
+to that same socket; host restrictions did not become sticky human settings.
+There is no provider request or live owner service in this journey.
+
+This qualifies that Linux configuration and execution path, not every credential
+location, startup file, inherited descriptor, Code Mode host, enabled-network
+proxy/provider route or receiving package. The production owner must still select
+and qualify its exact private roots, trusted binaries/startup, complete exposure
+and real accounting authority. It is not automatic funded-profile activation.
