@@ -432,7 +432,7 @@ its launcher needs system tools; Core does not guess a receiving PATH.
 Core copies the policy into private turn state, applies it to the initial local
 environments and reapplies it at step capture and runtime-resolved tool bindings.
 Review contexts preserve that same policy. The resulting turn-local environment
-disables login-shell invocation and broader snapshots through the existing host
+disables the tool login-shell option and broader snapshots through the existing host
 permission path. Thread configuration, ordinary turns and existing allowance-only
 attention retain their previous policy. No persistent environment or account is
 rewritten.
