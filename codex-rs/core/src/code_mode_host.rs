@@ -18,6 +18,8 @@ use std::task::Context;
 use std::task::Poll;
 use std::time::Duration;
 
+use codex_code_mode::CodeModeHostOptions;
+use codex_code_mode::CodeModeHostSandbox;
 use codex_code_mode::CodeModeOutputTruncation;
 use codex_code_mode::CodeModeProcessMetricsSample;
 use codex_code_mode::CodeModeSessionCellExecutionLimits;
@@ -69,10 +71,10 @@ impl CodeModeSessionProvider for LocalServerOutputProvider {
     fn create_isolated_session_with_options<'a>(
         &'a self,
         options: CodeModeSessionOptions,
-        host_environment: Option<HashMap<String, String>>,
+        host_options: CodeModeHostOptions,
     ) -> CodeModeSessionProviderFuture<'a> {
         self.inner
-            .create_isolated_session_with_options(options, host_environment)
+            .create_isolated_session_with_options(options, host_options)
     }
 
     fn create_session_with_limits<'a>(
@@ -97,6 +99,7 @@ impl CodeModeSessionProvider for LocalServerOutputProvider {
 pub struct ProcessOwnedGrpcCodeModeSessionProvider {
     host_program: PathBuf,
     host_environment: Option<Arc<HashMap<String, String>>>,
+    host_sandbox: Option<Arc<CodeModeHostSandbox>>,
     provider: OnceLock<GrpcCodeModeSessionProvider>,
     closed: Arc<AtomicBool>,
     current: Arc<Mutex<Option<HostChannel>>>,
@@ -107,6 +110,7 @@ impl ProcessOwnedGrpcCodeModeSessionProvider {
         Self {
             host_program,
             host_environment: None,
+            host_sandbox: None,
             provider: OnceLock::new(),
             closed: Arc::new(AtomicBool::new(false)),
             current: Arc::new(Mutex::new(None)),
@@ -147,11 +151,12 @@ impl CodeModeSessionProvider for ProcessOwnedGrpcCodeModeSessionProvider {
     fn create_isolated_session_with_options<'a>(
         &'a self,
         options: CodeModeSessionOptions,
-        host_environment: Option<HashMap<String, String>>,
+        host_options: CodeModeHostOptions,
     ) -> CodeModeSessionProviderFuture<'a> {
         Box::pin(async move {
             let mut owner = Self::with_host_program(self.host_program.clone());
-            owner.host_environment = host_environment.map(Arc::new);
+            owner.host_environment = host_options.environment.map(Arc::new);
+            owner.host_sandbox = host_options.sandbox.map(Arc::new);
             let owner = Arc::new(owner);
             let inner = owner.create_session_with_options(options).await?;
             Ok(Arc::new(IsolatedSession { inner, owner })
@@ -179,6 +184,7 @@ impl CodeModeSessionProvider for ProcessOwnedGrpcCodeModeSessionProvider {
                 let transport = Arc::new(HostTransport {
                     host_program: self.host_program.clone(),
                     host_environment: self.host_environment.clone(),
+                    host_sandbox: self.host_sandbox.clone(),
                     current: self.current.clone(),
                     closed: self.closed.clone(),
                 });
@@ -252,6 +258,7 @@ impl codex_code_mode::CodeModeSession for IsolatedSession {
 struct HostTransport {
     host_program: PathBuf,
     host_environment: Option<Arc<HashMap<String, String>>>,
+    host_sandbox: Option<Arc<CodeModeHostSandbox>>,
     current: Arc<Mutex<Option<HostChannel>>>,
     closed: Arc<AtomicBool>,
 }
@@ -292,9 +299,12 @@ impl HostTransport {
                 if rpc_path != "/codex.code_mode.v1.CodeModeHost/OpenSession" {
                     return Err(Status::unavailable("code-mode host is not running"));
                 }
-                let connection =
-                    HostConnection::spawn(&self.host_program, self.host_environment.as_deref())
-                        .map_err(|error| Status::unavailable(error.to_string()))?;
+                let connection = HostConnection::spawn(
+                    &self.host_program,
+                    self.host_environment.as_deref(),
+                    self.host_sandbox.as_deref(),
+                )
+                .map_err(|error| Status::unavailable(error.to_string()))?;
                 let alive = connection.alive.clone();
                 let connection = Arc::new(Mutex::new(Some(connection)));
                 // Preserve execution liveness detection independently of metrics cadence.
@@ -326,6 +336,74 @@ impl HostTransport {
     }
 }
 
+fn sandboxed_host_command(
+    host_program: &Path,
+    environment: Option<&HashMap<String, String>>,
+    sandbox: &CodeModeHostSandbox,
+) -> io::Result<Command> {
+    use codex_protocol::config_types::WindowsSandboxLevel;
+    use codex_protocol::models::PermissionProfile;
+    use codex_sandboxing::SandboxCommand;
+    use codex_sandboxing::SandboxManager;
+    use codex_sandboxing::SandboxTransformRequest;
+    use codex_sandboxing::SandboxType;
+    use codex_utils_absolute_path::AbsolutePathBuf;
+    use codex_utils_path_uri::PathUri;
+    if !cfg!(target_os = "linux")
+        || !matches!(sandbox.permissions, PermissionProfile::Managed { .. })
+        || sandbox
+            .permissions
+            .file_system_sandbox_policy()
+            .has_full_disk_write_access()
+        || sandbox.permissions.network_sandbox_policy().is_enabled()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "process-isolated code-mode sandbox requires qualified restrictive offline Linux permissions",
+        ));
+    }
+    let cwd = PathUri::from_abs_path(&AbsolutePathBuf::from_absolute_path(&sandbox.cwd)?);
+    let request = SandboxManager::new()
+        .transform(SandboxTransformRequest {
+            command: SandboxCommand {
+                program: host_program.as_os_str().to_owned(),
+                args: vec!["--listen".into(), "grpc+stdio://".into()],
+                cwd: cwd.clone(),
+                env: environment
+                    .cloned()
+                    .unwrap_or_else(|| std::env::vars().collect()),
+                managed_network: None,
+                additional_permissions: None,
+            },
+            permissions: &sandbox.permissions,
+            sandbox: SandboxType::LinuxSeccomp,
+            enforce_managed_network: false,
+            environment_id: None,
+            network: None,
+            sandbox_policy_cwd: &cwd,
+            sandbox_exe: Some(&sandbox.linux_sandbox_exe),
+            use_legacy_landlock: false,
+            windows_sandbox_level: WindowsSandboxLevel::Disabled,
+        })
+        .map_err(io::Error::other)?;
+    let (program, args) = request
+        .command
+        .split_first()
+        .ok_or_else(|| io::Error::other("empty sandbox host command"))?;
+    let mut command = Command::from(background_command(program));
+    command
+        .args(args)
+        .current_dir(request.cwd.to_abs_path()?.as_path())
+        .env_clear()
+        .envs(&request.env);
+    #[cfg(unix)]
+    if let Some(arg0) = request.arg0 {
+        use std::os::unix::process::CommandExt;
+        command.as_std_mut().arg0(arg0);
+    }
+    Ok(command)
+}
+
 struct HostConnection {
     io: tokio::io::Join<ChildStdout, ChildStdin>,
     child: Option<Child>,
@@ -336,15 +414,21 @@ impl HostConnection {
     fn spawn(
         host_program: &Path,
         host_environment: Option<&HashMap<String, String>>,
+        host_sandbox: Option<&CodeModeHostSandbox>,
     ) -> io::Result<Self> {
-        let mut command = Command::from(background_command(host_program));
-        if let Some(environment) = host_environment {
-            command.env_clear().envs(environment);
-        }
+        let mut command = if let Some(sandbox) = host_sandbox {
+            sandboxed_host_command(host_program, host_environment, sandbox)?
+        } else {
+            let mut command = Command::from(background_command(host_program));
+            command.args(["--listen", "grpc+stdio://"]);
+            if let Some(environment) = host_environment {
+                command.env_clear().envs(environment);
+            }
+            command
+        };
         #[cfg(unix)]
         command.process_group(/*pgroup*/ 0);
         command
-            .args(["--listen", "grpc+stdio://"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

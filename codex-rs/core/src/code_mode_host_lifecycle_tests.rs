@@ -71,6 +71,7 @@ async fn child_exit_after_channel_selection_does_not_replay_execution() -> Resul
     let recorder = CodeModeHostRecorder::new()?;
     let transport = Arc::new(HostTransport {
         host_environment: None,
+        host_sandbox: None,
         closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         host_program: recorder.program(),
         current: Arc::new(Mutex::new(None)),

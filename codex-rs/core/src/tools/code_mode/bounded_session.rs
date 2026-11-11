@@ -90,8 +90,9 @@ impl CodeModeService {
 
     pub(super) async fn session_for_turn(
         &self,
-        turn: &TurnContext,
+        step: &crate::session::step_context::StepContext,
     ) -> Result<Arc<dyn CodeModeSession>, String> {
+        let turn = &step.turn;
         let Some(allowance) = crate::turn_inference::allowance(turn) else {
             return self.session().await;
         };
@@ -129,12 +130,42 @@ impl CodeModeService {
         let host_environment = turn
             .command_environment_policy()
             .map(|policy| crate::exec_env::create_env(&policy, None));
+        let sandbox = if turn.permission_ceiling().is_some() {
+            let environment = step
+                .environments
+                .turn_environments()
+                .find(|environment| !environment.environment.is_remote())
+                .ok_or_else(|| {
+                    "process-isolated code mode has no qualified local environment".to_string()
+                })?;
+            let permissions = environment
+                .sandbox_context_with_permissions(
+                    turn.granted_permissions(&environment.selection.environment_id),
+                )
+                .map_err(|error| error.to_string())?
+                .permissions;
+            Some(codex_code_mode::CodeModeHostSandbox {
+                permissions: codex_protocol::models::PermissionProfile::from_runtime_permissions_with_enforcement(
+                    permissions.enforcement(), &permissions.file_system_sandbox_policy(),
+                    codex_protocol::permissions::NetworkSandboxPolicy::Restricted,
+                ),
+                cwd: environment.cwd().to_abs_path().map_err(|error| error.to_string())?.to_path_buf(),
+                linux_sandbox_exe: turn.config.codex_linux_sandbox_exe.clone()
+                    .ok_or_else(|| "process-isolated code mode requires a qualified sandbox helper".to_string())?,
+            })
+        } else {
+            None
+        };
+        let host_options = codex_code_mode::CodeModeHostOptions {
+            environment: host_environment,
+            sandbox,
+        };
         state.session.get_or_try_init(|| async {
             let inner = tokio::select! {
                 biased;
                 _ = allowance.execution_finished() => return Err("bounded code mode execution ended".into()),
                 _ = self.shutdown_token.cancelled() => return Err("code mode session is shutting down".into()),
-                result = self.session_provider.create_isolated_session_with_options(options, host_environment) => result?,
+                result = self.session_provider.create_isolated_session_with_options(options, host_options) => result?,
             };
             let closed = state.closed.clone();
             let shutdown = self.shutdown_token.clone();

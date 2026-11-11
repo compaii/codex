@@ -138,6 +138,7 @@ async fn grpc_stdio_host_exits_when_stdin_closes() -> Result<()> {
     let mut connection = HostConnection::spawn(
         &codex_utils_cargo_bin::cargo_bin("codex-code-mode-host")?,
         None,
+        None,
     )?;
     let mut child = connection.child.take().context("host process")?;
     drop(connection);

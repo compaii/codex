@@ -1,7 +1,6 @@
 use super::bounded_session::*;
 use super::*;
 use crate::session::session::SessionSettingsUpdate;
-use crate::session::tests::make_session_and_context_with_rx;
 use codex_code_mode::CodeModeSessionCellExecutionLimits;
 use codex_code_mode::CodeModeSessionOptions;
 #[cfg(target_os = "linux")]
@@ -14,11 +13,56 @@ use core_test_support::code_mode_host::CodeModeHostRecorder;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+async fn sandbox_session() -> (
+    Arc<Session>,
+    Arc<TurnContext>,
+    async_channel::Receiver<codex_protocol::protocol::Event>,
+) {
+    crate::session::tests::make_session_and_context_with_auth_and_config_and_rx(
+        codex_login::CodexAuth::from_api_key("Test API Key"),
+        vec![],
+        |config| {
+            let executable = std::env::current_exe().expect("test executable");
+            config.codex_self_exe = Some(executable.clone());
+            config.codex_linux_sandbox_exe = Some(executable);
+            config
+                .permissions
+                .set_permission_profile(codex_protocol::models::PermissionProfile::Disabled)
+                .expect("full-access fixture baseline");
+        },
+    )
+    .await
+}
+
 async fn context(
     session: &Arc<Session>,
     name: &str,
     duration: Duration,
+    recording_directory: Option<&std::path::Path>,
 ) -> anyhow::Result<(Arc<TurnContext>, Arc<codex_api::InferenceAllowance>)> {
+    let mut file_system = codex_protocol::permissions::FileSystemSandboxPolicy::read_only();
+    let mut environment = std::collections::HashMap::from([
+        ("PATH".into(), "/usr/bin:/bin".into()),
+        ("BOUNDED_HOST_MARKER".into(), "selected-fixture".into()),
+    ]);
+    if let Some(directory) = recording_directory {
+        use codex_protocol::permissions::FileSystemAccessMode;
+        use codex_protocol::permissions::FileSystemSandboxEntry;
+        use codex_utils_absolute_path::AbsolutePathBuf;
+        let root = AbsolutePathBuf::from_absolute_path(directory)?;
+        file_system.entries.push(FileSystemSandboxEntry::new(
+            root.clone().into(),
+            FileSystemAccessMode::Write,
+        ));
+        file_system.entries.push(FileSystemSandboxEntry::new(
+            root.join("blocked credential").into(),
+            FileSystemAccessMode::Deny,
+        ));
+        environment.insert(
+            "CODEX_TEST_CODE_MODE_RECORDER".into(),
+            directory.to_string_lossy().into_owned(),
+        );
+    }
     let mut init = ExtensionDataInit::new();
     init.insert(BoundedCodeModeOptions(CodeModeSessionOptions {
         cell_execution_limits: CodeModeSessionCellExecutionLimits {
@@ -35,15 +79,17 @@ async fn context(
                 ..Default::default()
             },
             crate::session::turn_context::NewTurnContextOptions {
-                permission_ceiling: Some(codex_protocol::models::PermissionProfile::read_only()),
+                permission_ceiling: Some(
+                    codex_protocol::models::PermissionProfile::from_runtime_permissions(
+                        &file_system,
+                        codex_protocol::permissions::NetworkSandboxPolicy::Restricted,
+                    ),
+                ),
                 tool_ceiling: Some(vec![]),
                 command_environment_policy: Some(
                     codex_protocol::config_types::ShellEnvironmentPolicy {
                         inherit: codex_protocol::config_types::ShellEnvironmentPolicyInherit::None,
-                        r#set: std::collections::HashMap::from([
-                            ("PATH".into(), "/usr/bin:/bin".into()),
-                            ("BOUNDED_HOST_MARKER".into(), "selected-fixture".into()),
-                        ]),
+                        r#set: environment,
                         ..Default::default()
                     },
                 ),
@@ -132,7 +178,9 @@ fn result_text(response: &RuntimeResponse) -> String {
 fn bounded_code_mode_native_sessions_isolate_heap_names_state_and_lifetime() -> anyhow::Result<()> {
     core_test_support::test_codex::run_test_with_large_stack("bounded-code-mode", || async {
         let recorder = CodeModeHostRecorder::new()?;
-        let (session, human, _events) = make_session_and_context_with_rx().await;
+        let recorder_program = recorder.program();
+        let recording_directory = recorder_program.parent().expect("recording directory");
+        let (session, human, _events) = sandbox_session().await;
         let service = CodeModeService::new(
             session.thread_id,
             Arc::new(
@@ -182,7 +230,7 @@ fn bounded_code_mode_native_sessions_isolate_heap_names_state_and_lifetime() -> 
         assert!(Arc::ptr_eq(
             &human_session,
             &service
-                .session_for_turn(&legacy)
+                .session_for_turn(StepContext::for_test(Arc::clone(&legacy)).as_ref())
                 .await
                 .map_err(anyhow::Error::msg)?
         ));
@@ -205,6 +253,7 @@ fn bounded_code_mode_native_sessions_isolate_heap_names_state_and_lifetime() -> 
                 } else {
                     Duration::from_secs(20)
                 },
+                Some(recording_directory),
             )
             .await?;
             let (owned_id, response) = run(
@@ -228,6 +277,10 @@ fn bounded_code_mode_native_sessions_isolate_heap_names_state_and_lifetime() -> 
                 CodeModeOutputTruncation::Client
             );
             let private_pid = recorder.pid()?;
+            assert_eq!(
+                std::fs::read_to_string(recording_directory.join("guard result"))?,
+                "guarded"
+            );
             assert_ne!(private_pid, human_pid);
             assert!(has_env(
                 private_pid,
@@ -354,7 +407,7 @@ async fn bounded_code_mode_refuses_unqualified_provider_without_default_session_
             Box::pin(async { Err("legacy create must not be called".into()) })
         }
     }
-    let (session, _, _events) = make_session_and_context_with_rx().await;
+    let (session, _, _events) = sandbox_session().await;
     let called = Arc::new(AtomicBool::new(false));
     let service = CodeModeService::new(
         session.thread_id,
@@ -362,8 +415,13 @@ async fn bounded_code_mode_refuses_unqualified_provider_without_default_session_
         &CodeModeConfig::default(),
         Default::default(),
     );
-    let (turn, allowance) =
-        context(&session, "unqualified-provider", Duration::from_secs(10)).await?;
+    let (turn, allowance) = context(
+        &session,
+        "unqualified-provider",
+        Duration::from_secs(10),
+        None,
+    )
+    .await?;
     assert!(
         service
             .wait(
@@ -379,8 +437,45 @@ async fn bounded_code_mode_refuses_unqualified_provider_without_default_session_
             .unwrap_err()
             .contains("another execution")
     );
-    let result = service.session_for_turn(&turn).await;
+    let result = service
+        .session_for_turn(StepContext::for_test(Arc::clone(&turn)).as_ref())
+        .await;
     assert!(matches!(result, Err(error) if error.contains("process-isolated")));
+    assert!(!called.load(Ordering::Acquire));
+    assert!(service.session.get().is_none());
+    allowance.close();
+    Ok(())
+}
+
+#[tokio::test]
+async fn bounded_code_mode_refuses_missing_sandbox_helper_without_default_host_fallback()
+-> anyhow::Result<()> {
+    struct DefaultHost(Arc<AtomicBool>);
+    impl codex_code_mode::CodeModeSessionProvider for DefaultHost {
+        fn create_session(&self) -> codex_code_mode::CodeModeSessionProviderFuture<'_> {
+            self.0.store(true, Ordering::Release);
+            Box::pin(async { Err("default host must not be created".into()) })
+        }
+    }
+    let (session, _, _events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let called = Arc::new(AtomicBool::new(false));
+    let service = CodeModeService::new(
+        session.thread_id,
+        Arc::new(DefaultHost(Arc::clone(&called))),
+        &CodeModeConfig::default(),
+        Default::default(),
+    );
+    let (turn, allowance) = context(
+        &session,
+        "missing-sandbox-helper",
+        Duration::from_secs(10),
+        None,
+    )
+    .await?;
+    let result = service
+        .session_for_turn(StepContext::for_test(Arc::clone(&turn)).as_ref())
+        .await;
+    assert!(matches!(result, Err(error) if error.contains("sandbox helper")));
     assert!(!called.load(Ordering::Acquire));
     assert!(service.session.get().is_none());
     allowance.close();

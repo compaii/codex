@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -51,6 +52,22 @@ pub enum CodeModeOutputTruncation {
     /// byte allowance. Eviction at the item limit can free space for later media.
     /// Media are indivisible. Bounded loss notices survive even a zero-token budget.
     Server,
+}
+
+/// Trusted local host launch policy, never serialized into the session RPC.
+#[derive(Clone, Debug, Default)]
+pub struct CodeModeHostOptions {
+    pub environment: Option<HashMap<String, String>>,
+    pub sandbox: Option<CodeModeHostSandbox>,
+}
+
+/// An already resolved local permission snapshot. The host engine stays offline;
+/// nested tools retain their separate originating-turn permissions.
+#[derive(Clone, Debug)]
+pub struct CodeModeHostSandbox {
+    pub permissions: codex_protocol::models::PermissionProfile,
+    pub cwd: PathBuf,
+    pub linux_sandbox_exe: PathBuf,
 }
 
 /// Settings shared by every cell in one code-mode session.
@@ -239,12 +256,12 @@ pub trait CodeModeSessionProvider: Send + Sync {
 
     /// Creates a session in an exclusively owned process. Sharing a host is not
     /// an acceptable fallback: heap exhaustion must not destroy another session.
-    /// A supplied host environment replaces process inheritance before launch;
-    /// it is trusted host input, never part of the session's gRPC payload.
+    /// Host launch options must be enforced before launch; unsupported isolation
+    /// must refuse. These options never enter the session's gRPC payload.
     fn create_isolated_session_with_options<'a>(
         &'a self,
         _options: CodeModeSessionOptions,
-        _host_environment: Option<HashMap<String, String>>,
+        _host_options: CodeModeHostOptions,
     ) -> CodeModeSessionProviderFuture<'a> {
         Box::pin(async {
             Err("code-mode provider does not support process-isolated sessions".into())

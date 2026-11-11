@@ -460,6 +460,37 @@ refusing isolated admission instead of creating a shared/default session.
 
 An omitted policy retains the existing ordinary/shared and legacy allowance-only
 behavior. Private-host lifetime, cell namespace, heap acknowledgment and cleanup
-use their existing controls. This is environment selection, not an OS filesystem,
-IPC, descriptor or total-RSS sandbox for the Code Mode host; those and the exact
+use their existing controls. Environment selection composes with the Linux host
+sandbox below; inherited descriptors, total RSS, trusted startup and the exact
 receiving provider/accounting profile remain separately unqualified.
+
+
+### Private Code Mode host OS permissions
+
+When the turn has a permission ceiling, Code Mode resolves the effective local
+step environment and current grants under that ceiling. Its host launch options
+carry that resolved filesystem snapshot, native cwd and the configured Linux
+sandbox helper. The built-in provider uses the existing SandboxManager seccomp/
+bubblewrap transformation with PID isolation and no override. Missing helper,
+unqualified platform or nonrestrictive launch policy refuses; no ordinary or
+unsandboxed host is a fallback. This initial host sandbox is qualified on Linux.
+
+The engine process itself is offline: its stdio protocol needs no direct network
+or owner socket. Nested tools still run through their originating turn's own
+permission/route controls. An omitted turn permission ceiling preserves existing
+ordinary/shared and allowance-only legacy behavior. Host options remain trusted
+Rust inputs, not new gRPC or model parameters.
+
+The native fixture probes a denied fake credential file and an existing Unix
+owner-socket fixture before execing the real V8 host. Both accesses are refused;
+its explicitly permitted recording/work directory remains usable. The same
+private hosts retain their heap/close/deadline checks and the ordinary host keeps
+its environment/session/state. The observer resolves namespaced PIDs only among
+owned descendants using executable, inner PID and a unique fixture marker, with
+bounded process/task scans. Inner namespace PIDs are not controller PIDs or
+operating authority. No model or provider call is part of this qualification.
+
+This implements and exercises the host kernel boundary, not every receiving
+private path or the complete economic profile. Total RSS/external buffers, inherited
+descriptors, trusted startup, full tool/provider exposure, real accounting authority
+and composed receiving selection remain required.
