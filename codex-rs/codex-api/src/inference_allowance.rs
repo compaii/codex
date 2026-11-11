@@ -45,8 +45,17 @@ pub type ProviderAttemptReservation<'a> = Pin<Box<dyn Future<Output = bool> + Se
 /// Return true only after durably reserving this exact attempt. A lost response
 /// or dropped future retains the reservation; it never authorizes replay or
 /// refund. The host owns authenticated usage settlement and real route isolation.
-pub trait ProviderAttemptGate: Send + Sync + std::fmt::Debug {
+pub trait ProviderAttemptGate: Send + Sync {
     fn reserve(&self, attempt: ProviderAttempt) -> ProviderAttemptReservation<'_>;
+}
+
+struct SelectedProviderAttemptGate(Arc<dyn ProviderAttemptGate>);
+
+impl std::fmt::Debug for SelectedProviderAttemptGate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Owner adapters may contain private accounting/custody references.
+        formatter.write_str("ProviderAttemptGate { .. }")
+    }
 }
 
 #[derive(Debug, Default)]
@@ -61,7 +70,7 @@ pub struct InferenceAllowance {
     max_request_bytes: usize,
     deadline: Instant,
     state: Mutex<State>,
-    provider_attempt_gate: Option<Arc<dyn ProviderAttemptGate>>,
+    provider_attempt_gate: Option<SelectedProviderAttemptGate>,
 }
 
 impl InferenceAllowance {
@@ -87,7 +96,7 @@ impl InferenceAllowance {
     /// Select an owner-held gate before sharing this new execution allowance.
     /// This neither creates funding nor rehydrates a spent/uncertain allowance.
     pub fn with_provider_attempt_gate(mut self, gate: Arc<dyn ProviderAttemptGate>) -> Self {
-        self.provider_attempt_gate = Some(gate);
+        self.provider_attempt_gate = Some(SelectedProviderAttemptGate(gate));
         self
     }
 
@@ -106,7 +115,7 @@ impl InferenceAllowance {
             deadline: self.deadline,
         };
         if !matches!(
-            tokio::time::timeout_at(self.deadline, gate.reserve(attempt)).await,
+            tokio::time::timeout_at(self.deadline, gate.0.reserve(attempt)).await,
             Ok(true)
         ) {
             self.close();
@@ -235,6 +244,24 @@ mod tests {
         fn reserve(&self, _: ProviderAttempt) -> ProviderAttemptReservation<'_> {
             Box::pin(std::future::pending())
         }
+    }
+
+    #[derive(Debug)]
+    struct PrivateGate(&'static str);
+    impl ProviderAttemptGate for PrivateGate {
+        fn reserve(&self, _: ProviderAttempt) -> ProviderAttemptReservation<'_> {
+            Box::pin(async move { !self.0.is_empty() })
+        }
+    }
+
+    #[test]
+    fn owner_gate_context_is_not_exposed_by_allowance_debug() {
+        let allowance = InferenceAllowance::new(2, 128, Instant::now() + Duration::from_secs(5))
+            .unwrap()
+            .with_provider_attempt_gate(Arc::new(PrivateGate("owner-context-canary")));
+        let debug = format!("{allowance:?}");
+        assert!(!debug.contains("owner-context-canary"));
+        assert!(debug.contains("ProviderAttemptGate { .. }"));
     }
 
     #[tokio::test(start_paused = true)]
