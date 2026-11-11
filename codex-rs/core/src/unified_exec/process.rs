@@ -106,6 +106,7 @@ pub(crate) struct UnifiedExecProcess {
     state_tx: watch::Sender<ProcessState>,
     state_rx: watch::Receiver<ProcessState>,
     output_task: Option<JoinHandle<()>>,
+    execution_lifetime: std::sync::Mutex<Option<JoinHandle<()>>>,
     sandbox_type: Option<SandboxType>,
     timed_out: AtomicBool,
     /// Explicit termination overrides retention of remote output after exit.
@@ -152,6 +153,7 @@ impl UnifiedExecProcess {
             state_tx,
             state_rx,
             output_task: None,
+            execution_lifetime: std::sync::Mutex::new(None),
             sandbox_type,
             timed_out: AtomicBool::new(false),
             termination_requested: AtomicBool::new(false),
@@ -227,6 +229,37 @@ impl UnifiedExecProcess {
 
     pub(super) fn mark_timed_out(&self) {
         self.timed_out.store(true, Ordering::Release);
+    }
+
+    /// One cleanup task per retained bounded process, under the existing process
+    /// store's cap. It owns no process strongly while waiting; process drop cancels it.
+    pub(super) fn bind_execution_lifetime(
+        self: &Arc<Self>,
+        allowance: Arc<codex_api::InferenceAllowance>,
+    ) {
+        let process = Arc::downgrade(self);
+        let watcher = tokio::spawn(async move {
+            allowance.execution_finished().await;
+            if let Some(process) = process.upgrade()
+                && !matches!(
+                    tokio::time::timeout(Duration::from_secs(2), process.terminate_confirmed())
+                        .await,
+                    Ok(Ok(()))
+                )
+            {
+                process.fail_and_terminate(
+                    "bounded execution ended before process termination was confirmed".into(),
+                );
+            }
+        });
+        let old = self
+            .execution_lifetime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(watcher);
+        if let Some(old) = old {
+            old.abort();
+        }
     }
 
     pub(super) fn timed_out(&self) -> bool {
@@ -701,6 +734,14 @@ impl UnifiedExecProcess {
 
 impl Drop for UnifiedExecProcess {
     fn drop(&mut self) {
+        if let Some(watcher) = self
+            .execution_lifetime
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            watcher.abort();
+        }
         self.terminate();
     }
 }

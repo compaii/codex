@@ -122,6 +122,7 @@ pub struct InferenceAllowance {
     max_request_bytes: usize,
     deadline: Instant,
     state: Mutex<State>,
+    closed: tokio_util::sync::CancellationToken,
     provider_attempt_gate: Option<SelectedProviderAttemptGate>,
 }
 
@@ -139,6 +140,7 @@ impl InferenceAllowance {
             max_request_bytes,
             deadline,
             state: Mutex::new(State::default()),
+            closed: tokio_util::sync::CancellationToken::new(),
             provider_attempt_gate: None,
         };
         value.remaining_time()?;
@@ -185,6 +187,25 @@ impl InferenceAllowance {
             attempt,
             remaining: self.remaining_time()?,
         })
+    }
+
+    /// Check the execution lifetime without consuming or requiring another provider
+    /// attempt. Tools may finish after the final permitted response.
+    pub fn check_execution_open(&self) -> Result<(), InferenceAllowanceError> {
+        if self.closed.is_cancelled() {
+            return Err(InferenceAllowanceError::Closed);
+        }
+        self.remaining_time().map(|_| ())
+    }
+
+    /// Wait for the same execution's explicit close or absolute deadline. This
+    /// creates no renewal, retry or independent background attention.
+    pub async fn execution_finished(&self) {
+        tokio::select! {
+            biased;
+            _ = self.closed.cancelled() => {},
+            _ = tokio::time::sleep_until(self.deadline) => {},
+        }
     }
 
     pub fn deadline(&self) -> Instant {
@@ -290,6 +311,7 @@ impl InferenceAllowance {
         if let Ok(mut state) = self.state.lock() {
             state.closed = true;
         }
+        self.closed.cancel();
     }
 
     pub fn attempted(&self) -> Result<u32, InferenceAllowanceError> {
@@ -339,6 +361,34 @@ mod tests {
             Err(InferenceAllowanceError::Closed)
         );
         assert_eq!(allowance.attempted().unwrap(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn execution_lifetime_observes_close_deadline_and_final_attempt_without_refill() {
+        let allowance =
+            InferenceAllowance::new(1, 128, Instant::now() + Duration::from_secs(5)).unwrap();
+        allowance.claim_attempt().unwrap();
+        assert!(allowance.check_execution_open().is_ok());
+        let finished = allowance.execution_finished();
+        tokio::pin!(finished);
+        assert!(futures::poll!(&mut finished).is_pending());
+        allowance.close();
+        finished.await;
+        allowance.execution_finished().await; // A later subscriber cannot miss close.
+        assert_eq!(
+            allowance.check_execution_open(),
+            Err(InferenceAllowanceError::Closed)
+        );
+        assert_eq!(allowance.attempted().unwrap(), 1);
+
+        let deadline =
+            InferenceAllowance::new(1, 128, Instant::now() + Duration::from_secs(5)).unwrap();
+        deadline.execution_finished().await;
+        assert_eq!(
+            deadline.check_execution_open(),
+            Err(InferenceAllowanceError::Deadline)
+        );
+        assert_eq!(deadline.attempted().unwrap(), 0);
     }
 
     #[derive(Debug)]
