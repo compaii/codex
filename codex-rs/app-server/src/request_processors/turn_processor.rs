@@ -778,6 +778,7 @@ impl TurnRequestProcessor {
         let request = TurnInputRequest::new(input)
             .with_thread_settings(thread_settings)
             .on_start(TurnStartOptions {
+                command_environment_policy: None,
                 permission_ceiling: None,
                 tool_ceiling: None,
                 inference_allowance,
