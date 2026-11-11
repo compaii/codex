@@ -3,6 +3,9 @@
 //! The owner must durably reserve the complete allocation before constructing
 //! this value. Sharing an Arc conserves attempts across retries/transports; a
 //! fresh value is NOT recovery of an accepted or uncertain execution.
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 use thiserror::Error;
@@ -20,6 +23,30 @@ pub enum InferenceAllowanceError {
     Attempts,
     #[error("complete model request exceeds native inference byte allowance")]
     InputBytes,
+    #[error("native provider attempt reservation unavailable")]
+    Reservation,
+}
+
+/// Host-only claim for one physical send. No provider credentials, prompt or
+/// model-visible metadata are carried here. The gate must already bind the
+/// exact causal account, route/model and qualified conservative cost contract.
+/// The complete allowance byte ceiling is the upper bound, never a WS delta.
+#[derive(Debug)]
+pub struct ProviderAttempt {
+    pub id: uuid::Uuid,
+    pub ordinal: u32,
+    pub max_request_bytes: usize,
+    pub deadline: Instant,
+}
+
+pub type ProviderAttemptReservation<'a> = Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+
+/// Trusted owner adapter, not a model callback or another budget journal.
+/// Return true only after durably reserving this exact attempt. A lost response
+/// or dropped future retains the reservation; it never authorizes replay or
+/// refund. The host owns authenticated usage settlement and real route isolation.
+pub trait ProviderAttemptGate: Send + Sync + std::fmt::Debug {
+    fn reserve(&self, attempt: ProviderAttempt) -> ProviderAttemptReservation<'_>;
 }
 
 #[derive(Debug, Default)]
@@ -34,6 +61,7 @@ pub struct InferenceAllowance {
     max_request_bytes: usize,
     deadline: Instant,
     state: Mutex<State>,
+    provider_attempt_gate: Option<Arc<dyn ProviderAttemptGate>>,
 }
 
 impl InferenceAllowance {
@@ -50,9 +78,48 @@ impl InferenceAllowance {
             max_request_bytes,
             deadline,
             state: Mutex::new(State::default()),
+            provider_attempt_gate: None,
         };
         value.remaining_time()?;
         Ok(value)
+    }
+
+    /// Select an owner-held gate before sharing this new execution allowance.
+    /// This neither creates funding nor rehydrates a spent/uncertain allowance.
+    pub fn with_provider_attempt_gate(mut self, gate: Arc<dyn ProviderAttemptGate>) -> Self {
+        self.provider_attempt_gate = Some(gate);
+        self
+    }
+
+    /// Reserve at the actual physical-send boundary under the original absolute
+    /// deadline. Refusal/unknown closes this allowance before any provider bytes;
+    /// auth retries, WS writes and HTTP fallback cannot bypass the refusal.
+    pub async fn claim_authorized_attempt(&self) -> Result<Duration, InferenceAllowanceError> {
+        let (ordinal, remaining) = self.claim_attempt_number()?;
+        let Some(gate) = &self.provider_attempt_gate else {
+            return Ok(remaining);
+        };
+        let attempt = ProviderAttempt {
+            id: uuid::Uuid::new_v4(),
+            ordinal,
+            max_request_bytes: self.max_request_bytes,
+            deadline: self.deadline,
+        };
+        if !matches!(
+            tokio::time::timeout_at(self.deadline, gate.reserve(attempt)).await,
+            Ok(true)
+        ) {
+            self.close();
+            return Err(InferenceAllowanceError::Reservation);
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| InferenceAllowanceError::Closed)?;
+        if state.closed {
+            return Err(InferenceAllowanceError::Closed);
+        }
+        self.remaining_time()
     }
 
     pub fn deadline(&self) -> Instant {
@@ -86,6 +153,10 @@ impl InferenceAllowance {
     /// Call immediately before each physical provider attempt. Even a lost
     /// acknowledgment consumes its attempt; there is deliberately no refund.
     pub fn claim_attempt(&self) -> Result<Duration, InferenceAllowanceError> {
+        self.claim_attempt_number().map(|(_, remaining)| remaining)
+    }
+
+    fn claim_attempt_number(&self) -> Result<(u32, Duration), InferenceAllowanceError> {
         let mut state = self
             .state
             .lock()
@@ -98,7 +169,7 @@ impl InferenceAllowance {
             return Err(InferenceAllowanceError::Attempts);
         }
         state.attempted += 1;
-        Ok(remaining)
+        Ok((state.attempted, remaining))
     }
 
     /// Fence future attempts. This does not cancel an already-active provider
@@ -156,6 +227,30 @@ mod tests {
             Err(InferenceAllowanceError::Closed)
         );
         assert_eq!(allowance.attempted().unwrap(), 2);
+    }
+
+    #[derive(Debug)]
+    struct StalledGate;
+    impl ProviderAttemptGate for StalledGate {
+        fn reserve(&self, _: ProviderAttempt) -> ProviderAttemptReservation<'_> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lost_reservation_response_closes_without_refill() {
+        let allowance = InferenceAllowance::new(8, 128, Instant::now() + Duration::from_secs(5))
+            .unwrap()
+            .with_provider_attempt_gate(Arc::new(StalledGate));
+        assert_eq!(
+            allowance.claim_authorized_attempt().await,
+            Err(InferenceAllowanceError::Reservation)
+        );
+        assert_eq!(allowance.attempted().unwrap(), 1);
+        assert_eq!(
+            allowance.claim_authorized_attempt().await,
+            Err(InferenceAllowanceError::Closed)
+        );
     }
 
     #[tokio::test(start_paused = true)]

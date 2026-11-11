@@ -90,7 +90,7 @@ impl WsStream {
                                 // The queue/pump is the physical write boundary. An
                                 // expired queued command must not acquire a fresh lease.
                                 let result = if let Some(allowance) = inference_allowance {
-                                    match allowance.claim_attempt() {
+                                    match allowance.claim_authorized_attempt().await {
                                         Ok(remaining) => tokio::time::timeout(remaining, inner.send(message)).await
                                             .unwrap_or_else(|_| Err(WsError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "native inference allowance deadline expired")))),
                                         Err(error) => Err(WsError::Io(std::io::Error::other(error.to_string()))),

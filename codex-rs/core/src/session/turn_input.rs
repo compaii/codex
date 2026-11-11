@@ -99,7 +99,7 @@ impl TurnStartKind {
 struct PreparedTurnInputSettings {
     thread_settings_update: Option<SessionSettingsUpdate>,
     start_options: TurnStartOptions,
-    inference_allowance: Option<Arc<codex_api::InferenceAllowance>>,
+    inference_allowance: Option<codex_api::InferenceAllowance>,
 }
 
 impl PreparedTurnInputSettings {
@@ -113,7 +113,7 @@ impl PreparedTurnInputSettings {
         let inference_allowance = start_options
             .inference_allowance
             .as_ref()
-            .map(crate::turn_inference::prepare)
+            .map(crate::turn_inference::prepare_owned)
             .transpose()?;
         let thread_settings = thread_settings.into();
         let thread_settings_update = if thread_settings.request
@@ -175,22 +175,32 @@ impl PreparedTurnInputSettings {
             final_output_json_schema,
             cyber_access_program,
         };
-        let turn_context = match kind {
-            TurnStartKind::User | TurnStartKind::Recovery => Some(
+        let has_allowance = self.inference_allowance.is_some();
+        let turn_context = if has_allowance && kind != TurnStartKind::Automatic {
+            Some(
                 session
                     .new_turn_with_sub_id(submission_id.clone(), updates, options)
                     .await?,
-            ),
-            TurnStartKind::Automatic => {
-                session
-                    .new_turn_with_sub_id_if(
-                        submission_id.clone(),
-                        updates,
-                        options,
-                        |current, proposed| kind.permits_settings(current, proposed),
-                    )
-                    .await?
-            }
+            )
+        } else {
+            session
+                .new_turn_with_sub_id_if(
+                    submission_id.clone(),
+                    updates,
+                    options,
+                    |current, proposed| {
+                        // Evaluate the actual committed host attachment, not the
+                        // earlier preview. Refusal never commits thread settings.
+                        let funding_selected = proposed
+                            .turn_extension_init
+                            .get::<Arc<dyn codex_api::ProviderAttemptGate>>()
+                            .is_some();
+                        (!funding_selected || has_allowance)
+                            && (kind != TurnStartKind::Automatic
+                                || kind.permits_settings(current, proposed))
+                    },
+                )
+                .await?
         };
         let Some((turn_context, settings_snapshot)) = turn_context else {
             return Ok(None);
@@ -199,7 +209,14 @@ impl PreparedTurnInputSettings {
             turn_context.extension_data.insert(spec);
         }
         if let Some(allowance) = self.inference_allowance {
-            turn_context.extension_data.insert(allowance);
+            let gate = turn_context
+                .extension_data
+                .get::<Arc<dyn codex_api::ProviderAttemptGate>>();
+            let allowance = match gate {
+                Some(gate) => allowance.with_provider_attempt_gate(Arc::clone(gate.as_ref())),
+                None => allowance,
+            };
+            turn_context.extension_data.insert(Arc::new(allowance));
         }
         if let Some(turn_trigger) = turn_trigger {
             turn_context

@@ -11,7 +11,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 
+#[cfg(test)]
 pub(crate) fn prepare(spec: &TurnInferenceAllowance) -> Result<Arc<InferenceAllowance>> {
+    prepare_owned(spec).map(Arc::new)
+}
+
+pub(crate) fn prepare_owned(spec: &TurnInferenceAllowance) -> Result<InferenceAllowance> {
     let remaining_ms = spec
         .deadline_unix_ms
         .checked_sub(chrono::Utc::now().timestamp_millis())
@@ -36,7 +41,6 @@ pub(crate) fn prepare(spec: &TurnInferenceAllowance) -> Result<Arc<InferenceAllo
         spec.max_request_bytes as usize,
         Instant::now() + duration,
     )
-    .map(Arc::new)
     .map_err(|err| CodexErr::InvalidRequest(err.to_string()))
 }
 

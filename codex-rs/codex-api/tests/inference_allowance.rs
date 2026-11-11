@@ -5,6 +5,9 @@ use codex_api::AuthProvider;
 use codex_api::Compression;
 use codex_api::InferenceAllowance;
 use codex_api::Provider;
+use codex_api::ProviderAttempt;
+use codex_api::ProviderAttemptGate;
+use codex_api::ProviderAttemptReservation;
 use codex_api::ReqwestTransport;
 use codex_api::ResponseCreateWsRequest;
 use codex_api::ResponseEvent;
@@ -21,6 +24,7 @@ use futures::StreamExt;
 use http::HeaderMap;
 use serde_json::json;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -41,6 +45,23 @@ struct NoAuth;
 impl AuthProvider for NoAuth {
     fn add_auth_headers(&self, _: &mut HeaderMap) -> Result<(), codex_api::AuthError> {
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct ReservationGate {
+    permitted: u32,
+    claims: Mutex<Vec<(uuid::Uuid, u32, usize)>>,
+}
+
+impl ProviderAttemptGate for ReservationGate {
+    fn reserve(&self, attempt: ProviderAttempt) -> ProviderAttemptReservation<'_> {
+        self.claims.lock().expect("gate fixture").push((
+            attempt.id,
+            attempt.ordinal,
+            attempt.max_request_bytes,
+        ));
+        Box::pin(async move { attempt.ordinal <= self.permitted })
     }
 }
 
@@ -578,4 +599,92 @@ async fn inference_allowance_deadline_also_closes_a_stalled_http_event_body() {
             .expect_err("owned server retired")
             .is_cancelled()
     );
+}
+
+#[tokio::test]
+async fn provider_gate_refuses_before_http_and_closes_retries() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let gate = Arc::new(ReservationGate {
+        permitted: 1,
+        claims: Mutex::default(),
+    });
+    let allowance = Arc::new(
+        InferenceAllowance::new(8, 4096, Instant::now() + Duration::from_secs(30))
+            .expect("gate fixture")
+            .with_provider_attempt_gate(gate.clone()),
+    );
+    let client = client(&server, Arc::clone(&allowance));
+    for _ in 0..2 {
+        assert!(matches!(
+            client
+                .stream(
+                    json!({"model":"loopback"}),
+                    HeaderMap::new(),
+                    Compression::None,
+                    None,
+                )
+                .await,
+            Err(ApiError::InvalidRequest { .. })
+        ));
+    }
+    let claims = gate.claims.lock().expect("gate fixture");
+    assert_eq!(claims.len(), 2);
+    assert_ne!(claims[0].0, claims[1].0);
+    assert_eq!((claims[0].1, claims[1].1), (1, 2));
+    assert!(claims.iter().all(|claim| claim.2 == 4096));
+    assert_eq!(allowance.attempted().expect("gate fixture"), 2);
+}
+
+#[tokio::test]
+async fn provider_gate_refuses_websocket_write_and_http_fallback() {
+    let (connection, received, server_task) = websocket_peer(true).await;
+    let gate = Arc::new(ReservationGate {
+        permitted: 0,
+        claims: Mutex::default(),
+    });
+    let allowance = Arc::new(
+        InferenceAllowance::new(8, 4096, Instant::now() + Duration::from_secs(30))
+            .expect("gate fixture")
+            .with_provider_attempt_gate(gate.clone()),
+    );
+    let mut events = connection
+        .stream_request_with_allowance(ws_request(), false, None, 512, Arc::clone(&allowance))
+        .await
+        .expect("gate fixture");
+    let event = tokio::time::timeout(Duration::from_secs(5), events.next())
+        .await
+        .expect("gate fixture")
+        .expect("gate fixture");
+    assert!(event.is_err());
+    assert_eq!(received.load(Ordering::SeqCst), 0);
+    let http = MockServer::start().await;
+    assert!(matches!(
+        client(&http, allowance)
+            .stream(
+                json!({"model":"loopback"}),
+                HeaderMap::new(),
+                Compression::None,
+                None,
+            )
+            .await,
+        Err(ApiError::InvalidRequest { .. })
+    ));
+    assert!(
+        http.received_requests()
+            .await
+            .expect("gate fixture")
+            .is_empty()
+    );
+    assert_eq!(gate.claims.lock().expect("gate fixture").len(), 1);
+    drop(events);
+    drop(connection);
+    tokio::time::timeout(Duration::from_secs(5), server_task)
+        .await
+        .expect("gate fixture")
+        .expect("gate fixture");
 }
