@@ -1517,3 +1517,103 @@ async fn funding_gate_does_not_block_human_steering_of_an_active_turn() {
     assert!(matches!(result, TurnInputSubmission::Steered { .. }));
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
+
+#[tokio::test]
+async fn per_turn_reservation_is_not_inherited_and_requires_finite_limits() {
+    let (session, _ctx, _rx) = make_session_and_context_with_rx().await;
+    let gate = Arc::new(FundingGateFixture::default());
+    let selected = codex_protocol::provider_attempt::ProviderAttemptGateSelection(gate.clone());
+    assert!(
+        PreparedTurnInputSettings::prepare(
+            &session,
+            ThreadSettingsOverrides::default(),
+            TurnStartOptions {
+                provider_attempt_gate: Some(selected.clone()),
+                ..Default::default()
+            }
+        )
+        .await
+        .is_err()
+    );
+    let prepared = PreparedTurnInputSettings::prepare(
+        &session,
+        ThreadSettingsOverrides::default(),
+        TurnStartOptions {
+            provider_attempt_gate: Some(selected),
+            inference_allowance: Some(codex_protocol::turn_input::TurnInferenceAllowance {
+                max_provider_attempts: 1,
+                max_request_bytes: 4096,
+                deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let ctx = prepared
+        .apply_started(&session, "one-funded-turn".into(), TurnStartKind::User)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        crate::turn_inference::allowance(&ctx)
+            .unwrap()
+            .claim_authorized_attempt()
+            .await
+            .is_err()
+    );
+    assert_eq!(gate.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let next = PreparedTurnInputSettings::prepare(
+        &session,
+        ThreadSettingsOverrides::default(),
+        TurnStartOptions::default(),
+    )
+    .await
+    .unwrap()
+    .apply_started(
+        &session,
+        "independent-human-turn".into(),
+        TurnStartKind::User,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(crate::turn_inference::allowance(&next).is_none());
+    assert!(
+        next.extension_data
+            .get::<Arc<dyn codex_api::ProviderAttemptGate>>()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn per_turn_caller_cannot_replace_an_existing_host_reservation_policy() {
+    let (session, _ctx, _rx) = make_session_and_context_with_rx().await;
+    let prepared = PreparedTurnInputSettings::prepare(
+        &session,
+        ThreadSettingsOverrides::default(),
+        TurnStartOptions {
+            provider_attempt_gate: Some(
+                codex_protocol::provider_attempt::ProviderAttemptGateSelection(Arc::new(
+                    FundingGateFixture::default(),
+                )),
+            ),
+            inference_allowance: Some(codex_protocol::turn_input::TurnInferenceAllowance {
+                max_provider_attempts: 1,
+                max_request_bytes: 4096,
+                deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    set_funding_gate(&session, Arc::new(FundingGateFixture::default())).await;
+    assert!(
+        prepared
+            .apply_started(&session, "conflicting-owner".into(), TurnStartKind::User)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

@@ -1885,6 +1885,12 @@ impl TryFrom<JSONRPCRequest> for ServerRequest {
 }
 
 server_request_definitions! {
+    /// Account reservation for a bounded native physical attempt. Only the
+    /// initiating owner connection may answer; never replay to subscribers.
+    ProviderAttemptReservation => "turn/providerAttempt/reserve" {
+        params: v2::ProviderAttemptReservationParams,
+        response: v2::ProviderAttemptReservationResponse,
+    },
     /// NEW APIs
     /// Sent when approval is requested for a specific command execution.
     /// This request is used for Turns started via turn/start.
@@ -2423,6 +2429,37 @@ mod tests {
         );
         value["params"].as_object_mut().unwrap().remove("allowance");
         assert!(serde_json::from_value::<ClientRequest>(value).is_err());
+    }
+
+    #[test]
+    fn provider_reservation_selection_is_rejected_by_older_bounded_readers() {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct OldBoundedParams {
+            #[serde(rename = "turn")]
+            _turn: v2::TurnStartParams,
+            #[serde(rename = "allowance")]
+            _allowance: codex_protocol::turn_input::TurnInferenceAllowance,
+        }
+        let mut params = serde_json::json!({
+            "turn":{"threadId":"selected-thread","input":[]},
+            "allowance":{"maxProviderAttempts":3,"maxRequestBytes":1024,"deadlineUnixMs":42}
+        });
+        assert!(serde_json::from_value::<OldBoundedParams>(params.clone()).is_ok());
+        params["providerReservationCycleId"] = "caa11c1d-b05b-4f56-99ab-167878e86126".into();
+        assert!(serde_json::from_value::<OldBoundedParams>(params.clone()).is_err());
+        let current: v2::TurnStartBoundedIfIdleParams =
+            serde_json::from_value(params.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(current).unwrap()["providerReservationCycleId"],
+            params["providerReservationCycleId"]
+        );
+        assert!(
+            serde_json::from_value::<v2::ProviderAttemptReservationResponse>(
+                serde_json::json!({"authorized":true})
+            )
+            .is_err()
+        );
     }
 
     #[test]

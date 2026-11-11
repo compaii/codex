@@ -141,6 +141,7 @@ mod otel_config;
 mod otel_reloader;
 mod outgoing_message;
 mod plugin_config_reload;
+mod provider_reservation;
 mod request_processors;
 mod request_serialization;
 mod server_request_error;

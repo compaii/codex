@@ -183,6 +183,7 @@ impl TurnRequestProcessor {
             app_server_client_version,
             only_if_idle,
             None,
+            None,
         )
         .await
         .map(|response| {
@@ -202,6 +203,14 @@ impl TurnRequestProcessor {
         app_server_client_version: Option<String>,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         validate_user_input_image_urls(&params.turn.input)?;
+        if let Some(cycle_id) = &params.provider_reservation_cycle_id {
+            let valid = uuid::Uuid::parse_str(cycle_id).is_ok_and(|id| id.to_string() == *cycle_id);
+            if !valid {
+                return Err(invalid_request(
+                    "canonical provider reservation cycle UUID required",
+                ));
+            }
+        }
         self.turn_start_inner(
             request_id,
             params.turn,
@@ -209,6 +218,7 @@ impl TurnRequestProcessor {
             app_server_client_version,
             true,
             Some(params.allowance),
+            params.provider_reservation_cycle_id,
         )
         .await
         .map(|response| Some(ClientResponsePayload::TurnStartBoundedIfIdle(response)))
@@ -582,6 +592,7 @@ impl TurnRequestProcessor {
         app_server_client_version: Option<String>,
         only_if_idle: bool,
         inference_allowance: Option<codex_protocol::turn_input::TurnInferenceAllowance>,
+        provider_reservation_cycle_id: Option<String>,
     ) -> Result<TurnStartResponse, JSONRPCErrorError> {
         let (thread_id, thread) =
             self.load_thread(&params.thread_id)
@@ -729,10 +740,24 @@ impl TurnRequestProcessor {
             )
             .await?;
 
+        let reservation = provider_reservation_cycle_id.map(|cycle_id| {
+            Arc::new(crate::provider_reservation::OwnerProviderReservation {
+                outgoing: self.outgoing.clone(),
+                owner: request_id.connection_id,
+                thread_id,
+                cycle_id,
+                deadline_unix_ms: inference_allowance
+                    .as_ref()
+                    .expect("bounded reservation start")
+                    .deadline_unix_ms,
+            }) as Arc<dyn codex_api::ProviderAttemptGate>
+        });
         let request = TurnInputRequest::new(input)
             .with_thread_settings(thread_settings)
             .on_start(TurnStartOptions {
                 inference_allowance,
+                provider_attempt_gate: reservation
+                    .map(codex_protocol::provider_attempt::ProviderAttemptGateSelection),
                 turn_trigger: params.turn_trigger,
                 parent_turn_id: params.parent_turn_id,
                 initiating_agent_path: None,

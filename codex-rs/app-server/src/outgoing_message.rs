@@ -157,6 +157,7 @@ pub(crate) struct ThreadScopedOutgoingMessageSender {
 }
 
 struct PendingCallbackEntry {
+    reservation_owner: Option<ConnectionId>,
     human_approval_recipients: HashSet<ConnectionId>,
     verification_owner: Option<ConnectionId>,
     verification_auth_revision: Option<u64>,
@@ -333,6 +334,10 @@ impl OutgoingMessageSender {
             .remove(&connection_id);
         self.disconnect_user_verification_connection(connection_id)
             .await;
+        self.request_id_to_callback
+            .lock()
+            .await
+            .retain(|_, entry| entry.reservation_owner != Some(connection_id));
         let mut request_contexts = self.request_contexts.lock().await;
         request_contexts.retain(|request_id, _| request_id.connection_id != connection_id);
     }
@@ -381,7 +386,7 @@ impl OutgoingMessageSender {
         .await
     }
 
-    fn next_request_id(&self) -> RequestId {
+    pub(crate) fn next_request_id(&self) -> RequestId {
         RequestId::Integer(self.next_server_request_id.fetch_add(1, Ordering::Relaxed))
     }
 
@@ -391,9 +396,31 @@ impl OutgoingMessageSender {
         request: ServerRequestPayload,
         thread_id: Option<ThreadId>,
     ) -> (RequestId, oneshot::Receiver<ClientRequestResult>) {
-        let id = self.next_request_id();
+        self.send_request_with_id(self.next_request_id(), connection_ids, request, thread_id)
+            .await
+    }
+
+    pub(crate) async fn send_request_with_id(
+        &self,
+        id: RequestId,
+        connection_ids: Option<&[ConnectionId]>,
+        request: ServerRequestPayload,
+        thread_id: Option<ThreadId>,
+    ) -> (RequestId, oneshot::Receiver<ClientRequestResult>) {
         let outgoing_message_id = id.clone();
         let request = request.request_with_id(outgoing_message_id.clone());
+        let is_reservation = matches!(&request, ServerRequest::ProviderAttemptReservation { .. });
+        let reservation_owner = if is_reservation {
+            match connection_ids {
+                Some([owner]) => Some(*owner),
+                _ => {
+                    let (_, rx) = oneshot::channel();
+                    return (outgoing_message_id, rx);
+                }
+            }
+        } else {
+            None
+        };
         let user_verification = matches!(
             &request,
             ServerRequest::McpServerElicitationRequest { params, .. }
@@ -451,6 +478,7 @@ impl OutgoingMessageSender {
             request_id_to_callback.insert(
                 id,
                 PendingCallbackEntry {
+                    reservation_owner,
                     human_approval_recipients: if requires_human_approval(&request) {
                         connection_ids.unwrap_or_default().iter().copied().collect()
                     } else {
@@ -572,6 +600,7 @@ impl OutgoingMessageSender {
             Some((id, entry)) => {
                 let completed_at_ms = now_unix_timestamp_ms();
                 if entry.verification_owner.is_none()
+                    && entry.reservation_owner.is_none()
                     && let Ok(response) = entry.request.response_from_result(result.clone())
                 {
                     tracing::info!("<- response: {response:?}");
@@ -666,6 +695,12 @@ impl OutgoingMessageSender {
             .contains(&connection_id);
         let mut callbacks = self.request_id_to_callback.lock().await;
         let entry = callbacks.get(id)?;
+        if entry
+            .reservation_owner
+            .is_some_and(|owner| owner != connection_id)
+        {
+            return None;
+        }
         if requires_human_approval(&entry.request)
             && (!human_approval || !entry.human_approval_recipients.contains(&connection_id))
         {
@@ -693,8 +728,10 @@ impl OutgoingMessageSender {
         let mut requests = request_id_to_callback
             .values()
             .filter_map(|entry| {
-                (entry.thread_id == Some(thread_id) && entry.verification_owner.is_none())
-                    .then_some(entry.request.clone())
+                (entry.thread_id == Some(thread_id)
+                    && entry.verification_owner.is_none()
+                    && entry.reservation_owner.is_none())
+                .then_some(entry.request.clone())
             })
             .collect::<Vec<_>>();
         requests.sort_by(|left, right| left.id().cmp(right.id()));
@@ -1042,6 +1079,10 @@ mod user_verification_ownership_tests;
 #[cfg(test)]
 #[path = "user_verification_cancel_context_tests.rs"]
 mod user_verification_cancel_context_tests;
+
+#[cfg(test)]
+#[path = "provider_reservation_tests.rs"]
+mod provider_reservation_tests;
 
 #[cfg(test)]
 mod tests {

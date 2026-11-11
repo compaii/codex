@@ -2191,6 +2191,15 @@ async fn handle_server_request(
             )
             .await
         }
+        ServerRequest::ProviderAttemptReservation { request_id, .. } => {
+            reject_server_request(
+                client,
+                request_id,
+                &method,
+                "provider accounting owner is not configured in exec mode".to_string(),
+            )
+            .await
+        }
         ServerRequest::ToolRequestUserInput { request_id, params } => {
             reject_server_request(
                 client,

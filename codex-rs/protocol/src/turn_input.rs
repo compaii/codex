@@ -234,6 +234,8 @@ pub struct TurnInferenceAllowance {
 /// child input, Core also compares root lineage to detect ambiguity.
 #[derive(Clone, Debug, Default)]
 pub struct TurnStartOptions {
+    /// Host-only reservation for this physical turn; never a sticky thread setting.
+    pub provider_attempt_gate: Option<crate::provider_attempt::ProviderAttemptGateSelection>,
     /// Finite already-reserved inference limits for this physical execution only.
     pub inference_allowance: Option<TurnInferenceAllowance>,
     /// Source classification for this request. Recorded on new turns and captured

@@ -4685,6 +4685,69 @@
       "title": "PermissionsRequestApprovalResponse",
       "type": "object"
     },
+    "ProviderAttemptReservationParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "description": "Host accounting request, never a model tool or human approval ceremony.",
+      "properties": {
+        "attemptId": {
+          "type": "string"
+        },
+        "cycleId": {
+          "type": "string"
+        },
+        "deadlineUnixMs": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "maxRequestBytes": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "ordinal": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "attemptId",
+        "cycleId",
+        "deadlineUnixMs",
+        "maxRequestBytes",
+        "ordinal",
+        "threadId"
+      ],
+      "title": "ProviderAttemptReservationParams",
+      "type": "object"
+    },
+    "ProviderAttemptReservationResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "description": "Authorizes only the exact retained journal operation. A lost response must retain exposure; repeating this request must never mint a replacement call.",
+      "properties": {
+        "attemptId": {
+          "type": "string"
+        },
+        "authorized": {
+          "type": "boolean"
+        },
+        "cycleId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "attemptId",
+        "authorized",
+        "cycleId"
+      ],
+      "title": "ProviderAttemptReservationResponse",
+      "type": "object"
+    },
     "RequestId": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "anyOf": [
@@ -6553,6 +6616,31 @@
       "$schema": "http://json-schema.org/draft-07/schema#",
       "description": "Request initiated from the server and sent to the client.",
       "oneOf": [
+        {
+          "description": "Account reservation for a bounded native physical attempt. Only the initiating owner connection may answer; never replay to subscribers.",
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "turn/providerAttempt/reserve"
+              ],
+              "title": "Turn/providerAttempt/reserveRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/ProviderAttemptReservationParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Turn/providerAttempt/reserveRequest",
+          "type": "object"
+        },
         {
           "description": "NEW APIs Sent when approval is requested for a specific command execution. This request is used for Turns started via turn/start.",
           "properties": {
@@ -27387,6 +27475,13 @@
         "properties": {
           "allowance": {
             "$ref": "#/definitions/v2/TurnInferenceAllowance"
+          },
+          "providerReservationCycleId": {
+            "description": "Owner journal cycle whose exact physical attempts require a reservation response from this initiating connection. This is not a budget grant. Older bounded-start servers reject this field rather than ignore it.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "turn": {
             "$ref": "#/definitions/v2/TurnStartParams"

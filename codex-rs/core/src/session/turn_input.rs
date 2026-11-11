@@ -110,6 +110,13 @@ impl PreparedTurnInputSettings {
         thread_settings: impl Into<WithTurnExtensionData<ThreadSettingsOverrides>>,
         start_options: TurnStartOptions,
     ) -> CodexResult<Self> {
+        if start_options.provider_attempt_gate.is_some()
+            && start_options.inference_allowance.is_none()
+        {
+            return Err(CodexErr::InvalidRequest(
+                "provider reservation requires a finite allowance".into(),
+            ));
+        }
         let inference_allowance = start_options
             .inference_allowance
             .as_ref()
@@ -154,6 +161,7 @@ impl PreparedTurnInputSettings {
     ) -> CodexResult<Option<Arc<TurnContext>>> {
         let TurnStartOptions {
             inference_allowance: inference_spec,
+            provider_attempt_gate,
             turn_trigger,
             final_output_json_schema,
             service_tier,
@@ -176,32 +184,36 @@ impl PreparedTurnInputSettings {
             cyber_access_program,
         };
         let has_allowance = self.inference_allowance.is_some();
-        let turn_context = if has_allowance && kind != TurnStartKind::Automatic {
-            Some(
-                session
-                    .new_turn_with_sub_id(submission_id.clone(), updates, options)
-                    .await?,
-            )
-        } else {
-            session
-                .new_turn_with_sub_id_if(
-                    submission_id.clone(),
-                    updates,
-                    options,
-                    |current, proposed| {
-                        // Evaluate the actual committed host attachment, not the
-                        // earlier preview. Refusal never commits thread settings.
-                        let funding_selected = proposed
-                            .turn_extension_init
-                            .get::<Arc<dyn codex_api::ProviderAttemptGate>>()
-                            .is_some();
-                        (!funding_selected || has_allowance)
-                            && (kind != TurnStartKind::Automatic
-                                || kind.permits_settings(current, proposed))
-                    },
+        let turn_context =
+            if has_allowance && provider_attempt_gate.is_none() && kind != TurnStartKind::Automatic
+            {
+                Some(
+                    session
+                        .new_turn_with_sub_id(submission_id.clone(), updates, options)
+                        .await?,
                 )
-                .await?
-        };
+            } else {
+                session
+                    .new_turn_with_sub_id_if(
+                        submission_id.clone(),
+                        updates,
+                        options,
+                        |current, proposed| {
+                            // Evaluate the actual committed host attachment, not the
+                            // earlier preview. Refusal never commits thread settings.
+                            let funding_selected = proposed
+                                .turn_extension_init
+                                .get::<Arc<dyn codex_api::ProviderAttemptGate>>()
+                                .is_some();
+                            // A per-turn caller cannot replace an already selected host policy.
+                            (!funding_selected || provider_attempt_gate.is_none())
+                                && (!funding_selected || has_allowance)
+                                && (kind != TurnStartKind::Automatic
+                                    || kind.permits_settings(current, proposed))
+                        },
+                    )
+                    .await?
+            };
         let Some((turn_context, settings_snapshot)) = turn_context else {
             return Ok(None);
         };
@@ -209,11 +221,16 @@ impl PreparedTurnInputSettings {
             turn_context.extension_data.insert(spec);
         }
         if let Some(allowance) = self.inference_allowance {
-            let gate = turn_context
-                .extension_data
-                .get::<Arc<dyn codex_api::ProviderAttemptGate>>();
+            let gate = provider_attempt_gate
+                .map(|selection| selection.0)
+                .or_else(|| {
+                    turn_context
+                        .extension_data
+                        .get::<Arc<dyn codex_api::ProviderAttemptGate>>()
+                        .map(|gate| Arc::clone(gate.as_ref()))
+                });
             let allowance = match gate {
-                Some(gate) => allowance.with_provider_attempt_gate(Arc::clone(gate.as_ref())),
+                Some(gate) => allowance.with_provider_attempt_gate(gate),
                 None => allowance,
             };
             turn_context.extension_data.insert(Arc::new(allowance));

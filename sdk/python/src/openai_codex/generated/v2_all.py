@@ -13833,6 +13833,13 @@ class TurnStartBoundedIfIdleParams(BaseModel):
         populate_by_name=True,
     )
     allowance: TurnInferenceAllowance
+    provider_reservation_cycle_id: Annotated[
+        str | None,
+        Field(
+            alias="providerReservationCycleId",
+            description="Owner journal cycle whose exact physical attempts require a reservation response from this initiating connection. This is not a budget grant. Older bounded-start servers reject this field rather than ignore it.",
+        ),
+    ] = None
     turn: TurnStartParams
 
 

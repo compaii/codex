@@ -67,6 +67,7 @@ jobs:
         run: |
           cargo test --locked --profile dev-small -j 2 -p codex-api --lib inference_allowance::tests
           cargo test --locked --profile dev-small -j 2 -p codex-api --test inference_allowance
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server --lib provider_reservation_tests
           RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-core --lib session::turn_input::tests
       - name: Resolved idle resume reuse and configuration boundaries
         run: |

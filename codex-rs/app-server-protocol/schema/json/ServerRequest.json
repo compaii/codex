@@ -1716,6 +1716,44 @@
       ],
       "type": "object"
     },
+    "ProviderAttemptReservationParams": {
+      "additionalProperties": false,
+      "description": "Host accounting request, never a model tool or human approval ceremony.",
+      "properties": {
+        "attemptId": {
+          "type": "string"
+        },
+        "cycleId": {
+          "type": "string"
+        },
+        "deadlineUnixMs": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "maxRequestBytes": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "ordinal": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "attemptId",
+        "cycleId",
+        "deadlineUnixMs",
+        "maxRequestBytes",
+        "ordinal",
+        "threadId"
+      ],
+      "type": "object"
+    },
     "RequestId": {
       "anyOf": [
         {
@@ -1853,6 +1891,31 @@
   },
   "description": "Request initiated from the server and sent to the client.",
   "oneOf": [
+    {
+      "description": "Account reservation for a bounded native physical attempt. Only the initiating owner connection may answer; never replay to subscribers.",
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "turn/providerAttempt/reserve"
+          ],
+          "title": "Turn/providerAttempt/reserveRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ProviderAttemptReservationParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Turn/providerAttempt/reserveRequest",
+      "type": "object"
+    },
     {
       "description": "NEW APIs Sent when approval is requested for a specific command execution. This request is used for Turns started via turn/start.",
       "properties": {
