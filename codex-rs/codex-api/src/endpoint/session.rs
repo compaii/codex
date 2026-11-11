@@ -50,7 +50,7 @@ impl<T: HttpTransport> EndpointSession<T> {
         self
     }
 
-    fn claim_inference_attempt(&self, request: &mut Request) -> Result<(), TransportError> {
+    async fn claim_inference_attempt(&self, request: &mut Request) -> Result<(), TransportError> {
         if let Some(allowance) = &self.inference_allowance {
             if !self.transport.supports_single_attempt() {
                 return Err(TransportError::Build(
@@ -58,7 +58,8 @@ impl<T: HttpTransport> EndpointSession<T> {
                 ));
             }
             let remaining = allowance
-                .claim_attempt()
+                .claim_authorized_attempt()
+                .await
                 .map_err(|e| TransportError::Build(e.to_string()))?;
             request.timeout = Some(
                 request
@@ -214,7 +215,7 @@ impl<T: HttpTransport> EndpointSession<T> {
                 let transport = &self.transport;
                 async move {
                     let mut req = self.authorize_request(req).await?;
-                    self.claim_inference_attempt(&mut req)?;
+                    self.claim_inference_attempt(&mut req).await?;
                     transport.execute(req).await
                 }
             },
@@ -264,7 +265,7 @@ impl<T: HttpTransport> EndpointSession<T> {
                 let transport = &self.transport;
                 async move {
                     let mut req = self.authorize_request(req).await?;
-                    self.claim_inference_attempt(&mut req)?;
+                    self.claim_inference_attempt(&mut req).await?;
                     transport.stream(req).await
                 }
             },

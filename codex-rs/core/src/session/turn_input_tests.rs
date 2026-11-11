@@ -1402,3 +1402,118 @@ async fn agent_message_wake_preserves_bounded_predecessor(bounded: bool) {
         vec![TurnInput::InterAgentCommunication(communication.into())]
     );
 }
+
+#[derive(Debug, Default)]
+struct FundingGateFixture(std::sync::atomic::AtomicUsize);
+impl codex_api::ProviderAttemptGate for FundingGateFixture {
+    fn reserve(&self, _: codex_api::ProviderAttempt) -> codex_api::ProviderAttemptReservation<'_> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { false })
+    }
+}
+
+async fn set_funding_gate(session: &Session, gate: Arc<FundingGateFixture>) {
+    let gate: Arc<dyn codex_api::ProviderAttemptGate> = gate;
+    session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .turn_extension_init
+        .insert(gate);
+}
+
+#[tokio::test]
+async fn funding_gate_uses_actual_start_attachment_and_refuses_unbounded_start() {
+    let (session, _ctx, _rx) = make_session_and_context_with_rx().await;
+    let initial = session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .step_settings
+        .collaboration_mode
+        .clone();
+    let prepared = PreparedTurnInputSettings::prepare(
+        &session,
+        ThreadSettingsOverrides {
+            model: Some("gpt-5.2".into()),
+            ..Default::default()
+        },
+        TurnStartOptions::default(),
+    )
+    .await
+    .expect("prepare unfunded start");
+    let old_gate = Arc::new(FundingGateFixture::default());
+    set_funding_gate(&session, Arc::clone(&old_gate)).await;
+    assert!(
+        prepared
+            .apply_started(&session, "unfunded-start".into(), TurnStartKind::User)
+            .await
+            .expect("admission result")
+            .is_none()
+    );
+    assert_eq!(
+        session
+            .state
+            .lock()
+            .await
+            .session_configuration
+            .step_settings
+            .collaboration_mode,
+        initial
+    );
+    let spec = codex_protocol::turn_input::TurnInferenceAllowance {
+        max_provider_attempts: 2,
+        max_request_bytes: 4096,
+        deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+    };
+    let prepared = PreparedTurnInputSettings::prepare(
+        &session,
+        ThreadSettingsOverrides::default(),
+        TurnStartOptions {
+            inference_allowance: Some(spec),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("prepare funded start");
+    let current_gate = Arc::new(FundingGateFixture::default());
+    set_funding_gate(&session, Arc::clone(&current_gate)).await;
+    let ctx = prepared
+        .apply_started(&session, "funded-start".into(), TurnStartKind::User)
+        .await
+        .expect("start result")
+        .expect("bounded start");
+    let allowance = crate::turn_inference::allowance(&ctx).expect("native allowance");
+    assert!(allowance.claim_authorized_attempt().await.is_err());
+    assert_eq!(old_gate.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(current_gate.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn funding_gate_does_not_block_human_steering_of_an_active_turn() {
+    let (session, ctx, _rx) = make_session_and_context_with_rx().await;
+    set_funding_gate(&session, Arc::new(FundingGateFixture::default())).await;
+    session
+        .spawn_task(
+            Arc::clone(&ctx),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+    let result = submit_steer_only(
+        &session,
+        vec![UserInput::Text {
+            text: "human steering remains available".into(),
+            text_elements: Vec::new(),
+        }],
+        &ctx.sub_id,
+    )
+    .await;
+    assert!(matches!(result, TurnInputSubmission::Steered { .. }));
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}

@@ -8,7 +8,7 @@ exists. Lost acknowledgments still consume their claim. A fresh allowance is not
 recovery of an accepted or uncertain execution.
 
 The execution owner must durably reserve its allocation before constructing this
-value. The native integration under development adds mandatory
+value. The native integration exposes mandatory
 `turn/startBoundedIfIdle` with nested `turn` and required `allowance` fields.
 An old server rejects the method; callers must never fall back to ordinary
 `turn/start` or discard the allowance. The allowance specifies positive
@@ -31,13 +31,13 @@ a fresh allocation. Independent `StartIfIdle` and explicit trigger-mail work kee
 their existing authority; a previous bounded turn does not prohibit unrelated
 persisted goal continuation. Chronological adjacency is not causal ownership.
 
-These are source changes under qualification, not receiving deployment or a
-working heartbeat. Durable parent accounting is owned by DaimonApp#452/PR590.
-Native descendant/reviewer inference, external tools, actual recovery and
-cancellation journeys and the finite producer still require qualification before
-enabling a heartbeat producer. Schema/client exports and the durable
-producer-to-native allocation binding have focused source qualification, not
-receiving acceptance. Bounded lifecycle callbacks leave the existing thread goal
+Actual receiving selection and end-to-end heartbeat evidence belong to the
+[Matrix coverage checkpoint](https://github.com/AlterMundi/daimon-matrix/issues/437#issuecomment-6597923440),
+not this source guide. The existing DaimonApp owner supplies durable parent
+attempt accounting and finite/standing producer controls. Those attempt
+reservations are separate from monetary funding. Native descendant/reviewer and
+external credential/tool routes retain their own qualification requirements.
+Bounded lifecycle callbacks leave the existing thread goal
 and its accounting untouched. The existing extension-tool execution boundary
 rejects bounded `create_goal` and `update_goal`, while retaining `get_goal` and
 authenticated human goal controls. An independently authorized goal may resume
@@ -105,3 +105,49 @@ provider request within its original cap, unchanged current images/text, unknown
 provenance, original history preservation, ordinary requests and both transports.
 The source change alone is not installed receiving behavior or a successful
 message/reply journey.
+
+## Host-selected durable provider reservations
+
+A trusted native host can construct an allowance with
+`with_provider_attempt_gate(Arc<dyn ProviderAttemptGate>)`. Core also accepts that
+opaque `Arc<dyn ProviderAttemptGate>` in the existing host-owned
+`turn_extension_init`. This is typed in-process host data, never a serialized
+turn parameter, model tool, peer message or prompt-selected callback.
+
+Core evaluates the actual host attachment atomically with new-turn settings
+admission, rather than using a stale preview. A selected gate requires a finite
+turn allowance; refusal changes no thread settings. The admitted turn captures
+that exact gate. Human steering keeps the running turn's existing limits and is
+not refused merely because it carries no fresh allocation. Hosts select or clear
+their attachment for their actual task/profile; a spent cycle gate must not be
+copied into another execution or used as an ordinary-human default.
+
+HTTP claims immediately before physical transport dispatch, including every
+auth/retry attempt. WebSocket claims in the existing writer pump immediately
+before the response-create frame. The same allowance/gate survives fallback.
+Each gate request carries a fresh UUID, a monotonic per-execution ordinal, the
+original absolute deadline and the complete allowance byte ceiling. The ceiling
+is a conservative upper bound, not the current WS delta or measured input tokens.
+It contains no credentials or prompt. The host must independently bind the exact
+causal account, provider/model/route and qualified maximum charge to this object.
+
+The host returns true only after retaining a durable reservation for that exact
+UUID. For Matrix's schema5 journal, use the already implemented
+`dispatch_provider_attempt` and exact operation identity; the callback enqueues
+only the bounded authorization response, not a model/tool loop under its lock.
+False, timeout or an unavailable result closes the allowance before provider
+bytes are sent, so neither retries nor HTTP fallback bypass the refusal. The
+in-memory claimed-slot count also includes refused/unknown reservations; it is
+not proof of physical submission. Retained transport and usage receipts establish
+those effects separately. A lost
+reservation response retains exposure; cancellation/drop never refunds it.
+The original absolute deadline also bounds reservation and is rechecked before
+submission. Already admitted/in-flight exposure remains distinct from later pause.
+
+This native gate is not a funding authority, bill estimator or usage receipt.
+Owner/account selection, full-request conservative pricing, authenticated
+per-attempt usage settlement and credential/tool-route exclusivity must still be
+provided and qualified together before claiming real economic fencing. No new
+budget, signer, API credential, account/provider switch, service, model attention
+or production activation is supplied by this source increment. Legacy callers
+without a selected gate retain their attempt/byte/deadline behavior.

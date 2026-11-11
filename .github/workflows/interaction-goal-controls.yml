@@ -63,6 +63,11 @@ jobs:
           RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server --lib maintenance -- --nocapture
           RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-goal-extension --test goal_extension_backend
           RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all daemon_update_recovery -- --nocapture
+      - name: Host-owned provider reservations and native input boundaries
+        run: |
+          cargo test --locked --profile dev-small -j 2 -p codex-api --lib inference_allowance::tests
+          cargo test --locked --profile dev-small -j 2 -p codex-api --test inference_allowance
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-core --lib session::turn_input::tests
       - name: Resolved idle resume reuse and configuration boundaries
         run: |
           cargo test --locked --profile dev-small -j 2 -p codex-core -p codex-app-server --lib resolved_resume -- --list > "$RUNNER_TEMP/resume-tests.txt"
