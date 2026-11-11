@@ -4696,6 +4696,124 @@
       ],
       "type": "object"
     },
+    "ThreadGoalConditionalActivateParams": {
+      "properties": {
+        "additionalContext": {
+          "additionalProperties": {
+            "$ref": "#/definitions/AdditionalContextEntry"
+          },
+          "type": "object"
+        },
+        "expectedRevision": {
+          "type": "string"
+        },
+        "objective": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "origin": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadGoalMutationOrigin"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "tokenBudget": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "additionalContext",
+        "expectedRevision",
+        "threadId"
+      ],
+      "type": "object"
+    },
+    "ThreadGoalConditionalClearParams": {
+      "properties": {
+        "expectedRevision": {
+          "type": "string"
+        },
+        "origin": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadGoalMutationOrigin"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "expectedRevision",
+        "threadId"
+      ],
+      "type": "object"
+    },
+    "ThreadGoalConditionalSetParams": {
+      "properties": {
+        "expectedRevision": {
+          "type": "string"
+        },
+        "objective": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "origin": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadGoalMutationOrigin"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ThreadGoalStatus"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "tokenBudget": {
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "expectedRevision",
+        "threadId"
+      ],
+      "type": "object"
+    },
     "ThreadGoalGetParams": {
       "properties": {
         "threadId": {
@@ -4753,6 +4871,17 @@
             "integer",
             "null"
           ]
+        }
+      },
+      "required": [
+        "threadId"
+      ],
+      "type": "object"
+    },
+    "ThreadGoalSnapshotParams": {
+      "properties": {
+        "threadId": {
+          "type": "string"
         }
       },
       "required": [
@@ -5845,6 +5974,32 @@
       ],
       "type": "object"
     },
+    "TurnInferenceAllowance": {
+      "additionalProperties": false,
+      "description": "A durably reserved allocation for one physical execution. This is not an account grant. Never reconstruct it to recover accepted or uncertain work.",
+      "properties": {
+        "deadlineUnixMs": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "maxProviderAttempts": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "maxRequestBytes": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "deadlineUnixMs",
+        "maxProviderAttempts",
+        "maxRequestBytes"
+      ],
+      "type": "object"
+    },
     "TurnInterruptParams": {
       "properties": {
         "threadId": {
@@ -5884,6 +6039,46 @@
           "type": "string"
         }
       ]
+    },
+    "TurnStartBoundedIfIdleParams": {
+      "additionalProperties": false,
+      "description": "Mandatory bounded idle-only admission. An older server must reject this method rather than ignore an optional field on ordinary turn/start.",
+      "properties": {
+        "allowance": {
+          "$ref": "#/definitions/TurnInferenceAllowance"
+        },
+        "providerMaxOutputTokens": {
+          "description": "Owner-selected output ceiling, applied at HTTP/WS request construction. Requires the same reservation cycle; older closed readers reject it.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "providerReservationCycleId": {
+          "description": "Owner journal cycle whose exact physical attempts require a reservation response from this initiating connection. This is not a budget grant. Older bounded-start servers reject this field rather than ignore it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "providerUsageObservations": {
+          "description": "Opt in to owner-only completion observations. Older closed readers reject this field; legacy reservation-only clients omit it.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "turn": {
+          "$ref": "#/definitions/TurnStartParams"
+        }
+      },
+      "required": [
+        "allowance",
+        "turn"
+      ],
+      "type": "object"
     },
     "TurnStartParams": {
       "properties": {
@@ -6549,6 +6744,102 @@
         "params"
       ],
       "title": "Thread/name/setRequest",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "thread/goal/snapshot"
+          ],
+          "title": "Thread/goal/snapshotRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ThreadGoalSnapshotParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Thread/goal/snapshotRequest",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "thread/goal/conditionalActivate"
+          ],
+          "title": "Thread/goal/conditionalActivateRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ThreadGoalConditionalActivateParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Thread/goal/conditionalActivateRequest",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "thread/goal/conditionalSet"
+          ],
+          "title": "Thread/goal/conditionalSetRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ThreadGoalConditionalSetParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Thread/goal/conditionalSetRequest",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "thread/goal/conditionalClear"
+          ],
+          "title": "Thread/goal/conditionalClearRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ThreadGoalConditionalClearParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Thread/goal/conditionalClearRequest",
       "type": "object"
     },
     {
@@ -7894,6 +8185,56 @@
         "params"
       ],
       "title": "Turn/startRequest",
+      "type": "object"
+    },
+    {
+      "description": "Start a new turn only while idle; never steer or enqueue into another writer.",
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "turn/startIfIdle"
+          ],
+          "title": "Turn/startIfIdleRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/TurnStartParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Turn/startIfIdleRequest",
+      "type": "object"
+    },
+    {
+      "description": "Idle-only admission with mandatory physical-execution limits.",
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "turn/startBoundedIfIdle"
+          ],
+          "title": "Turn/startBoundedIfIdleRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/TurnStartBoundedIfIdleParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Turn/startBoundedIfIdleRequest",
       "type": "object"
     },
     {

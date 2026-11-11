@@ -628,6 +628,26 @@ client_request_definitions! {
         serialization: thread_id(params.thread_id),
         response: v2::ThreadPredictionRequestResponse,
     },
+    ThreadGoalSnapshot => "thread/goal/snapshot" {
+        params: v2::ThreadGoalSnapshotParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadGoalSnapshotResponse,
+    },
+    ThreadGoalConditionalActivate => "thread/goal/conditionalActivate" {
+        params: v2::ThreadGoalConditionalActivateParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadGoalConditionalActivateResponse,
+    },
+    ThreadGoalConditionalSet => "thread/goal/conditionalSet" {
+        params: v2::ThreadGoalConditionalSetParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadGoalConditionalSetResponse,
+    },
+    ThreadGoalConditionalClear => "thread/goal/conditionalClear" {
+        params: v2::ThreadGoalConditionalClearParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadGoalConditionalClearResponse,
+    },
     ThreadGoalSet => "thread/goal/set" {
         params: v2::ThreadGoalSetParams,
         serialization: thread_id(params.thread_id),
@@ -1087,6 +1107,22 @@ client_request_definitions! {
         params: v2::TurnStartParams,
         inspect_params: true,
         serialization: thread_id(params.thread_id),
+        response: v2::TurnStartResponse,
+    },
+    /// Start a new turn only while idle; never steer or enqueue into another writer.
+    TurnStartIfIdle => "turn/startIfIdle" {
+        params: v2::TurnStartParams,
+        inspect_params: true,
+        serialization: thread_id(params.thread_id),
+        manual_payload_conversion: manual,
+        response: v2::TurnStartResponse,
+    },
+    /// Idle-only admission with mandatory physical-execution limits.
+    TurnStartBoundedIfIdle => "turn/startBoundedIfIdle" {
+        params: v2::TurnStartBoundedIfIdleParams,
+        inspect_params: true,
+        serialization: thread_id(params.turn.thread_id),
+        manual_payload_conversion: manual,
         response: v2::TurnStartResponse,
     },
     #[experimental("turn/settings/update")]
@@ -1849,6 +1885,17 @@ impl TryFrom<JSONRPCRequest> for ServerRequest {
 }
 
 server_request_definitions! {
+    /// Account reservation for a bounded native physical attempt. Only the
+    /// initiating owner connection may answer; never replay to subscribers.
+    ProviderAttemptReservation => "turn/providerAttempt/reserve" {
+        params: v2::ProviderAttemptReservationParams,
+        response: v2::ProviderAttemptReservationResponse,
+    },
+    /// Exact usage observation for the initiating accounting owner only.
+    ProviderAttemptUsage => "turn/providerAttempt/usage" {
+        params: v2::ProviderAttemptUsageParams,
+        response: v2::ProviderAttemptUsageResponse,
+    },
     /// NEW APIs
     /// Sent when approval is requested for a specific command execution.
     /// This request is used for Turns started via turn/start.
@@ -2352,6 +2399,72 @@ mod tests {
             .is_err()
         );
         Ok(())
+    }
+
+    #[test]
+    fn idle_only_start_uses_existing_typed_params_and_thread_serialization() {
+        let value = serde_json::json!({"id":7,"method":"turn/startIfIdle","params":{"threadId":"selected-thread","input":[]}});
+        let request: ClientRequest = serde_json::from_value(value.clone()).unwrap();
+        assert!(matches!(&request, ClientRequest::TurnStartIfIdle { .. }));
+        assert_eq!(request.method_name(), "turn/startIfIdle");
+        assert_eq!(
+            request.serialization_scope(),
+            Some(ClientRequestSerializationScope::Thread {
+                thread_id: "selected-thread".into()
+            })
+        );
+        let roundtrip = serde_json::to_value(request).unwrap();
+        assert_eq!(roundtrip["method"], value["method"]);
+        assert_eq!(roundtrip["params"]["threadId"], value["params"]["threadId"]);
+    }
+
+    #[test]
+    fn bounded_idle_requires_limits_and_serializes_on_the_nested_thread() {
+        let mut value = serde_json::json!({"id":8,"method":"turn/startBoundedIfIdle","params":{
+            "turn":{"threadId":"selected-thread","input":[]},
+            "allowance":{"maxProviderAttempts":3,"maxRequestBytes":1024,"deadlineUnixMs":42}
+        }});
+        let request: ClientRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(request.method_name(), "turn/startBoundedIfIdle");
+        assert_eq!(
+            request.serialization_scope(),
+            Some(ClientRequestSerializationScope::Thread {
+                thread_id: "selected-thread".into()
+            })
+        );
+        value["params"].as_object_mut().unwrap().remove("allowance");
+        assert!(serde_json::from_value::<ClientRequest>(value).is_err());
+    }
+
+    #[test]
+    fn provider_reservation_selection_is_rejected_by_older_bounded_readers() {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct OldBoundedParams {
+            #[serde(rename = "turn")]
+            _turn: v2::TurnStartParams,
+            #[serde(rename = "allowance")]
+            _allowance: codex_protocol::turn_input::TurnInferenceAllowance,
+        }
+        let mut params = serde_json::json!({
+            "turn":{"threadId":"selected-thread","input":[]},
+            "allowance":{"maxProviderAttempts":3,"maxRequestBytes":1024,"deadlineUnixMs":42}
+        });
+        assert!(serde_json::from_value::<OldBoundedParams>(params.clone()).is_ok());
+        params["providerReservationCycleId"] = "caa11c1d-b05b-4f56-99ab-167878e86126".into();
+        assert!(serde_json::from_value::<OldBoundedParams>(params.clone()).is_err());
+        let current: v2::TurnStartBoundedIfIdleParams =
+            serde_json::from_value(params.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(current).unwrap()["providerReservationCycleId"],
+            params["providerReservationCycleId"]
+        );
+        assert!(
+            serde_json::from_value::<v2::ProviderAttemptReservationResponse>(
+                serde_json::json!({"authorized":true})
+            )
+            .is_err()
+        );
     }
 
     #[test]

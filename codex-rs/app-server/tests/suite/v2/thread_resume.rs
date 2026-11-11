@@ -7029,3 +7029,100 @@ async fn thread_resume_recovers_after_provider_configuration_is_restored(
     assert_eq!(resumed.model_provider, "old_provider");
     Ok(())
 }
+
+#[tokio::test]
+async fn thread_resume_explicit_saved_profile_preserves_route_and_input() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let home = TempDir::new()?;
+    mock_responses_config(&server.uri()).write(home.path())?;
+    let thread_id = create_fake_rollout(
+        home.path(),
+        "2025-01-05T12-00-00",
+        "2025-01-05T12:00:00Z",
+        "Saved profile history",
+        Some("old_provider"),
+        None,
+    )?;
+    let config_path = home.path().join("config.toml");
+    let original = std::fs::read_to_string(&config_path)?;
+    std::fs::write(
+        &config_path,
+        format!(
+            "{original}\n[model_providers.old_provider]\nname = 'Original provider'\nbase_url = '{}/v1'\n",
+            server.uri()
+        ),
+    )?;
+    let mut client = TestAppServer::builder()
+        .with_codex_home(home.path())
+        .build_initialized()
+        .await?;
+    // Same explicit saved profile used by the App; no default/provider switch.
+    let id = client
+        .send_thread_resume_request(ThreadResumeParams {
+            thread_id: thread_id.clone(),
+            model_provider: Some("old_provider".into()),
+            config: Some(std::collections::HashMap::from([(
+                "model_provider".into(),
+                json!("old_provider"),
+            )])),
+            ..Default::default()
+        })
+        .await?;
+    let resumed: ThreadResumeResponse = client.read_response(id).await?;
+    assert_eq!(resumed.thread.id, thread_id);
+    assert_eq!(resumed.model_provider, "old_provider");
+    let id = client
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread_id.clone(),
+            input: vec![UserInput::Text {
+                text: "Continue the fixture".into(),
+                text_elements: vec![],
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let _: TurnStartResponse = client.read_response(id).await?;
+    let completed = timeout(
+        DEFAULT_READ_TIMEOUT,
+        client.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    assert_eq!(
+        completed.params.as_ref().unwrap()["turn"]["status"],
+        "completed"
+    );
+    let count = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path().ends_with("/responses"))
+        .count();
+    assert_eq!(count, 1);
+    // Withdrawal takes effect for subsequent input without rewriting history.
+    std::fs::write(&config_path, original)?;
+    let id = client
+        .send_turn_start_request(TurnStartParams {
+            thread_id,
+            input: vec![UserInput::Text {
+                text: "Must be refused".into(),
+                text_elements: vec![],
+            }],
+            ..Default::default()
+        })
+        .await?;
+    client
+        .read_stream_until_error_message(RequestId::Integer(id))
+        .await?;
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with("/responses"))
+            .count(),
+        count
+    );
+    Ok(())
+}

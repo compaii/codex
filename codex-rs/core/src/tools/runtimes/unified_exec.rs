@@ -600,7 +600,8 @@ impl<'a> ToolRuntime<UnifiedExecRequest<'_>, UnifiedExecAttempt> for UnifiedExec
             },
             prepared.permissions.additional_permissions.as_ref(),
             internal_permissions.as_ref(),
-        );
+        )
+        .map_err(ToolError::Codex)?;
         let baseline_file_system = prepared
             .turn_environment
             .permission_profile()

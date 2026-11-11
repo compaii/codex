@@ -41,8 +41,8 @@ def just_formatter_group(*, check: bool) -> FormatterGroup:
 
 
 def rust_formatter_group(*, check: bool) -> FormatterGroup:
-    rust_workspace = REPO_ROOT / "codex-rs"
-    repository_files = subprocess.check_output(
+    workspace = REPO_ROOT / "codex-rs"
+    encoded = subprocess.check_output(
         [
             "git",
             "ls-files",
@@ -55,30 +55,39 @@ def rust_formatter_group(*, check: bool) -> FormatterGroup:
         ],
         cwd=REPO_ROOT,
     ).split(b"\0")
-    rust_files = sorted(
-        os.path.relpath(REPO_ROOT / os.fsdecode(encoded_path), rust_workspace)
-        for encoded_path in repository_files
-        if encoded_path and (REPO_ROOT / os.fsdecode(encoded_path)).is_file()
+    paths = sorted(
+        {
+            os.path.relpath(REPO_ROOT / os.fsdecode(path), workspace)
+            for path in encoded
+            if path and (REPO_ROOT / os.fsdecode(path)).is_file()
+        }
     )
-    # Git supplies every source file, including files Cargo cannot discover.
-    # Do not recursively format child modules again or include ignored files.
-    args = [
+    prefix = [
         "rustfmt",
         "--edition",
         "2024",
         "--config-path",
-        str(rust_workspace / "rustfmt.toml"),
+        str(workspace / "rustfmt.toml"),
         "--config",
         "imports_granularity=Item,skip_children=true",
     ]
     if check:
-        args.append("--check")
-    # Batch relative paths to stay below Windows command-line limits.
-    commands = tuple(
-        Command(tuple(args + rust_files[start : start + 64]), rust_workspace)
-        for start in range(0, len(rust_files), 64)
-    )
-    return FormatterGroup("Rust", commands)
+        prefix.append("--check")
+    # Include Rust outside Cargo, retaining safe command lengths on Windows.
+    commands: list[Command] = []
+    batch: list[str] = []
+    size = sum(len(os.fsencode(arg)) + 3 for arg in prefix)
+    for path in paths:
+        cost = len(os.fsencode(path)) + 3
+        if batch and size + cost > 24_000:
+            commands.append(Command(tuple(prefix + batch), workspace))
+            batch = []
+            size = sum(len(os.fsencode(arg)) + 3 for arg in prefix)
+        batch.append(path)
+        size += cost
+    if batch:
+        commands.append(Command(tuple(prefix + batch), workspace))
+    return FormatterGroup("Rust", tuple(commands))
 
 
 def buildifier_formatter_group(*, check: bool) -> FormatterGroup:

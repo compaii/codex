@@ -127,15 +127,23 @@ fn reject_obsolete_request_fields(request: &JSONRPCRequest) -> Result<(), JSONRP
 }
 
 fn reject_removed_permission_profile(request: &JSONRPCRequest) -> Result<(), JSONRPCErrorError> {
-    if matches!(
-        request.method.as_str(),
-        "thread/start" | "thread/resume" | "thread/fork" | "turn/start"
-    ) && request
+    let params = request
         .params
         .as_ref()
-        .and_then(serde_json::Value::as_object)
-        .is_some_and(|params| params.contains_key("permissionProfile"))
-    {
+        .and_then(serde_json::Value::as_object);
+    let selected = if request.method == "turn/startBoundedIfIdle" {
+        params
+            .and_then(|params| params.get("turn"))
+            .and_then(serde_json::Value::as_object)
+    } else if matches!(
+        request.method.as_str(),
+        "thread/start" | "thread/resume" | "thread/fork" | "turn/start" | "turn/startIfIdle"
+    ) {
+        params
+    } else {
+        None
+    };
+    if selected.is_some_and(|params| params.contains_key("permissionProfile")) {
         let method = request.method.as_str();
         return Err(invalid_params(format!(
             "`permissionProfile` is no longer supported for `{method}`; use `permissions` with a named profile id instead"
@@ -799,8 +807,11 @@ impl MessageProcessor {
 
     pub(crate) async fn daemon_recovery_snapshot(
         &self,
-    ) -> codex_app_server_transport::daemon_recovery::RecoverySnapshot {
-        self.thread_processor.daemon_recovery_snapshot().await
+        maintenance: bool,
+    ) -> std::io::Result<codex_app_server_transport::daemon_recovery::RecoverySnapshot> {
+        self.thread_processor
+            .daemon_recovery_snapshot(maintenance)
+            .await
     }
 
     pub(crate) async fn restore_daemon_threads(
@@ -1037,6 +1048,8 @@ impl MessageProcessor {
             ClientRequest::ThreadSample { .. }
             | ClientRequest::ThreadGuardianReview { .. }
             | ClientRequest::TurnStart { .. }
+            | ClientRequest::TurnStartIfIdle { .. }
+            | ClientRequest::TurnStartBoundedIfIdle { .. }
             | ClientRequest::TurnSteer { .. }
             | ClientRequest::ReviewStart { .. }
             | ClientRequest::ThreadCompactStart { .. }
@@ -1405,6 +1418,26 @@ impl MessageProcessor {
                     .thread_set_name(request_id.clone(), params)
                     .await
             }
+            ClientRequest::ThreadGoalSnapshot { params, .. } => {
+                self.thread_goal_processor
+                    .thread_goal_snapshot(params)
+                    .await
+            }
+            ClientRequest::ThreadGoalConditionalActivate { params, .. } => {
+                self.thread_goal_processor
+                    .thread_goal_conditional_activate(request_id.clone(), params)
+                    .await
+            }
+            ClientRequest::ThreadGoalConditionalSet { params, .. } => {
+                self.thread_goal_processor
+                    .thread_goal_conditional_set(request_id.clone(), params)
+                    .await
+            }
+            ClientRequest::ThreadGoalConditionalClear { params, .. } => {
+                self.thread_goal_processor
+                    .thread_goal_conditional_clear(request_id.clone(), params)
+                    .await
+            }
             ClientRequest::ThreadGoalSet { params, .. } => {
                 self.thread_goal_processor
                     .thread_goal_set(request_id.clone(), params)
@@ -1707,8 +1740,31 @@ impl MessageProcessor {
                         params,
                         app_server_client_name.clone(),
                         client_version.clone(),
+                        false,
                     )
                     .await
+            }
+            ClientRequest::TurnStartIfIdle { params, .. } => {
+                self.turn_processor
+                    .turn_start(
+                        request_id.clone(),
+                        params,
+                        app_server_client_name.clone(),
+                        client_version.clone(),
+                        true,
+                    )
+                    .await
+            }
+            ClientRequest::TurnStartBoundedIfIdle { params, .. } => {
+                // Keep this additional handler out of the already large
+                // dispatch frame, including while another request cold-resumes.
+                Box::pin(self.turn_processor.turn_start_bounded_if_idle(
+                    request_id.clone(),
+                    params,
+                    app_server_client_name.clone(),
+                    client_version.clone(),
+                ))
+                .await
             }
             ClientRequest::ThreadGuardianReview { params, .. } => {
                 let cancellation = &request_context.cancellation;

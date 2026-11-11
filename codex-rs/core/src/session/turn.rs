@@ -209,8 +209,10 @@ pub(crate) async fn run_turn(
     // Record results from hooks that finished after the previous turn before this turn's user prompt.
     drain_async_hook_results(&sess, &turn_context, /*before_user_prompt*/ true).await;
 
-    let mut client_session =
-        prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
+    let mut client_session = crate::turn_inference::bind(
+        prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session()),
+        &turn_context,
+    );
     // TODO(ccunningham): Pre-turn compaction runs before context updates and the
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
@@ -1337,7 +1339,14 @@ async fn build_extension_turn_input_items(
         return Some(Vec::new());
     }
 
-    let environment_accessors = step_context.environments();
+    let environment_accessors = match step_context.environments() {
+        Ok(environments) => environments,
+        Err(error) => {
+            sess.send_event(turn_context, EventMsg::Error(error.to_error_event(None)))
+                .await;
+            return None;
+        }
+    };
     let environments = environment_accessors
         .iter()
         .enumerate()

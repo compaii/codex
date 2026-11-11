@@ -244,6 +244,52 @@ async fn websocket_transport_repeated_sighup_keeps_waiting_for_running_turn() ->
 
 #[cfg(unix)]
 #[tokio::test]
+async fn websocket_transport_maintenance_serves_other_clients_while_a_turn_is_held() -> Result<()> {
+    let (release_first, first_gate) = oneshot::channel();
+    let (release_second, second_gate) = oneshot::channel();
+    let (server, _completions) = start_streaming_sse_server(vec![
+        vec![StreamingSseChunk {
+            gate: Some(first_gate),
+            body: create_final_assistant_message_sse_response("First done")?,
+        }],
+        vec![StreamingSseChunk {
+            gate: Some(second_gate),
+            body: create_final_assistant_message_sse_response("Second done")?,
+        }],
+    ])
+    .await;
+    let (_codex_home, mut process, mut ws) = start_ctrl_c_restart_client(server.uri()).await?;
+    send_thread_start_request(&mut ws, 2).await?;
+    let ThreadStartResponse { thread, .. } = to_response(read_response_for_id(&mut ws, 2).await?)?;
+    send_turn_start_request(&mut ws, 3, &thread.id).await?;
+    read_response_for_id(&mut ws, 3).await?;
+    timeout(DEFAULT_READ_TIMEOUT, server.wait_for_request_count(1)).await?;
+
+    send_sighup(&process)?;
+    assert_process_does_not_exit_within(&mut process, Duration::from_millis(100)).await?;
+    send_sighup(&process)?;
+    // Admission for another conversation must remain open throughout the wait.
+    send_thread_start_request(&mut ws, 10).await?;
+    let ThreadStartResponse { thread, .. } = to_response(read_response_for_id(&mut ws, 10).await?)?;
+    send_turn_start_request(&mut ws, 11, &thread.id).await?;
+    read_response_for_id(&mut ws, 11).await?;
+    timeout(DEFAULT_READ_TIMEOUT, server.wait_for_request_count(2)).await?;
+    release_second.send(()).expect("second response waiting");
+    read_notification_for_method(&mut ws, "turn/completed").await?;
+    assert_process_does_not_exit_within(&mut process, Duration::from_millis(100)).await?;
+    release_first.send(()).expect("first response waiting");
+    let status = wait_for_process_exit_within(
+        &mut process,
+        Duration::from_secs(10),
+        "maintenance did not exit at natural idle",
+    )
+    .await?;
+    assert!(status.success());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn websocket_transport_allows_turn_interrupt_during_drain() -> Result<()> {
     let (_release_target, target_gate) = oneshot::channel();
     let (release_guard, guard_gate) = oneshot::channel();

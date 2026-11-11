@@ -32,6 +32,29 @@ impl Default for ToolPolicy {
 }
 
 impl ToolPolicy {
+    /// Combine independent ceilings without granting a tool or relaxing execution.
+    pub fn intersect(&self, ceiling: &Self) -> Self {
+        let allowed_tools = match (&self.allowed_tools, &ceiling.allowed_tools) {
+            (None, None) => None,
+            (Some(tools), None) | (None, Some(tools)) => Some(tools.clone()),
+            (Some(tools), Some(_)) => Some(
+                tools
+                    .iter()
+                    .filter(|tool| ceiling.allows(tool))
+                    .cloned()
+                    .collect(),
+            ),
+        };
+        Self {
+            allowed_tools,
+            require_managed_sandbox: self.require_managed_sandbox
+                || ceiling.require_managed_sandbox,
+            require_unified_exec: self.require_unified_exec || ceiling.require_unified_exec,
+            expose_additional_permissions: self.expose_additional_permissions
+                && ceiling.expose_additional_permissions,
+        }
+    }
+
     pub fn allows(&self, tool: &ToolName) -> bool {
         self.allowed_tools.as_ref().is_none_or(|tools| {
             tools.iter().any(|allowed| {

@@ -51,7 +51,7 @@ pub(crate) fn terminal_session_for_input(
             .session
             .services
             .unified_exec_manager
-            .resolve_terminal(args.session_id)
+            .resolve_terminal(args.session_id, &invocation.turn)
             .await
             .map(ToolEnvironments::Terminal)
             .map_err(|err| {

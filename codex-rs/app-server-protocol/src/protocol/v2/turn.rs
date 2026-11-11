@@ -306,6 +306,83 @@ pub struct TurnStartParams {
     pub cyber_access_program: Option<CyberAccessProgram>,
 }
 
+/// Mandatory bounded idle-only admission. An older server must reject this
+/// method rather than ignore an optional field on ordinary turn/start.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct TurnStartBoundedIfIdleParams {
+    #[experimental(nested)]
+    pub turn: TurnStartParams,
+    pub allowance: codex_protocol::turn_input::TurnInferenceAllowance,
+    /// Owner journal cycle whose exact physical attempts require a reservation
+    /// response from this initiating connection. This is not a budget grant.
+    /// Older bounded-start servers reject this field rather than ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub provider_reservation_cycle_id: Option<String>,
+    /// Opt in to owner-only completion observations. Older closed readers
+    /// reject this field; legacy reservation-only clients omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub provider_usage_observations: Option<bool>,
+    /// Owner-selected output ceiling, applied at HTTP/WS request construction.
+    /// Requires the same reservation cycle; older closed readers reject it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub provider_max_output_tokens: Option<u32>,
+}
+
+/// Host accounting request, never a model tool or human approval ceremony.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct ProviderAttemptReservationParams {
+    pub thread_id: String,
+    pub cycle_id: String,
+    pub attempt_id: String,
+    pub ordinal: u32,
+    pub max_request_bytes: u32,
+    pub deadline_unix_ms: i64,
+}
+
+/// Exact physical response evidence, not a financial settlement or grant.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct ProviderAttemptUsageParams {
+    pub thread_id: String,
+    pub cycle_id: String,
+    pub attempt_id: String,
+    pub ordinal: u32,
+    pub response_id: String,
+    pub model: Option<String>,
+    pub token_usage: Option<super::TokenUsageBreakdown>,
+    pub usage_metadata: Option<super::ResponseUsageMetadata>,
+}
+
+/// True acknowledges retained evidence only. A missing/false acknowledgment
+/// never proves absence or authorizes releasing conservative exposure.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct ProviderAttemptUsageResponse {
+    pub cycle_id: String,
+    pub attempt_id: String,
+    pub recorded: bool,
+}
+
+/// Authorizes only the exact retained journal operation. A lost response must
+/// retain exposure; repeating this request must never mint a replacement call.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct ProviderAttemptReservationResponse {
+    pub cycle_id: String,
+    pub attempt_id: String,
+    pub authorized: bool,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]

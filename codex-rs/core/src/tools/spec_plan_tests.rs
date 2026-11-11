@@ -3417,3 +3417,36 @@ async fn hosted_web_search_and_standalone_image_generation_follow_runtime_gates(
 
 #[path = "spec_plan_strict_third_party_tests.rs"]
 mod strict_third_party;
+
+#[tokio::test]
+async fn host_tool_ceiling_filters_actual_router_without_changing_session_policy() {
+    let (session, _) = make_session_and_context().await;
+    let turn = session
+        .new_turn_with_default_settings(
+            "empty-host-ceiling".into(),
+            crate::session::turn_context::NewTurnContextOptions {
+                tool_ceiling: Some(vec![]),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("build turn context");
+    let step = StepContext::for_test(Arc::clone(&turn));
+    let router = super::build_tool_router(
+        &session,
+        turn.as_ref(),
+        &step.settings.model_info,
+        &step.environments,
+        &step.mcp,
+        false,
+        &turn.extension_data,
+        None,
+        session.dynamic_tools().await.as_ref(),
+    )
+    .expect("restricted router");
+    let plan = ToolPlanProbe::from_router(router);
+    assert!(plan.registered_names.is_empty());
+    assert!(plan.visible_specs.is_empty());
+    assert!(plan.code_mode_tool_names.is_empty());
+    assert!(session.tool_policy.allowed_tools.is_none());
+}

@@ -33,6 +33,7 @@ impl ToolExecutor<ToolInvocation> for Handler {
 async fn handle_resume_agent(
     invocation: ToolInvocation,
 ) -> Result<ResumeAgentResult, FunctionCallError> {
+    crate::turn_inference::require_agent_admission(&invocation.turn)?;
     let ToolInvocation {
         session,
         turn,

@@ -120,6 +120,7 @@ async fn explicit_escalation_prepares_exec_without_managed_network() -> anyhow::
     let permissions = PermissionProfile::Disabled;
     let manager = SandboxManager::new();
     let attempt = SandboxAttempt {
+        permission_ceiling: None,
         sandbox_override: SandboxOverride::NoOverride,
         sandbox: SandboxType::None,
         sandbox_requested: false,

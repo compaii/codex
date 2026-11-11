@@ -5,6 +5,14 @@ use std::io::IsTerminal;
 use anyhow::Result;
 use codex_app_server_daemon::InstallRequest;
 
+pub(crate) fn confirm_install_if_stopped(request: &InstallRequest, yes: bool) -> Result<bool> {
+    anyhow::ensure!(
+        !request.restart_required,
+        "a receiver is running; stopped-only package replacement left it unchanged"
+    );
+    confirm_install(request, yes)
+}
+
 pub(crate) fn confirm_install(request: &InstallRequest, yes: bool) -> Result<bool> {
     eprintln!("{}", describe_install(request));
     if yes {

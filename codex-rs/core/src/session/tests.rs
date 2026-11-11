@@ -5560,7 +5560,23 @@ async fn resolved_environments_for_configuration(
     session_configuration: &SessionConfiguration,
     environment_selections: &[TurnEnvironmentSelection],
 ) -> (Arc<EnvironmentManager>, TurnEnvironmentSnapshot) {
-    let environment_manager = Arc::new(EnvironmentManager::default_for_tests());
+    let runtime = &session_configuration.original_config_do_not_use;
+    let environment_manager = Arc::new(match runtime.codex_self_exe.clone() {
+        Some(executable) => {
+            EnvironmentManager::create_for_tests(
+                None,
+                Some(
+                    codex_exec_server::ExecServerRuntimeOptions::new(
+                        executable,
+                        runtime.codex_linux_sandbox_exe.clone(),
+                    )
+                    .expect("test runtime paths"),
+                ),
+            )
+            .await
+        }
+        None => EnvironmentManager::default_for_tests(),
+    });
     let turn_environments = ThreadEnvironments::new(
         Arc::clone(&environment_manager),
         default_user_shell(),
@@ -5993,7 +6009,8 @@ enabled = false
 
     let child_turn = session
         .new_turn_with_default_settings("role-skill-turn".to_string(), Default::default())
-        .await;
+        .await
+        .expect("build turn context");
     let skills_snapshot = child_turn.skills_snapshot();
     let child_skill = skills_snapshot
         .outcome()
@@ -6394,6 +6411,7 @@ async fn compaction_persists_resume_metadata_and_companion_records() {
         multi_agent_version: Some(MultiAgentVersion::V2),
         last_started_turn_id: Some(turn_context.sub_id.clone()),
         turn_attribution: Some(codex_history::TurnAttribution {
+            inference_allowance: None,
             turn_id: turn_context.sub_id.clone(),
             turn_trigger: Some("automation".to_string()),
             parent_turn_id: Some("parent-turn".to_string()),
@@ -6708,6 +6726,7 @@ async fn permission_profile_updates_apply_to_next_turn_environment() {
                     Default::default(),
                 )
                 .await
+                .expect("build turn context")
         };
         let next_environment = next_turn
             .initial_environments
@@ -7148,6 +7167,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         parent_observer_event_tx: OnceLock::new(),
         agent_status: agent_status_tx,
         state: Mutex::new(state),
+        initial_resume_configuration: std::sync::OnceLock::new(),
+        initial_resume_input_config: std::sync::OnceLock::new(),
         thread_settings_persistence: Semaphore::new(/*permits*/ 1),
         code_mode_message_tasks: Default::default(),
         managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
@@ -7938,21 +7959,19 @@ async fn request_permissions_tool_resolves_legacy_paths_against_selected_environ
         .expect("primary environment")
         .clone();
     let current_environment_config = current_environment.config().clone();
-    let environment = TurnEnvironment {
-        user_home_dir: Some(PathUri::from_abs_path(&environment_home)),
-        ..TurnEnvironment::new(
-            TurnEnvironmentSelection {
-                selected_capability_roots: Default::default(),
-                environment_id: "remote".to_string(),
-                cwd: PathUri::from_abs_path(&environment_cwd),
-                workspace_roots: Vec::new(),
-                config: EnvironmentConfigState::Ready(current_environment_config),
-            },
-            current_environment.config_origin,
-            current_environment.environment,
-            current_environment.shell,
-        )
-    };
+    let mut environment = TurnEnvironment::new(
+        TurnEnvironmentSelection {
+            selected_capability_roots: Default::default(),
+            environment_id: "remote".to_string(),
+            cwd: PathUri::from_abs_path(&environment_cwd),
+            workspace_roots: Vec::new(),
+            config: EnvironmentConfigState::Ready(current_environment_config),
+        },
+        current_environment.config_origin,
+        current_environment.environment,
+        current_environment.shell,
+    );
+    environment.user_home_dir = Some(PathUri::from_abs_path(&environment_home));
     let call_id = "call-1".to_string();
     let arguments = json!({
         "environment_id": "remote",
@@ -8531,7 +8550,8 @@ async fn new_task_does_not_change_an_already_running_tasks_environments() {
 
     let candidate = session
         .new_turn_with_default_settings("candidate".into(), Default::default())
-        .await;
+        .await
+        .expect("build turn context");
     assert_eq!(candidate.config.cwd, current_cwd);
     assert_eq!(candidate.config.workspace_roots, vec![current_cwd.clone()]);
     assert_eq!(
@@ -8543,7 +8563,8 @@ async fn new_task_does_not_change_an_already_running_tasks_environments() {
     recv_terminal_event(&events, TerminalEventKind::TurnComplete).await;
     let next = session
         .new_turn_with_default_settings("next".into(), Default::default())
-        .await;
+        .await
+        .expect("build turn context");
     assert_eq!(next.config.cwd, next_cwd);
     assert_eq!(next.config.workspace_roots, vec![next_cwd]);
 }
@@ -8566,7 +8587,8 @@ async fn task_turn_does_not_overlay_legacy_fallback_cwd_onto_stored_thread_envir
         .expect("environment selection update should succeed");
     let turn_context = session
         .new_turn_with_default_settings("task".into(), Default::default())
-        .await;
+        .await
+        .expect("build turn context");
 
     let turn_environments = &turn_context.initial_environments;
     assert_eq!(turn_environments.turn_environments().count(), 1);
@@ -8604,7 +8626,8 @@ async fn task_turn_honors_empty_stored_thread_environments() {
         .expect("environment selection update should succeed");
     let turn_context = session
         .new_turn_with_default_settings("task".into(), Default::default())
-        .await;
+        .await
+        .expect("build turn context");
 
     assert!(turn_context.initial_environments.primary().is_none());
     assert!(
@@ -9471,6 +9494,8 @@ where
         parent_observer_event_tx: OnceLock::new(),
         agent_status: agent_status_tx,
         state: Mutex::new(state),
+        initial_resume_configuration: std::sync::OnceLock::new(),
+        initial_resume_input_config: std::sync::OnceLock::new(),
         thread_settings_persistence: Semaphore::new(/*permits*/ 1),
         code_mode_message_tasks: Default::default(),
         managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
@@ -10064,7 +10089,8 @@ async fn mcp_elicitation_reviewer_uses_active_reviewer_and_latest_runtime_policy
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
     let restricted_turn = session
         .new_turn_with_default_settings("owner-restricted".to_string(), Default::default())
-        .await;
+        .await
+        .expect("build turn context");
     session.spawn_task(restricted_turn, Vec::new(), task).await;
     session.refresh_mcp_if_dirty().await;
     assert_eq!(
@@ -13817,5 +13843,151 @@ async fn rejected_mcp_refresh_then_corrected_user_config_blocks_ordinary_replace
             .get("enterprise")
             .is_some_and(|server| server.enabled),
         "rejection must not permit same-name ordinary-auth replacement in this session"
+    );
+}
+
+#[tokio::test]
+async fn resolved_resume_requires_full_config_and_unchanged_runtime() {
+    let (session, _) = make_session_and_context().await;
+    let config = session.get_config().await;
+    assert!(
+        !session
+            .can_reuse_resolved_resume_config(config.as_ref())
+            .await
+    );
+    // Normal startup derives token-budget activation even with no configured
+    // budget. Resume resolves the original loader input, not that derived Config.
+    let mut activated = config.as_ref().clone();
+    activated
+        .prepare_token_budget_for_startup()
+        .expect("startup config");
+    assert_ne!(activated, *config);
+    session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .original_config_do_not_use = Arc::new(activated);
+    assert!(
+        session
+            .initial_resume_input_config
+            .set(Arc::clone(&config))
+            .is_ok()
+    );
+    let initial = session.state.lock().await.session_configuration.clone();
+    assert!(
+        session
+            .initial_resume_configuration
+            .set(initial.clone())
+            .is_ok()
+    );
+    assert!(
+        session
+            .can_reuse_resolved_resume_config(config.as_ref())
+            .await
+    );
+    let mut rebound_roots = config.as_ref().clone();
+    rebound_roots.workspace_roots_explicit = !config.workspace_roots_explicit;
+    assert!(
+        !session
+            .can_reuse_resolved_resume_config(&rebound_roots)
+            .await
+    );
+    let mut changed = config.as_ref().clone();
+    changed.model_provider.http_headers = Some(std::collections::HashMap::from([(
+        "X-Changed".to_string(),
+        "changed".into(),
+    )]));
+    assert!(!session.can_reuse_resolved_resume_config(&changed).await);
+    for change in 0..9 {
+        {
+            let mut state = session.state.lock().await;
+            state.session_configuration = initial.clone();
+            let current = &mut state.session_configuration;
+            match change {
+                0 => {
+                    Arc::make_mut(&mut current.step_settings)
+                        .collaboration_mode
+                        .settings
+                        .reasoning_effort = Some(ReasoningEffortConfig::Low)
+                }
+                1 => {
+                    Arc::make_mut(&mut current.step_settings).service_tier =
+                        Some("priority".to_string())
+                }
+                2 => {
+                    let summary = &mut Arc::make_mut(&mut current.step_settings).reasoning_summary;
+                    *summary = if *summary
+                        == Some(codex_protocol::config_types::ReasoningSummary::Detailed)
+                    {
+                        None
+                    } else {
+                        Some(codex_protocol::config_types::ReasoningSummary::Detailed)
+                    };
+                }
+                3 => current
+                    .runtime_workspace_roots
+                    .push(current.legacy_fallback_cwd.clone()),
+                4 => current.windows_sandbox_level = WindowsSandboxLevel::Elevated,
+                5 => current
+                    .disabled_plugin_ids
+                    .push("changed-plugin".to_string()),
+                6 => {
+                    Arc::make_mut(&mut current.step_settings).personality =
+                        Some(codex_protocol::config_types::Personality::Friendly)
+                }
+                7 => current
+                    .set_permission_profile_for_tests(PermissionProfile::Disabled)
+                    .expect("test permission update"),
+                _ => {
+                    current
+                        .turn_extension_init
+                        .insert("opaque host data".to_string());
+                }
+            }
+        }
+        assert!(
+            !session
+                .can_reuse_resolved_resume_config(config.as_ref())
+                .await,
+            "change {change}"
+        );
+    }
+    {
+        let mut state = session.state.lock().await;
+        state.session_configuration = initial;
+        // A runtime refresh must not make a new config look like startup state.
+        state.session_configuration.original_config_do_not_use = Arc::new(changed.clone());
+    }
+    assert!(!session.can_reuse_resolved_resume_config(&changed).await);
+    assert!(
+        !session
+            .can_reuse_resolved_resume_config(config.as_ref())
+            .await
+    );
+
+    let (guardian, _) = make_session_and_context().await;
+    let guardian_config = guardian.get_config().await;
+    let guardian_initial = {
+        let mut state = guardian.state.lock().await;
+        state.session_configuration.trusted_guardian_reviewer = true;
+        state.session_configuration.clone()
+    };
+    assert!(
+        guardian
+            .initial_resume_input_config
+            .set(Arc::clone(&guardian_config))
+            .is_ok()
+    );
+    assert!(
+        guardian
+            .initial_resume_configuration
+            .set(guardian_initial)
+            .is_ok()
+    );
+    assert!(
+        !guardian
+            .can_reuse_resolved_resume_config(guardian_config.as_ref())
+            .await
     );
 }

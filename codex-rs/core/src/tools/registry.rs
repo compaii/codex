@@ -726,6 +726,43 @@ impl ToolRegistry {
         mut invocation: ToolInvocation,
         call_state: Option<Arc<ToolCallState>>,
     ) -> Result<AnyToolResult, FunctionCallError> {
+        let tool_policy = invocation
+            .turn
+            .effective_tool_policy(&invocation.session.tool_policy);
+        if !tool_policy.allows(&invocation.tool_name) {
+            return Err(FunctionCallError::RespondToModel(
+                "tool is outside this turn's host ceiling".into(),
+            ));
+        }
+        // A retained runtime/cell cannot execute with an earlier turn's authority.
+        // Ordinary legacy dispatch keeps its behavior when neither side is bounded.
+        {
+            let active = invocation
+                .session
+                .active_turn
+                .lock()
+                .or_cancel_tool(&invocation.cancellation_token)
+                .await?;
+            let current = active
+                .as_ref()
+                .and_then(|active| active.task.as_ref())
+                .map(|task| &task.turn_context);
+            if invocation.turn.has_tool_ceiling()
+                || current.is_some_and(|turn| turn.has_tool_ceiling())
+            {
+                let authorized = current.is_some_and(|turn| {
+                    turn.sub_id == invocation.turn.sub_id
+                        && turn
+                            .effective_tool_policy(&invocation.session.tool_policy)
+                            .allows(&invocation.tool_name)
+                });
+                if !authorized {
+                    return Err(FunctionCallError::RespondToModel(
+                        "retained tool context is not the active restricted turn".into(),
+                    ));
+                }
+            }
+        }
         // Standalone dispatch has no outer task to reserve the ID for it.
         let standalone;
         let reservation = if let Some(state) = &call_state {
@@ -852,6 +889,20 @@ impl ToolRegistry {
             Ok(environments) => environments,
             Err(err) => return Err(fail_before_execution(&invocation, err).await),
         };
+        if let Some(ceiling) = invocation.turn.permission_ceiling() {
+            let result = match &mut invocation.environments {
+                crate::tools::context::ToolEnvironments::Arguments(environments) => {
+                    environments.iter_mut().try_for_each(|(_, environment)| {
+                        Arc::make_mut(environment).restrict_permissions(&ceiling)
+                    })
+                }
+                _ => Ok(()),
+            };
+            if let Err(error) = result {
+                let error = FunctionCallError::RespondToModel(error.to_string());
+                return Err(fail_before_execution(&invocation, error).await);
+            }
+        }
         match apply_pre_tool_use(tool.as_ref(), &mut invocation).await {
             Ok(()) => {}
             Err(PreToolUseError::Blocked(message)) => {

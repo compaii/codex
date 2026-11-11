@@ -575,6 +575,8 @@ async fn dynamic_tool_call_round_trip_sends_text_content_items_to_model() -> Res
 }
 
 struct PendingDynamicToolCall {
+    // Input admission reloads provider configuration; keep it for the whole journey.
+    _codex_home: TempDir,
     mcp: TestAppServer,
     server: MockServer,
     request_id: RequestId,
@@ -582,11 +584,25 @@ struct PendingDynamicToolCall {
 }
 
 async fn start_function_dynamic_tool_call(call_id: &str) -> Result<PendingDynamicToolCall> {
+    start_function_dynamic_tool_call_with_responses(call_id, Vec::new()).await
+}
+async fn start_function_dynamic_tool_call_with_responses(
+    call_id: &str,
+    extra_responses: Vec<String>,
+) -> Result<PendingDynamicToolCall> {
+    start_function_dynamic_tool_call_with_history_image(call_id, extra_responses, None).await
+}
+
+async fn start_function_dynamic_tool_call_with_history_image(
+    call_id: &str,
+    extra_responses: Vec<String>,
+    history_image: Option<&str>,
+) -> Result<PendingDynamicToolCall> {
     let tool_name = "demo_tool";
     let tool_args = json!({ "city": "Paris" });
     let tool_call_arguments = serde_json::to_string(&tool_args)?;
 
-    let response_sequence = vec![
+    let mut response_sequence = vec![
         responses::sse(vec![
             responses::ev_response_created("resp-1"),
             responses::ev_function_call(call_id, tool_name, &tool_call_arguments),
@@ -594,6 +610,7 @@ async fn start_function_dynamic_tool_call(call_id: &str) -> Result<PendingDynami
         ]),
         create_final_assistant_message_sse_response("Done")?,
     ];
+    response_sequence.extend(extra_responses);
     let server = create_mock_responses_server_sequence_unchecked(response_sequence).await;
 
     let codex_home = TempDir::new()?;
@@ -638,14 +655,23 @@ async fn start_function_dynamic_tool_call(call_id: &str) -> Result<PendingDynami
     let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
     let thread_id = thread.id.clone();
 
+    let mut input = vec![V2UserInput::Text {
+        text: "Run the tool".to_string(),
+        text_elements: Vec::new(),
+    }];
+    if let Some(url) = history_image {
+        input.push(V2UserInput::Image {
+            image: codex_app_server_protocol::ImageReference::Inline {
+                url: url.to_owned(),
+            },
+            detail: None,
+        });
+    }
     let turn_req = mcp
         .send_turn_start_request(TurnStartParams {
             thread_id: thread_id.clone(),
             client_user_message_id: None,
-            input: vec![V2UserInput::Text {
-                text: "Run the tool".to_string(),
-                text_elements: Vec::new(),
-            }],
+            input,
             ..Default::default()
         })
         .await?;
@@ -682,6 +708,7 @@ async fn start_function_dynamic_tool_call(call_id: &str) -> Result<PendingDynami
     assert_eq!(actual_params, params);
 
     Ok(PendingDynamicToolCall {
+        _codex_home: codex_home,
         mcp,
         server,
         request_id,
@@ -694,6 +721,7 @@ async fn start_function_dynamic_tool_call(call_id: &str) -> Result<PendingDynami
 async fn dynamic_tool_call_round_trip_handles_content_items() -> Result<()> {
     let call_id = "dyn-call-items-1";
     let PendingDynamicToolCall {
+        _codex_home,
         mut mcp,
         server,
         request_id,
@@ -812,6 +840,7 @@ async fn dynamic_tool_call_round_trip_handles_content_items() -> Result<()> {
 async fn dynamic_tool_remote_image_response_becomes_model_visible_error() -> Result<()> {
     let call_id = "dyn-call-remote-image";
     let PendingDynamicToolCall {
+        _codex_home,
         mut mcp,
         server,
         request_id,
@@ -868,6 +897,7 @@ async fn dynamic_tool_remote_image_response_becomes_model_visible_error() -> Res
 async fn dynamic_tool_remote_audio_response_becomes_model_visible_error() -> Result<()> {
     let call_id = "dyn-call-remote-audio";
     let PendingDynamicToolCall {
+        _codex_home,
         mut mcp,
         server,
         request_id,
@@ -1004,4 +1034,247 @@ async fn wait_for_dynamic_tool_completed(
             return Ok(completed);
         }
     }
+}
+
+/// The native admission, not a prior idle read, decides whether internal work may start.
+#[tokio::test]
+async fn idle_only_turn_refuses_busy_without_recording_then_starts_internal_context() -> Result<()>
+{
+    exercise_idle_only_turn(false).await
+}
+
+#[tokio::test]
+async fn bounded_idle_turn_refuses_busy_then_starts_with_required_allocation() -> Result<()> {
+    exercise_idle_only_turn(true).await
+}
+
+async fn exercise_idle_only_turn(bounded: bool) -> Result<()> {
+    // Valid PNG with substantial trailing bytes: ordinary requests retain the
+    // exact source; a bounded historical projection must fit its existing cap.
+    // Real textured-image preview quality has separate Core/retained-history tests.
+    let history_image = if bounded {
+        use base64::Engine;
+        let mut png = base64::engine::general_purpose::STANDARD
+            .decode(TINY_PNG_DATA_URL.split_once(',').unwrap().1)?;
+        png.resize(1024 * 1024, 0);
+        Some(format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(png)
+        ))
+    } else {
+        None
+    };
+    let reply = if bounded {
+        responses::sse(vec![
+            responses::ev_response_created("bounded-reply"),
+            responses::ev_function_call("bounded-tool", "demo_tool", r#"{"city":"Paris"}"#),
+            responses::ev_completed("bounded-reply"),
+        ])
+    } else {
+        create_final_assistant_message_sse_response("Heartbeat reviewed")?
+    };
+    let PendingDynamicToolCall {
+        _codex_home,
+        mut mcp,
+        server,
+        request_id,
+        params,
+    } = start_function_dynamic_tool_call_with_history_image(
+        "human-held-tool",
+        if bounded {
+            vec![
+                reply,
+                create_final_assistant_message_sse_response("Ordinary work preserved")?,
+            ]
+        } else {
+            vec![reply]
+        },
+        history_image.as_deref(),
+    )
+    .await?;
+    let marker = "Exact heartbeat context: not a human utterance";
+    let heartbeat = TurnStartParams {
+        thread_id: params.thread_id.clone(),
+        input: Vec::new(),
+        tool_output: Some(Box::new(codex_app_server_protocol::TurnToolOutput {
+            name: "heartbeat_attention".into(),
+            namespace: None,
+            retain: true,
+            output: codex_protocol::models::FunctionCallOutputBody::Text(marker.into()),
+        })),
+        additional_context: if bounded {
+            Some(serde_json::from_value(json!({
+                "heartbeat.context": {"kind":"application", "value":"Exact bounded application context revision"}
+            }))?)
+        } else {
+            None
+        },
+        ..Default::default()
+    };
+    let (method, payload) = if bounded {
+        (
+            "turn/startBoundedIfIdle",
+            json!({
+                "turn":heartbeat,
+                "allowance":{
+                    "maxProviderAttempts":1,
+                    "maxRequestBytes":1024*1024,
+                    "deadlineUnixMs":chrono::Utc::now().timestamp_millis()+30_000
+                }
+            }),
+        )
+    } else {
+        ("turn/startIfIdle", serde_json::to_value(&heartbeat)?)
+    };
+    let busy = mcp.send_request(method, Some(payload.clone())).await?;
+    let error = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(busy)),
+    )
+    .await??;
+    assert_eq!(error.error.code, -32600);
+    assert_eq!(
+        error.error.data,
+        Some(json!({"reason":"notIdle","submitted":false}))
+    );
+    assert_eq!(
+        responses_bodies(&server).await?.len(),
+        1,
+        "Busy refusal must not call the model"
+    );
+    mcp.send_response(
+        request_id,
+        serde_json::to_value(DynamicToolCallResponse {
+            content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                text: "Human tool completed".into(),
+            }],
+            success: true,
+        })?,
+    )
+    .await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    let before = responses_bodies(&server).await?;
+    assert_eq!(before.len(), 2);
+    if bounded {
+        assert!(
+            serde_json::to_vec(&before[0])?.len() > 1024 * 1024,
+            "Fixture must actually exceed the later bounded request cap"
+        );
+    }
+    assert!(
+        !serde_json::to_string(&before)?.contains(marker),
+        "Refused input must not be queued or enter human context"
+    );
+    let idle = mcp.send_request(method, Some(payload)).await?;
+    let TurnStartResponse { turn } =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(idle)).await??;
+    assert_ne!(turn.id, params.turn_id);
+    if bounded {
+        wait_for_dynamic_tool_started(&mut mcp, "bounded-tool").await?;
+        let request = timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_request_message(),
+        )
+        .await??;
+        let ServerRequest::DynamicToolCall {
+            request_id,
+            params: tool,
+        } = request
+        else {
+            anyhow::bail!("expected bounded dynamic tool request");
+        };
+        assert_eq!(tool.turn_id, turn.id);
+        mcp.send_response(
+            request_id,
+            serde_json::to_value(DynamicToolCallResponse {
+                content_items: vec![DynamicToolCallOutputContentItem::InputText {
+                    text: "bounded tool completed".into(),
+                }],
+                success: true,
+            })?,
+        )
+        .await?;
+    }
+    let completed = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("turn/completed"),
+    )
+    .await??;
+    if bounded {
+        assert_eq!(
+            completed
+                .params
+                .as_ref()
+                .and_then(|params| params.pointer("/turn/status"))
+                .and_then(Value::as_str),
+            Some("failed"),
+            "the second inference must fail locally without another provider request"
+        );
+    }
+    let bodies = responses_bodies(&server).await?;
+    assert_eq!(bodies.len(), 3);
+    if bounded {
+        assert!(
+            serde_json::to_vec(&bodies[2])?.len() <= 1024 * 1024,
+            "Complete first bounded model request must fit its unchanged allowance"
+        );
+    }
+    let input = bodies[2]["input"]
+        .as_array()
+        .context("Model input missing")?;
+    assert!(
+        input
+            .iter()
+            .any(|item| item["type"] == "function_call_output"
+                && item["name"] == "heartbeat_attention"
+                && item["output"] == marker)
+    );
+    assert!(
+        !input
+            .iter()
+            .any(|item| item["role"] == "user" && item.to_string().contains(marker)),
+        "Internal context must not impersonate human input"
+    );
+    if let Some(original_image) = history_image {
+        let ordinary = mcp
+            .send_turn_start_request(TurnStartParams {
+                thread_id: params.thread_id.clone(),
+                input: vec![V2UserInput::Text {
+                    text: "Independent ordinary follow-up".into(),
+                    text_elements: vec![],
+                }],
+                ..Default::default()
+            })
+            .await?;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_response::<TurnStartResponse>(ordinary),
+        )
+        .await??;
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_notification_message("turn/completed"),
+        )
+        .await??;
+        let ordinary_bodies = responses_bodies(&server).await?;
+        assert_eq!(ordinary_bodies.len(), 4);
+        assert!(
+            serde_json::to_vec(&ordinary_bodies[3])?.len() > 1024 * 1024,
+            "Ordinary request must retain the original history rather than the reduced bounded projection"
+        );
+        assert!(
+            ordinary_bodies[3]["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|item| item["content"].as_array())
+                .flatten()
+                .any(|part| part["image_url"] == original_image)
+        );
+    }
+    Ok(())
 }

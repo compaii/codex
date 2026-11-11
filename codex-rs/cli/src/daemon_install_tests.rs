@@ -16,3 +16,17 @@ fn running_daemon_replacement_prompt() {
     The running daemon will restart; active or queued work may be interrupted.
     ");
 }
+
+#[test]
+fn stopped_only_confirmation_cannot_override_a_running_receiver_with_yes() {
+    let mut request = InstallRequest {
+        source: "/cli/package".into(),
+        version: "0.0.0".into(),
+        destination: "/home/packages/app-server-daemon".into(),
+        installed_version: Some("0.152.0".into()),
+        restart_required: true,
+    };
+    assert!(confirm_install_if_stopped(&request, true).is_err());
+    request.restart_required = false;
+    assert!(confirm_install_if_stopped(&request, true).unwrap());
+}

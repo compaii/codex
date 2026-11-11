@@ -1,14 +1,16 @@
+use crate::InferenceAllowance;
 use crate::auth::SharedAuthProvider;
 use crate::common::ResponseStream;
 use crate::common::ResponsesApiRequest;
 use crate::endpoint::session::EndpointSession;
 use crate::error::ApiError;
+use crate::inference_allowance::AttemptObserver;
 use crate::provider::Provider;
 use crate::requests::Compression;
 use crate::requests::headers::build_session_headers;
 use crate::requests::headers::insert_header;
 use crate::requests::headers::subagent_header;
-use crate::sse::spawn_response_stream;
+use crate::sse::responses::spawn_response_stream_with_attempt;
 use crate::telemetry::SseTelemetry;
 use codex_client::EncodedJsonBody;
 use codex_client::HttpTransport;
@@ -46,6 +48,14 @@ impl<T: HttpTransport> ResponsesClient<T> {
         }
     }
 
+    /// Meter this execution with one already-reserved allowance. HTTP transports
+    /// must support single-attempt requests (for example `without_replays()`);
+    /// an unknown/replay-enabled transport is refused before sending.
+    pub fn with_inference_allowance(mut self, allowance: Arc<InferenceAllowance>) -> Self {
+        self.session = self.session.with_inference_allowance(allowance);
+        self
+    }
+
     pub fn with_telemetry(
         self,
         request: Option<Arc<dyn RequestTelemetry>>,
@@ -80,8 +90,21 @@ impl<T: HttpTransport> ResponsesClient<T> {
             compression,
             turn_state,
         } = options;
-        let body = EncodedJsonBody::encode(&request)
-            .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
+        let bounded = self
+            .session
+            .inference_allowance()
+            .map(|allowance| allowance.output_bound_request(&request))
+            .transpose()
+            .map_err(|error| ApiError::InvalidRequest {
+                message: error.to_string(),
+            })?
+            .flatten();
+        let body = if let Some(bounded) = bounded {
+            EncodedJsonBody::encode(&bounded)
+        } else {
+            EncodedJsonBody::encode(&request)
+        }
+        .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
 
         let mut headers = extra_headers;
         if let Some(ref thread_id) = thread_id {
@@ -114,6 +137,14 @@ impl<T: HttpTransport> ResponsesClient<T> {
         compression: Compression,
         turn_state: Option<Arc<OnceLock<String>>>,
     ) -> Result<ResponseStream, ApiError> {
+        let mut body = body;
+        if let Some(allowance) = self.session.inference_allowance() {
+            allowance
+                .bound_output(&mut body)
+                .map_err(|error| ApiError::InvalidRequest {
+                    message: error.to_string(),
+                })?;
+        }
         let body = EncodedJsonBody::encode(&body)
             .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
         self.stream_encoded(body, extra_headers, compression, turn_state)
@@ -132,7 +163,7 @@ impl<T: HttpTransport> ResponsesClient<T> {
             Compression::Zstd => RequestCompression::Zstd,
         };
 
-        let stream_response = self
+        let (stream_response, attempt) = self
             .session
             .stream_encoded_json_with(
                 Method::POST,
@@ -149,11 +180,16 @@ impl<T: HttpTransport> ResponsesClient<T> {
             )
             .await?;
 
-        Ok(spawn_response_stream(
+        Ok(spawn_response_stream_with_attempt(
             stream_response,
             self.session.provider().stream_idle_timeout,
             self.sse_telemetry.clone(),
             turn_state,
+            self.session
+                .inference_allowance()
+                .cloned()
+                .zip(attempt)
+                .and_then(|(allowance, attempt)| AttemptObserver::new(allowance, attempt)),
         ))
     }
 }

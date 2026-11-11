@@ -5,6 +5,13 @@ import type { AbsolutePathBuf } from "./AbsolutePathBuf";
 
 export type InitializeResponse = { userAgent: string,
 /**
+ * This server implements the finite, idle-only turn admission primitive.
+ * This advertises support only, never permission, funding, availability of
+ * a particular thread/provider or evidence that a turn was submitted.
+ * Older servers omit it; clients must treat omission as unsupported.
+ */
+boundedIdleTurn?: boolean,
+/**
  * Absolute path to the server's $CODEX_HOME directory.
  */
 codexHome: AbsolutePathBuf,

@@ -1,0 +1,23 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "description": "Authorizes only the exact retained journal operation. A lost response must retain exposure; repeating this request must never mint a replacement call.",
+  "properties": {
+    "attemptId": {
+      "type": "string"
+    },
+    "authorized": {
+      "type": "boolean"
+    },
+    "cycleId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "attemptId",
+    "authorized",
+    "cycleId"
+  ],
+  "title": "ProviderAttemptReservationResponse",
+  "type": "object"
+}

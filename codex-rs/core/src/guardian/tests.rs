@@ -4296,3 +4296,77 @@ async fn review_approval_request(
     .await
     .expect("Guardian should handle the request")
 }
+
+#[tokio::test]
+async fn bounded_approval_review_defers_before_any_contributor() {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    struct CountReviews(Arc<AtomicUsize>);
+    impl codex_extension_api::ApprovalReviewContributor for CountReviews {
+        fn decide<'a>(
+            &'a self,
+            _input: &'a codex_extension_api::ApprovalDecisionInput<'_>,
+        ) -> codex_extension_api::ExtensionFuture<'a, Option<codex_extension_api::ApprovalDecision>>
+        {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Some(codex_extension_api::ApprovalDecision::Allow) })
+        }
+    }
+    let (mut session, turn, _rx) = crate::session::tests::make_session_and_context_with_rx().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::<Config>::new();
+    extensions.approval_review_contributor(Arc::new(CountReviews(Arc::clone(&calls))));
+    Arc::get_mut(&mut session)
+        .expect("unique session")
+        .services
+        .extensions = Arc::new(extensions.build());
+    let spec = codex_protocol::turn_input::TurnInferenceAllowance {
+        max_provider_attempts: 1,
+        max_request_bytes: 1024,
+        deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+    };
+    turn.extension_data
+        .insert(crate::turn_inference::prepare(&spec).expect("valid allocation"));
+    turn.extension_data.insert(spec);
+    let request = || GuardianApprovalRequest::ApplyPatch {
+        environment_id: "local".to_string(),
+        id: "bounded-patch".to_string(),
+        cwd: test_path_buf("/tmp").abs().into(),
+        files: vec![test_path_buf("/tmp/bounded-review-test.txt").abs().into()],
+        patch: "test-only review request; no filesystem action".to_string(),
+    };
+    let decision = review_approval_request(
+        &session,
+        &turn,
+        "bounded-review".into(),
+        request(),
+        ApprovalRequestReasons::default(),
+    )
+    .await;
+    assert_eq!(
+        decision,
+        ReviewDecision::denied(
+            "Bounded attention requires separately reserved approval review; the action was not approved."
+        )
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "no cached or model reviewer may run"
+    );
+    // The restriction belongs to this allocation, not the session or contributor.
+    turn.extension_data
+        .remove::<Arc<codex_api::InferenceAllowance>>();
+    turn.extension_data
+        .remove::<codex_protocol::turn_input::TurnInferenceAllowance>();
+    let decision = review_approval_request(
+        &session,
+        &turn,
+        "ordinary-review".into(),
+        request(),
+        ApprovalRequestReasons::default(),
+    )
+    .await;
+    assert_eq!(decision, ReviewDecision::Approved);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}

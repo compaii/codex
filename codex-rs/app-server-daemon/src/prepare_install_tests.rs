@@ -155,6 +155,69 @@ async fn seeds_full_package() {
 }
 
 #[tokio::test]
+async fn stopped_confirmation_rechecks_a_new_native_start_reservation() {
+    use std::os::fd::AsRawFd;
+    let temp = tempfile::TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let daemon = daemon(&home);
+    let source = temp.path().join("source");
+    let bin = package(&source, "1.0.0");
+    let settings = DaemonSettings::default();
+    prepare_from_package(
+        &daemon,
+        &settings,
+        InstallMode::Missing,
+        Some(&source),
+        &bin,
+        |_| Ok(true),
+    )
+    .await
+    .unwrap();
+    let selected = daemon
+        .current_managed_codex_bin()
+        .unwrap()
+        .canonicalize()
+        .unwrap();
+    std::fs::create_dir_all(daemon.pid_file.parent().unwrap()).unwrap();
+    let reservation = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(daemon.pid_file.with_extension("pid.lock"))
+        .unwrap();
+    let next = temp.path().join("next");
+    let next_bin = package(&next, "1.0.1");
+    let error = prepare_from_package(
+        &daemon,
+        &settings,
+        InstallMode::Replace,
+        Some(&next),
+        &next_bin,
+        |request| {
+            assert!(!request.restart_required);
+            assert_eq!(
+                unsafe { libc::flock(reservation.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            Ok(true)
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("running state changed"));
+    assert_eq!(
+        daemon
+            .current_managed_codex_bin()
+            .unwrap()
+            .canonicalize()
+            .unwrap(),
+        selected
+    );
+    assert!(!daemon.pid_file.exists());
+}
+
+#[tokio::test]
 async fn incomplete_source_fails_without_selecting_it() {
     let temp = tempfile::TempDir::new().expect("temp");
     let source = temp.path().join("package");

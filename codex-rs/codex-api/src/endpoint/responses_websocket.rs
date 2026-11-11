@@ -1,3 +1,5 @@
+use crate::InferenceAllowance;
+use crate::ProviderAttempt;
 use crate::RESPONSES_PATH;
 use crate::auth::SharedAuthProvider;
 use crate::common::ResponseEvent;
@@ -11,12 +13,14 @@ use crate::endpoint::responses_websocket_probe::ResponsesWebsocketProbe;
 use crate::endpoint::responses_websocket_probe::ResponsesWebsocketProbeError;
 use crate::endpoint::responses_websocket_probe::ResponsesWebsocketProbeFailureStage;
 use crate::error::ApiError;
+use crate::inference_allowance::AttemptObserver;
 use crate::provider::Provider;
 use crate::rate_limits::parse_rate_limit_event;
 use crate::responses_headers::json_headers_to_http_headers;
 use crate::safety_buffering::treatment_from_headers;
 use crate::sse::ResponsesStreamEvent;
 use crate::sse::process_responses_event;
+use crate::sse::responses::ResponsesEventError;
 use crate::telemetry::WebsocketTelemetry;
 use codex_client::TransportError;
 use codex_http_client::HttpClientFactory;
@@ -56,6 +60,7 @@ use tungstenite::protocol::WebSocketConfig;
 use url::Url;
 
 struct WsStream {
+    completed_responses: std::collections::HashSet<String>,
     routing_affinity: Option<codex_http_client::ChatGptRoutingAffinity>,
     tx_command: mpsc::Sender<WsCommand>,
     rx_message: mpsc::UnboundedReceiver<Result<Message, WsError>>,
@@ -65,7 +70,8 @@ struct WsStream {
 enum WsCommand {
     Send {
         message: Message,
-        tx_result: oneshot::Sender<Result<(), WsError>>,
+        tx_result: oneshot::Sender<Result<Option<ProviderAttempt>, WsError>>,
+        inference_allowance: Option<Arc<InferenceAllowance>>,
     },
 }
 
@@ -84,8 +90,19 @@ impl WsStream {
                             break;
                         };
                         match command {
-                            WsCommand::Send { message, tx_result } => {
-                                let result = inner.send(message).await;
+                            WsCommand::Send { message, tx_result, inference_allowance } => {
+                                // The queue/pump is the physical write boundary. An
+                                // expired queued command must not acquire a fresh lease.
+                                let result = if let Some(allowance) = inference_allowance {
+                                    match allowance.claim_authorized_attempt().await {
+                                        Ok(claimed) => tokio::time::timeout(claimed.remaining, inner.send(message)).await
+                                            .unwrap_or_else(|_| Err(WsError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "native inference allowance deadline expired"))))
+                                            .map(|()| Some(claimed.attempt)),
+                                        Err(error) => Err(WsError::Io(std::io::Error::other(error.to_string()))),
+                                    }
+                                } else {
+                                    inner.send(message).await.map(|()| None)
+                                };
                                 let should_break = result.is_err();
                                 let _ = tx_result.send(result);
                                 if should_break {
@@ -129,6 +146,7 @@ impl WsStream {
         });
 
         Self {
+            completed_responses: std::collections::HashSet::new(),
             routing_affinity,
             tx_command,
             rx_message,
@@ -138,8 +156,10 @@ impl WsStream {
 
     async fn request(
         &mut self,
-        make_command: impl FnOnce(oneshot::Sender<Result<(), WsError>>) -> WsCommand,
-    ) -> Result<(), WsError> {
+        make_command: impl FnOnce(
+            oneshot::Sender<Result<Option<ProviderAttempt>, WsError>>,
+        ) -> WsCommand,
+    ) -> Result<Option<ProviderAttempt>, WsError> {
         let (tx_result, rx_result) = oneshot::channel();
         if self.tx_command.send(make_command(tx_result)).await.is_ok()
             && let Ok(result) = rx_result.await
@@ -152,9 +172,17 @@ impl WsStream {
         Err(WsError::ConnectionClosed)
     }
 
-    async fn send(&mut self, message: Message) -> Result<(), WsError> {
-        self.request(|tx_result| WsCommand::Send { message, tx_result })
-            .await
+    async fn send_with_allowance(
+        &mut self,
+        message: Message,
+        inference_allowance: Option<Arc<InferenceAllowance>>,
+    ) -> Result<Option<ProviderAttempt>, WsError> {
+        self.request(|tx_result| WsCommand::Send {
+            message,
+            tx_result,
+            inference_allowance,
+        })
+        .await
     }
 
     async fn next(&mut self) -> Option<Result<Message, WsError>> {
@@ -257,6 +285,36 @@ impl ResponsesWebsocketConnection {
         connection_reused: bool,
         turn_state: Option<Arc<OnceLock<String>>>,
     ) -> Result<ResponseStream, ApiError> {
+        self.stream_request_inner(request, connection_reused, turn_state, None)
+            .await
+    }
+
+    /// The owner supplies the size of the COMPLETE logical request before
+    /// incremental WebSocket encoding, not just this delta's wire bytes.
+    pub async fn stream_request_with_allowance(
+        &self,
+        request: ResponsesWsRequest<'_>,
+        connection_reused: bool,
+        turn_state: Option<Arc<OnceLock<String>>>,
+        complete_request_bytes: usize,
+        allowance: Arc<InferenceAllowance>,
+    ) -> Result<ResponseStream, ApiError> {
+        self.stream_request_inner(
+            request,
+            connection_reused,
+            turn_state,
+            Some((allowance, complete_request_bytes)),
+        )
+        .await
+    }
+
+    async fn stream_request_inner(
+        &self,
+        request: ResponsesWsRequest<'_>,
+        connection_reused: bool,
+        turn_state: Option<Arc<OnceLock<String>>>,
+        allowance: Option<(Arc<InferenceAllowance>, usize)>,
+    ) -> Result<ResponseStream, ApiError> {
         let (tx_event, rx_event) =
             mpsc::channel::<std::result::Result<ResponseEvent, ApiError>>(1600);
         let (tx_interrupt, rx_interrupt) = oneshot::channel();
@@ -290,7 +348,35 @@ impl ResponsesWebsocketConnection {
             warmup: ws_request.generate == Some(false),
             connection_reused,
         };
-        let request_text = serialize_websocket_request(&request)?;
+        let mut request_text = serialize_websocket_request(&request)?;
+        let original_bytes = request_text.len();
+        if let Some((allowance, _)) = &allowance
+            && let Some(bounded) = allowance.output_bound_request(&request).map_err(|error| {
+                ApiError::InvalidRequest {
+                    message: error.to_string(),
+                }
+            })?
+        {
+            // Serialize the same typed/raw fields directly. Normalizing RawValue
+            // tools would change payload bytes and erase the added-field delta.
+            request_text = serde_json::to_string(&bounded)
+                .map_err(|error| ApiError::Stream(error.to_string()))?;
+        }
+        if let Some((allowance, complete_bytes)) = &allowance {
+            // The caller's complete logical byte count predates the owner field;
+            // account for that delta even when the wire carries only a WS diff.
+            let complete_bytes = complete_bytes
+                .checked_add(request_text.len().saturating_sub(original_bytes))
+                .ok_or_else(|| ApiError::InvalidRequest {
+                    message: "complete output-bounded request exceeds byte allowance".into(),
+                })?;
+            allowance
+                .validate_request(complete_bytes.max(request_text.len()))
+                .map_err(|error| ApiError::InvalidRequest {
+                    message: error.to_string(),
+                })?;
+        }
+        let inference_allowance = allowance.map(|(allowance, _)| allowance);
 
         let current_span = Span::current();
         tokio::spawn(
@@ -324,6 +410,14 @@ impl ResponsesWebsocketConnection {
                     }
                 };
                 tokio::pin!(interrupt_timeout);
+                let allowance_deadline = async {
+                    if let Some(allowance) = &inference_allowance {
+                        tokio::time::sleep_until(allowance.deadline()).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                };
+                tokio::pin!(allowance_deadline);
                 let mut guard = tokio::select! {
                     biased;
                     _ = tx_event.closed() => return,
@@ -331,6 +425,10 @@ impl ResponsesWebsocketConnection {
                         let _ = tx_event.send(Err(ApiError::Stream(
                             "timed out draining interrupted response".into(),
                         ))).await;
+                        return;
+                    }
+                    () = &mut allowance_deadline => {
+                        let _ = tx_event.send(Err(ApiError::InvalidRequest { message: "native inference allowance deadline expired".into() })).await;
                         return;
                     }
                     guard = stream.lock() => guard,
@@ -358,12 +456,14 @@ impl ResponsesWebsocketConnection {
                         &timing_log_context,
                         interrupt.clone(),
                         &mut completion,
+                        inference_allowance.clone(),
                     );
                     tokio::pin!(response);
 
                     tokio::select! {
                         biased;
                         result = &mut response => result,
+                        () = &mut allowance_deadline => Err(ApiError::InvalidRequest { message: "native inference allowance deadline expired".into() }),
                         () = &mut interrupt_timeout => Err(ApiError::Stream(
                             "timed out draining interrupted response".into(),
                         )),
@@ -779,6 +879,7 @@ async fn run_websocket_response_stream(
     timing_log_context: &ResponsesWebsocketTimingLogContext,
     interrupt: impl Future<Output = ResponseInterrupt> + Clone + Unpin,
     completion: &mut Option<ResponseEvent>,
+    inference_allowance: Option<Arc<InferenceAllowance>>,
 ) -> Result<(), ApiError> {
     let mut last_server_model: Option<String> = None;
     let mut safety_buffering_treatment = SafetyBufferingTreatment::default();
@@ -789,15 +890,27 @@ async fn run_websocket_response_stream(
         // No request reached the backend, so this socket is still reusable.
         return Ok(());
     }
-    send_websocket_request(
+    // Retain response identities for this socket, never a rolling history that
+    // could make an old terminal eligible again. Saturation requires a fresh
+    // connection for accounting; ordinary unmetered streams remain compatible.
+    if inference_allowance.is_some() && ws_stream.completed_responses.len() >= 1024 {
+        return Err(ApiError::Stream(
+            "provider response identity bound reached".into(),
+        ));
+    }
+    let attempt = send_websocket_request_with_allowance(
         ws_stream,
         request_text,
         idle_timeout,
         telemetry.as_ref(),
         timing_log_context.connection_reused,
+        inference_allowance.clone(),
     )
     .await?;
 
+    let observer = inference_allowance
+        .zip(attempt)
+        .and_then(|(allowance, attempt)| AttemptObserver::new(allowance, attempt));
     // A response owns its interrupt, and create must be sent before interrupt.
     let mut interrupt_request = interrupt.clone().fuse();
     let mut interruption = None;
@@ -924,11 +1037,91 @@ async fn run_websocket_response_stream(
                     continue;
                 }
                 let model = event.response_model();
+                let incomplete_metadata = event.incomplete_usage_metadata();
                 // Preserve terminal usage before any accompanying notification can block.
                 let event = match process_responses_event(event) {
                     Ok(Some(event @ ResponseEvent::Completed { .. })) => {
+                        if let ResponseEvent::Completed {
+                            response_id: id, ..
+                        } = &event
+                        {
+                            let valid = !id.is_empty() && id.len() <= 200;
+                            let seen = valid && ws_stream.completed_responses.contains(id);
+                            if observer.is_some()
+                                && (!valid
+                                    || seen
+                                    || response_id.as_ref().is_some_and(|expected| expected != id))
+                            {
+                                return Err(ApiError::Stream(
+                                    "provider completion identity is stale or conflicting".into(),
+                                ));
+                            }
+                            if valid && ws_stream.completed_responses.len() < 1024 {
+                                ws_stream.completed_responses.insert(id.clone());
+                            }
+                        }
+                        // Keep parsed terminal evidence before any cancellable
+                        // owner callback, just as before adding usage reports.
                         *completion = Some(event);
+                        if let (
+                            Some(observer),
+                            Some(
+                                event @ ResponseEvent::Completed {
+                                    response_id: id, ..
+                                },
+                            ),
+                        ) = (&observer, completion.as_ref())
+                            && response_id.as_ref() == Some(id)
+                        {
+                            // A raw model field or unrelated socket metadata is
+                            // not proof of the model for this exact response.
+                            observer.observe(event, model.clone()).await;
+                        }
                         Ok(None)
+                    }
+                    Err(ResponsesEventError::Api(ApiError::ResponseIncomplete(error))) => {
+                        if let Some(id) = &error.response_id {
+                            let valid = !id.is_empty() && id.len() <= 200;
+                            if observer.is_some()
+                                && (!valid
+                                    || ws_stream.completed_responses.contains(id)
+                                    || response_id.as_ref().is_some_and(|expected| expected != id))
+                            {
+                                return Err(ApiError::Stream(
+                                    "provider incomplete identity is stale or conflicting".into(),
+                                ));
+                            }
+                            if valid && ws_stream.completed_responses.len() < 1024 {
+                                ws_stream.completed_responses.insert(id.clone());
+                            }
+                            if let Some(observer) = &observer
+                                && response_id.as_ref() == Some(id)
+                            {
+                                observer
+                                    .observe_incomplete(&error, model.clone(), incomplete_metadata)
+                                    .await;
+                            }
+                        }
+                        Err(ResponsesEventError::Api(ApiError::ResponseIncomplete(
+                            error,
+                        )))
+                    }
+                    Ok(Some(event @ ResponseEvent::Created { .. })) => {
+                        if let ResponseEvent::Created {
+                            response_id: Some(id),
+                        } = &event
+                            && observer.is_some()
+                            && (id.is_empty()
+                                || id.len() > 200
+                                || ws_stream.completed_responses.contains(id)
+                                || response_id.as_ref().is_some_and(|expected| expected != id))
+                        {
+                            return Err(ApiError::Stream(
+                                "provider response creation identity is stale or conflicting"
+                                    .into(),
+                            ));
+                        }
+                        Ok(Some(event))
                     }
                     event => event,
                 };
@@ -1039,10 +1232,30 @@ async fn send_websocket_request(
     telemetry: Option<&Arc<dyn WebsocketTelemetry>>,
     connection_reused: bool,
 ) -> Result<(), ApiError> {
+    send_websocket_request_with_allowance(
+        ws_stream,
+        request_text,
+        idle_timeout,
+        telemetry,
+        connection_reused,
+        None,
+    )
+    .await
+    .map(|_| ())
+}
+
+async fn send_websocket_request_with_allowance(
+    ws_stream: &mut WsStream,
+    request_text: String,
+    idle_timeout: Duration,
+    telemetry: Option<&Arc<dyn WebsocketTelemetry>>,
+    connection_reused: bool,
+    inference_allowance: Option<Arc<InferenceAllowance>>,
+) -> Result<Option<ProviderAttempt>, ApiError> {
     let request_start = Instant::now();
     let result = tokio::time::timeout(
         idle_timeout,
-        ws_stream.send(Message::Text(request_text.into())),
+        ws_stream.send_with_allowance(Message::Text(request_text.into()), inference_allowance),
     )
     .await
     .map_err(|_| ApiError::Stream("idle timeout sending websocket request".into()))
@@ -1056,9 +1269,7 @@ async fn send_websocket_request(
         );
     }
 
-    result?;
-
-    Ok(())
+    result
 }
 
 fn serialize_websocket_request(request: &ResponsesWsRequest<'_>) -> Result<String, ApiError> {

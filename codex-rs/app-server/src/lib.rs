@@ -73,6 +73,7 @@ use codex_websocket_auth::WebsocketAuthSettings;
 use codex_websocket_auth::policy_from_settings;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
@@ -140,6 +141,7 @@ mod otel_config;
 mod otel_reloader;
 mod outgoing_message;
 mod plugin_config_reload;
+mod provider_reservation;
 mod request_processors;
 mod request_serialization;
 mod server_request_error;
@@ -210,18 +212,23 @@ enum OutboundControlEvent {
 struct ShutdownState {
     requested: bool,
     forced: bool,
+    maintenance: bool,
+    draining: bool,
+    maintenance_deadline: Option<tokio::time::Instant>,
+    maintenance_reply: Option<oneshot::Sender<&'static str>>,
+    maintenance_flushed: Option<oneshot::Receiver<()>>,
     last_logged_running_turn_count: Option<usize>,
 }
 
 enum ShutdownAction {
     Noop,
     Finish,
+    ResumeServing,
 }
 
 #[derive(Clone, Copy)]
 enum ShutdownSignal {
     Forceable,
-    #[cfg(unix)]
     GracefulOnly,
 }
 
@@ -262,6 +269,39 @@ impl ShutdownState {
         self.forced
     }
 
+    fn cancel_maintenance(&mut self, turn_admission: &turn_admission::TurnAdmission) {
+        turn_admission.cancel_drain();
+        if let Some(reply) = self.maintenance_reply.take() {
+            let _ = reply.send("deferred");
+        }
+        *self = Self::default();
+        warn!("maintenance handoff abandoned; continuing to serve without interrupting work");
+    }
+
+    fn on_maintenance_request(
+        &mut self,
+        expires_at: tokio::time::Instant,
+        reply: oneshot::Sender<&'static str>,
+        flushed: oneshot::Receiver<()>,
+        turn_admission: &turn_admission::TurnAdmission,
+    ) {
+        if reply.is_closed() || tokio::time::Instant::now() >= expires_at {
+            let _ = reply.send("deferred");
+        } else if self.requested() {
+            let _ = reply.send("alreadyPending");
+        } else {
+            turn_admission.defer_goal_continuations();
+            self.requested = true;
+            self.maintenance = true;
+            self.draining = false;
+            self.last_logged_running_turn_count = None;
+            self.maintenance_deadline = Some(expires_at);
+            info!("received bounded maintenance request; continuing to serve until idle");
+            self.maintenance_reply = Some(reply);
+            self.maintenance_flushed = Some(flushed);
+        }
+    }
+
     fn on_signal(
         &mut self,
         signal: ShutdownSignal,
@@ -271,29 +311,71 @@ impl ShutdownState {
     ) {
         if self.requested {
             if matches!(signal, ShutdownSignal::Forceable) {
-                self.forced = true;
+                if self.maintenance {
+                    if let Some(reply) = self.maintenance_reply.take() {
+                        let _ = reply.send("supersededByExplicitStop");
+                    }
+                    self.maintenance_flushed = None;
+                    self.maintenance = false;
+                    self.maintenance_deadline = None;
+                    self.draining = true;
+                    turn_admission.begin_drain();
+                } else {
+                    self.forced = true;
+                }
             }
             return;
         }
 
-        turn_admission.begin_drain();
+        self.maintenance = !matches!(signal, ShutdownSignal::Forceable);
+        self.draining = !self.maintenance;
+        if self.draining {
+            turn_admission.begin_drain();
+        }
         self.requested = true;
+        if self.maintenance {
+            turn_admission.defer_goal_continuations();
+            // A maintenance caller must have a bounded deferred outcome, not a
+            // permanent pending request that exits unexpectedly hours later.
+            self.maintenance_deadline =
+                Some(tokio::time::Instant::now() + std::time::Duration::from_secs(120));
+        }
         self.last_logged_running_turn_count = None;
         info!(
-            "received shutdown signal; entering graceful restart drain (connections={}, runningAssistantTurns={}, new client turns rejected)",
-            connection_count, running_turn_count,
+            "received shutdown signal (connections={}, runningAssistantTurns={}, maintenance={}, acceptingNewTurns={})",
+            connection_count, running_turn_count, self.maintenance, !self.draining,
         );
     }
 
     fn update(
         &mut self,
-        running_turn_count: usize,
+        running_turn_count_rx: &watch::Receiver<usize>,
         active_admissions: usize,
         connection_count: usize,
+        turn_admission: &turn_admission::TurnAdmission,
     ) -> ShutdownAction {
         if !self.requested {
             return ShutdownAction::Noop;
         }
+
+        if self
+            .maintenance_deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            self.cancel_maintenance(turn_admission);
+            return ShutdownAction::ResumeServing;
+        }
+
+        if self.maintenance && !self.draining {
+            if !turn_admission.begin_idle_drain(running_turn_count_rx) {
+                return ShutdownAction::Noop;
+            }
+            self.draining = true;
+            self.maintenance_deadline =
+                Some(tokio::time::Instant::now() + std::time::Duration::from_secs(5));
+        }
+
+        let running_turn_count = *running_turn_count_rx.borrow();
 
         if self.forced || (running_turn_count == 0 && active_admissions == 0) {
             if self.forced {
@@ -837,6 +919,8 @@ pub async fn run_main_with_transport_options(
                         .is_some()
                 {
                     DaemonShutdownAccess::Managed
+                } else if managed_daemon {
+                    DaemonShutdownAccess::MaintenanceOnly
                 } else {
                     DaemonShutdownAccess::Disabled
                 },
@@ -1065,18 +1149,24 @@ pub async fn run_main_with_transport_options(
             };
             let mut listen_for_threads = true;
             // Keep force signals and daemon control events responsive while saving.
-            let mut snapshot = Box::pin(async {
+            let make_snapshot = |path, maintenance| {
                 let processor = Arc::clone(&processor);
-                let recovery_file = recovery_file.clone();
-                // Run independently: snapshot locks can require the event loop to make progress.
-                let task = tokio::spawn(async move {
-                    let saved = processor.daemon_recovery_snapshot().await;
-                    if let Err(err) = daemon_thread_recovery::snapshot(recovery_file, saved).await {
-                        warn!("failed to save threads during daemon shutdown: {err}");
-                    }
-                });
-                let _ = tokio_util::task::AbortOnDropHandle::new(task).await;
-            });
+                Box::pin(async move {
+                    // Run independently: snapshot locks can require the event loop to make progress.
+                    let task = tokio::spawn(async move {
+                        let saved = processor.daemon_recovery_snapshot(maintenance).await?;
+                        daemon_thread_recovery::snapshot(path, saved).await
+                    });
+                    tokio_util::task::AbortOnDropHandle::new(task)
+                        .await
+                        .map_err(std::io::Error::other)?
+                })
+            };
+            let mut snapshot = make_snapshot(recovery_file.clone(), false);
+            let mut snapshot_started = false;
+            let mut snapshot_is_maintenance = false;
+            let mut snapshot_attempt = 0_u64;
+            let mut snapshot_file = recovery_file.clone();
             let mut snapshot_finished = !managed_daemon;
             let mut clients_disconnected = false;
             let mut shutdown_state = ShutdownState::default();
@@ -1085,23 +1175,57 @@ pub async fn run_main_with_transport_options(
                 // Sample submissions first: one can publish a running turn before
                 // releasing its permit, and shutdown must observe that new turn.
                 let active_admissions = *active_admissions_rx.borrow_and_update();
-                let running_turn_count = *running_turn_count_rx.borrow_and_update();
-                let ready_to_exit = matches!(
-                    shutdown_state.update(running_turn_count, active_admissions, connections.len()),
-                    ShutdownAction::Finish
+                let _ = running_turn_count_rx.borrow_and_update();
+                let action = shutdown_state.update(
+                    &running_turn_count_rx,
+                    active_admissions,
+                    connections.len(),
+                    &processor.turn_admission,
                 );
+                if matches!(action, ShutdownAction::ResumeServing) {
+                    // Dropping the future aborts its async task. A late filesystem
+                    // writer can only touch this attempt's private staging file,
+                    // never publish an abandoned continuation for a later restart.
+                    snapshot = make_snapshot(recovery_file.clone(), false);
+                    snapshot_started = false;
+                }
+                let ready_to_exit = matches!(action, ShutdownAction::Finish);
+                if shutdown_state.draining && !snapshot_started {
+                    snapshot_attempt += 1;
+                    snapshot_is_maintenance = shutdown_state.maintenance;
+                    snapshot_file = if snapshot_is_maintenance {
+                        recovery_file.with_extension(format!(
+                            "maintenance-{}-{snapshot_attempt}",
+                            std::process::id()
+                        ))
+                    } else {
+                        recovery_file.clone()
+                    };
+                    snapshot = make_snapshot(snapshot_file.clone(), snapshot_is_maintenance);
+                    snapshot_started = true;
+                }
                 if ready_to_exit {
-                    if let Some(task) = &recovery_task {
-                        task.abort();
-                    }
                     let finished = snapshot_finished || shutdown_state.forced();
                     if finished {
+                        if let Some(reply) = shutdown_state.maintenance_reply.take() {
+                            let _ = reply.send("handoffReady");
+                            if let Some(flushed) = shutdown_state.maintenance_flushed.take() {
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_secs(2),
+                                    flushed,
+                                )
+                                .await;
+                            }
+                        }
+                        if let Some(task) = &recovery_task {
+                            task.abort();
+                        }
                         transport_shutdown_token.cancel();
                     }
                     if managed_daemon && shutdown_state.forced() {
                         break "forced_shutdown_requested";
                     }
-                    if !clients_disconnected {
+                    if !clients_disconnected && (finished || !shutdown_state.maintenance) {
                         let _ = outbound_control_tx
                             .send(OutboundControlEvent::DisconnectAll)
                             .await;
@@ -1113,8 +1237,36 @@ pub async fn run_main_with_transport_options(
                 }
 
                 tokio::select! {
-                    _ = &mut snapshot, if shutdown_state.requested() && active_admissions == 0 && !snapshot_finished => {
+                    result = &mut snapshot, if shutdown_state.draining && active_admissions == 0 && !snapshot_finished => {
+                        // A ready writer and timer can become runnable together.
+                        // Deadline expiry still wins before publishing recovery.
+                        if shutdown_state.maintenance && shutdown_state.maintenance_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                            shutdown_state.cancel_maintenance(&processor.turn_admission);
+                            snapshot = make_snapshot(recovery_file.clone(), false);
+                            snapshot_started = false;
+                            continue;
+                        }
+                        let result = result.and_then(|()| {
+                            if snapshot_is_maintenance {
+                                std::fs::rename(&snapshot_file, &recovery_file)
+                            } else {
+                                Ok(())
+                            }
+                        });
+                        if let Err(err) = result {
+                            warn!("failed to save threads during daemon shutdown: {err}");
+                            if shutdown_state.maintenance {
+                                shutdown_state.cancel_maintenance(&processor.turn_admission);
+                                snapshot = make_snapshot(recovery_file.clone(), false);
+                                snapshot_started = false;
+                                continue;
+                            }
+                        }
                         snapshot_finished = true;
+                        shutdown_state.maintenance_deadline = None;
+                    }
+                    _ = tokio::time::sleep_until(shutdown_state.maintenance_deadline.unwrap_or_else(tokio::time::Instant::now)), if shutdown_state.maintenance_deadline.is_some() && !snapshot_finished => {
+                        // The next update abandons the handoff and reopens admission.
                     }
                     shutdown_signal_result = &mut shutdown_signal_future, if graceful_signal_restart_enabled && !shutdown_state.forced() => {
                         shutdown_signal_future.set(shutdown_signal());
@@ -1142,13 +1294,16 @@ pub async fn run_main_with_transport_options(
                         let Some(event) = event else {
                             break "transport_channel_closed";
                         };
-                        if ready_to_exit && !matches!(event, TransportEvent::DaemonShutdown) {
+                        if ready_to_exit && !shutdown_state.maintenance && !matches!(event, TransportEvent::DaemonShutdown) {
                             if let TransportEvent::ConnectionOpened { disconnect_sender: Some(token), .. } = event {
                                 token.cancel();
                             }
                             continue;
                         }
                         match event {
+                            TransportEvent::DaemonMaintenance { expires_at, reply, flushed } => {
+                                shutdown_state.on_maintenance_request(expires_at, reply, flushed, &processor.turn_admission);
+                            }
                             TransportEvent::DaemonShutdown => {
                                 shutdown_state.on_signal(ShutdownSignal::Forceable, connections.len(), *running_turn_count_rx.borrow(), &processor.turn_admission);
                             }

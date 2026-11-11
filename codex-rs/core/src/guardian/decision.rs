@@ -5,6 +5,7 @@ use codex_async_utils::THREAD_STACK_SIZE_BYTES;
 use codex_protocol::protocol::ReviewDecision;
 use std::sync::Arc;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 use super::ApprovalRequestReasons;
 use super::GuardianApprovalRequest;
@@ -51,6 +52,23 @@ pub(crate) fn decide_approval(
     mut options: GuardianReviewOptions,
 ) -> futures::future::BoxFuture<'static, Option<ReviewDecision>> {
     let context: GuardianReviewContext = context.into();
+    if crate::turn_inference::allowance(context.turn()).is_some() {
+        let cancellation = options.external_cancel;
+        return Box::pin(async move {
+            Some(
+                if cancellation
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled)
+                {
+                    ReviewDecision::Abort
+                } else {
+                    ReviewDecision::denied(
+                        "Bounded attention requires separately reserved approval review; the action was not approved.",
+                    )
+                },
+            )
+        });
+    }
     let request: ReviewAction = request.into();
     // Bind the invocation before scheduling. Async review cleanup can outlive
     // the decision, but must not extend the time blocking this tool.

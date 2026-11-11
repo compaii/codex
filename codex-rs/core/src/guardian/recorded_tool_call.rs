@@ -69,7 +69,7 @@ pub(crate) async fn review_tool_call(
     let review = async {
         let turn = session
             .new_turn_with_default_settings(uuid::Uuid::now_v7().to_string(), Default::default())
-            .await;
+            .await?;
         let step = session
             .capture_speculative_step_context(turn, cancellation)
             .await?;

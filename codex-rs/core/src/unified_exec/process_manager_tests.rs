@@ -651,7 +651,8 @@ async fn pruning_does_not_evict_live_process_while_exited_process_is_finalizing(
                     crate::sandboxing::SandboxPermissions::UseDefault,
                     /*additional_permissions*/ None,
                     /*internal_permissions*/ None,
-                ),
+                )
+                .expect("capture launch permissions"),
                 network_approval: None,
                 session: std::sync::Weak::new(),
                 last_used: if is_exited {

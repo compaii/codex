@@ -1025,7 +1025,8 @@ async fn rejects_non_regular_turns() {
             .set_root_turn_id("incoming-root".to_string());
         let turn_context = session
             .new_turn_with_default_settings("turn".to_string(), Default::default())
-            .await;
+            .await
+            .expect("build turn context");
         turn_context
             .turn_metadata_state
             .set_root_turn_id("active-root".to_string());
@@ -1141,6 +1142,125 @@ async fn steer_preserves_request_origin(
 }
 
 #[tokio::test]
+async fn bounded_admission_attaches_one_shared_account_without_sticky_thread_limits() {
+    let (session, _) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let spec = codex_protocol::turn_input::TurnInferenceAllowance {
+        max_provider_attempts: 2,
+        max_request_bytes: 1024,
+        deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+    };
+    let prepared = PreparedTurnInputSettings::prepare(
+        &session,
+        ThreadSettingsOverrides::default(),
+        TurnStartOptions {
+            inference_allowance: Some(spec),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let ctx = prepared
+        .apply_started(&session, "bounded-test".into(), TurnStartKind::User)
+        .await
+        .unwrap()
+        .unwrap();
+    let first = crate::turn_inference::allowance(&ctx).unwrap();
+    let second = crate::turn_inference::allowance(&ctx).unwrap();
+    assert!(Arc::ptr_eq(&first, &second));
+    first.claim_attempt().unwrap();
+    assert_eq!(second.attempted().unwrap(), 1);
+    let ordinary = PreparedTurnInputSettings::prepare(
+        &session,
+        ThreadSettingsOverrides::default(),
+        TurnStartOptions::default(),
+    )
+    .await
+    .unwrap()
+    .apply_started(
+        &session,
+        "ordinary-after-bounded".into(),
+        TurnStartKind::User,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(crate::turn_inference::allowance(&ordinary).is_none());
+}
+
+#[tokio::test]
+async fn bounded_recovery_refuses_instead_of_replenishing_spent_attempts() {
+    let (session, _) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let spec = codex_protocol::turn_input::TurnInferenceAllowance {
+        max_provider_attempts: 2,
+        max_request_bytes: 128,
+        deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+    };
+    assert!(
+        handle_recovery(
+            &session,
+            ThreadSettingsOverrides::default(),
+            TurnStartOptions {
+                inference_allowance: Some(spec),
+                ..Default::default()
+            },
+            "retained-bounded-turn".into()
+        )
+        .await
+        .is_err()
+    );
+    assert!(session.active_turn.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn bounded_predecessor_refuses_an_unreserved_direct_continuation() {
+    let (session, _) = make_session_and_context().await;
+    let session = Arc::new(session);
+    session.state.lock().await.turn_attribution = Some(codex_history::TurnAttribution {
+        inference_allowance: Some(Box::new(
+            codex_protocol::turn_input::TurnInferenceAllowance {
+                max_provider_attempts: 1,
+                max_request_bytes: 128,
+                deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+            },
+        )),
+        turn_id: "bounded-predecessor".into(),
+        turn_trigger: Some("heartbeat".into()),
+        parent_turn_id: None,
+        initiating_agent_path: None,
+        root_turn_id: None,
+    });
+    session.state.lock().await.last_started_turn_id = Some("bounded-predecessor".into());
+    let input = TurnInputRequest::new(SubmittedTurnInput::ResponseItem(
+        ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: None,
+            name: Some("automatic_continuation".into()),
+            namespace: None,
+            output: codex_protocol::models::FunctionCallOutputPayload {
+                body: codex_protocol::models::FunctionCallOutputBody::Text("continue".into()),
+                success: None,
+            },
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ));
+    assert!(
+        handle(
+            &session,
+            input,
+            TurnInputMode::ContinueIfIdle {
+                expected_previous_turn_id: "bounded-predecessor".into(),
+            },
+            "unreserved-successor".into()
+        )
+        .await
+        .is_err()
+    );
+    assert!(session.active_turn.lock().await.is_none());
+}
+
+#[tokio::test]
 async fn scored_prompt_keeps_its_submission_item_id() {
     let (session, turn, events) = make_session_and_context_with_rx().await;
     session
@@ -1237,4 +1357,661 @@ async fn scored_prompt_keeps_its_submission_item_id() {
         .collect::<std::collections::HashSet<_>>();
     assert_eq!(ui_ids.len(), 3);
     session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+/// Queue-only message wakes may reuse ordinary context but never replenish a bounded turn.
+#[test_case(false; "ordinary_wake")]
+#[test_case(true; "bounded_predecessor")]
+#[tokio::test]
+async fn agent_message_wake_preserves_bounded_predecessor(bounded: bool) {
+    let (mut session, _) = make_session_and_context().await;
+    session
+        .features
+        .enable(Feature::WakeOnAgentMessages)
+        .expect("enable agent-message wakes");
+    session.state.lock().await.turn_attribution = Some(codex_history::TurnAttribution {
+        inference_allowance: bounded.then(|| {
+            Box::new(codex_protocol::turn_input::TurnInferenceAllowance {
+                max_provider_attempts: 1,
+                max_request_bytes: 128,
+                deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+            })
+        }),
+        turn_id: "predecessor".into(),
+        turn_trigger: Some("heartbeat".into()),
+        parent_turn_id: None,
+        initiating_agent_path: None,
+        root_turn_id: None,
+    });
+    let communication = InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("valid worker path"),
+        AgentPath::root(),
+        Vec::new(),
+        "late worker update".to_string(),
+        /*trigger_turn*/ false,
+    );
+    session
+        .input_queue
+        .enqueue_mailbox_communication(communication.clone().into(), Default::default())
+        .await;
+
+    let reservation = session.reserve_pending_work_turn().await;
+    assert_eq!(reservation.is_none(), bounded);
+    assert_eq!(session.active_turn.lock().await.is_none(), bounded);
+    assert_eq!(
+        session.input_queue.drain_mailbox_input_items().await.0,
+        vec![TurnInput::InterAgentCommunication(communication.into())]
+    );
+}
+
+#[derive(Debug, Default)]
+struct FundingGateFixture(std::sync::atomic::AtomicUsize);
+impl codex_api::ProviderAttemptGate for FundingGateFixture {
+    fn reserve(&self, _: codex_api::ProviderAttempt) -> codex_api::ProviderAttemptReservation<'_> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { false })
+    }
+}
+
+async fn set_funding_gate(session: &Session, gate: Arc<FundingGateFixture>) {
+    let gate: Arc<dyn codex_api::ProviderAttemptGate> = gate;
+    session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .turn_extension_init
+        .insert(gate);
+}
+
+#[tokio::test]
+async fn funding_gate_uses_actual_start_attachment_and_refuses_unbounded_start() {
+    let (session, _ctx, _rx) = make_session_and_context_with_rx().await;
+    let initial = session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .step_settings
+        .collaboration_mode
+        .clone();
+    let prepared = PreparedTurnInputSettings::prepare(
+        &session,
+        ThreadSettingsOverrides {
+            model: Some("gpt-5.2".into()),
+            ..Default::default()
+        },
+        TurnStartOptions::default(),
+    )
+    .await
+    .expect("prepare unfunded start");
+    let old_gate = Arc::new(FundingGateFixture::default());
+    set_funding_gate(&session, Arc::clone(&old_gate)).await;
+    assert!(
+        prepared
+            .apply_started(&session, "unfunded-start".into(), TurnStartKind::User)
+            .await
+            .expect("admission result")
+            .is_none()
+    );
+    assert_eq!(
+        session
+            .state
+            .lock()
+            .await
+            .session_configuration
+            .step_settings
+            .collaboration_mode,
+        initial
+    );
+    let spec = codex_protocol::turn_input::TurnInferenceAllowance {
+        max_provider_attempts: 2,
+        max_request_bytes: 4096,
+        deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+    };
+    let prepared = PreparedTurnInputSettings::prepare(
+        &session,
+        ThreadSettingsOverrides::default(),
+        TurnStartOptions {
+            inference_allowance: Some(spec),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("prepare funded start");
+    let current_gate = Arc::new(FundingGateFixture::default());
+    set_funding_gate(&session, Arc::clone(&current_gate)).await;
+    let ctx = prepared
+        .apply_started(&session, "funded-start".into(), TurnStartKind::User)
+        .await
+        .expect("start result")
+        .expect("bounded start");
+    let allowance = crate::turn_inference::allowance(&ctx).expect("native allowance");
+    assert!(allowance.claim_authorized_attempt().await.is_err());
+    assert_eq!(old_gate.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(current_gate.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn funding_gate_does_not_block_human_steering_of_an_active_turn() {
+    let (session, ctx, _rx) = make_session_and_context_with_rx().await;
+    set_funding_gate(&session, Arc::new(FundingGateFixture::default())).await;
+    session
+        .spawn_task(
+            Arc::clone(&ctx),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+    let result = submit_steer_only(
+        &session,
+        vec![UserInput::Text {
+            text: "human steering remains available".into(),
+            text_elements: Vec::new(),
+        }],
+        &ctx.sub_id,
+    )
+    .await;
+    assert!(matches!(result, TurnInputSubmission::Steered { .. }));
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
+async fn per_turn_reservation_is_not_inherited_and_requires_finite_limits() {
+    let (session, _ctx, _rx) = make_session_and_context_with_rx().await;
+    let gate = Arc::new(FundingGateFixture::default());
+    let selected = codex_protocol::provider_attempt::ProviderAttemptGateSelection(gate.clone());
+    assert!(
+        PreparedTurnInputSettings::prepare(
+            &session,
+            ThreadSettingsOverrides::default(),
+            TurnStartOptions {
+                provider_attempt_gate: Some(selected.clone()),
+                ..Default::default()
+            }
+        )
+        .await
+        .is_err()
+    );
+    let prepared = PreparedTurnInputSettings::prepare(
+        &session,
+        ThreadSettingsOverrides::default(),
+        TurnStartOptions {
+            provider_attempt_gate: Some(selected),
+            inference_allowance: Some(codex_protocol::turn_input::TurnInferenceAllowance {
+                max_provider_attempts: 1,
+                max_request_bytes: 4096,
+                deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let ctx = prepared
+        .apply_started(&session, "one-funded-turn".into(), TurnStartKind::User)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        crate::turn_inference::allowance(&ctx)
+            .unwrap()
+            .claim_authorized_attempt()
+            .await
+            .is_err()
+    );
+    assert_eq!(gate.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let next = PreparedTurnInputSettings::prepare(
+        &session,
+        ThreadSettingsOverrides::default(),
+        TurnStartOptions::default(),
+    )
+    .await
+    .unwrap()
+    .apply_started(
+        &session,
+        "independent-human-turn".into(),
+        TurnStartKind::User,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(crate::turn_inference::allowance(&next).is_none());
+    assert!(
+        next.extension_data
+            .get::<Arc<dyn codex_api::ProviderAttemptGate>>()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn per_turn_caller_cannot_replace_an_existing_host_reservation_policy() {
+    let (session, _ctx, _rx) = make_session_and_context_with_rx().await;
+    let prepared = PreparedTurnInputSettings::prepare(
+        &session,
+        ThreadSettingsOverrides::default(),
+        TurnStartOptions {
+            provider_attempt_gate: Some(
+                codex_protocol::provider_attempt::ProviderAttemptGateSelection(Arc::new(
+                    FundingGateFixture::default(),
+                )),
+            ),
+            inference_allowance: Some(codex_protocol::turn_input::TurnInferenceAllowance {
+                max_provider_attempts: 1,
+                max_request_bytes: 4096,
+                deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    set_funding_gate(&session, Arc::new(FundingGateFixture::default())).await;
+    assert!(
+        prepared
+            .apply_started(&session, "conflicting-owner".into(), TurnStartKind::User)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn host_tool_ceiling_intersection_never_widens_either_policy() {
+    use codex_extension_api::ToolPolicy;
+    use codex_protocol::ToolName;
+    let plain = ToolName {
+        namespace: None,
+        name: "exec".into(),
+    };
+    let alias = ToolName {
+        namespace: Some("functions".into()),
+        name: "exec".into(),
+    };
+    let external = ToolName {
+        namespace: Some("remote".into()),
+        name: "exec".into(),
+    };
+    let base = ToolPolicy {
+        allowed_tools: Some(vec![plain.clone(), external.clone()]),
+        ..Default::default()
+    };
+    let ceiling = ToolPolicy {
+        allowed_tools: Some(vec![alias.clone()]),
+        require_managed_sandbox: true,
+        require_unified_exec: true,
+        expose_additional_permissions: false,
+    };
+    for policy in [base.intersect(&ceiling), ceiling.intersect(&base)] {
+        assert!(policy.allows(&plain));
+        assert!(policy.allows(&alias));
+        assert!(!policy.allows(&external));
+        assert!(policy.require_managed_sandbox);
+        assert!(policy.require_unified_exec);
+        assert!(!policy.expose_additional_permissions);
+        assert!(
+            !policy
+                .intersect(&ToolPolicy {
+                    allowed_tools: Some(vec![]),
+                    ..Default::default()
+                })
+                .allows(&plain)
+        );
+    }
+}
+
+#[tokio::test]
+async fn host_tool_ceiling_is_transient_and_requires_finite_allowance() {
+    let (session, _, _rx) = make_session_and_context_with_rx().await;
+    let tool = codex_protocol::ToolName {
+        namespace: None,
+        name: "exec".into(),
+    };
+    assert!(
+        PreparedTurnInputSettings::prepare(
+            &session,
+            ThreadSettingsOverrides::default(),
+            TurnStartOptions {
+                tool_ceiling: Some(vec![tool.clone()]),
+                ..Default::default()
+            }
+        )
+        .await
+        .is_err()
+    );
+    let bounded = PreparedTurnInputSettings::prepare(
+        &session,
+        ThreadSettingsOverrides::default(),
+        TurnStartOptions {
+            tool_ceiling: Some(vec![tool.clone()]),
+            inference_allowance: Some(codex_protocol::turn_input::TurnInferenceAllowance {
+                max_provider_attempts: 2,
+                max_request_bytes: 4096,
+                deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("prepare bounded tools")
+    .apply_started(&session, "restricted-tools".into(), TurnStartKind::User)
+    .await
+    .expect("admit")
+    .expect("context");
+    assert!(bounded.has_tool_ceiling());
+    let policy = bounded.effective_tool_policy(&session.tool_policy);
+    assert!(policy.allows(&tool));
+    assert!(!policy.allows(&codex_protocol::ToolName {
+        namespace: None,
+        name: "other".into()
+    }));
+    assert!(!policy.expose_additional_permissions);
+    let ordinary = PreparedTurnInputSettings::prepare(
+        &session,
+        ThreadSettingsOverrides::default(),
+        TurnStartOptions::default(),
+    )
+    .await
+    .expect("prepare human turn")
+    .apply_started(&session, "ordinary-tools".into(), TurnStartKind::User)
+    .await
+    .expect("admit human")
+    .expect("context");
+    assert!(!ordinary.has_tool_ceiling());
+    assert!(Arc::ptr_eq(
+        &ordinary.effective_tool_policy(&session.tool_policy),
+        &session.tool_policy
+    ));
+}
+
+#[tokio::test]
+async fn host_tool_ceiling_cannot_be_discarded_by_steering() {
+    let (session, _, _rx) = make_session_and_context_with_rx().await;
+    for mode in [
+        TurnInputMode::StartOrSteer,
+        TurnInputMode::Steer {
+            expected_turn_id: "restricted-target".into(),
+        },
+    ] {
+        let request = TurnInputRequest::user_input(vec![]).on_start(TurnStartOptions {
+            tool_ceiling: Some(vec![]),
+            ..Default::default()
+        });
+        assert!(
+            handle(&session, request, mode, "restricted-steering".into())
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn host_permission_ceiling_requires_finite_managed_explicit_tool_admission() {
+    use codex_protocol::models::PermissionProfile;
+    let (session, _, _rx) = make_session_and_context_with_rx().await;
+    let allowance = codex_protocol::turn_input::TurnInferenceAllowance {
+        max_provider_attempts: 1,
+        max_request_bytes: 4096,
+        deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+    };
+    for options in [
+        TurnStartOptions {
+            permission_ceiling: Some(PermissionProfile::read_only()),
+            ..Default::default()
+        },
+        TurnStartOptions {
+            permission_ceiling: Some(PermissionProfile::read_only()),
+            inference_allowance: Some(allowance.clone()),
+            ..Default::default()
+        },
+        TurnStartOptions {
+            permission_ceiling: Some(PermissionProfile::Disabled),
+            inference_allowance: Some(allowance.clone()),
+            tool_ceiling: Some(vec![]),
+            ..Default::default()
+        },
+    ] {
+        assert!(
+            PreparedTurnInputSettings::prepare(
+                &session,
+                ThreadSettingsOverrides::default(),
+                options
+            )
+            .await
+            .is_err()
+        );
+    }
+}
+
+#[ctor::ctor]
+fn dispatch_permission_test_filesystem_helpers() {
+    use codex_test_binary_support::TestBinaryDispatchMode;
+    use codex_test_binary_support::configure_test_binary_dispatch;
+    configure_test_binary_dispatch("codex-core-unit-permissions", |name, argument| {
+        if argument == Some(codex_exec_server::CODEX_FS_HELPER_ARG1)
+            || name == codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0
+        {
+            TestBinaryDispatchMode::DispatchArg0Only
+        } else {
+            // No aliases, environment changes or helper startup for ordinary tests.
+            TestBinaryDispatchMode::Skip
+        }
+    });
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn host_permission_ceiling_enforces_real_files_after_old_and_new_grants_without_changing_human_defaults()
+-> anyhow::Result<()> {
+    use crate::session::step_context::StepContext;
+    use crate::session::tests::make_session_and_context_with_auth_and_config_and_rx;
+    use codex_file_system::EnvironmentAccess;
+    use codex_file_system::ReadFileOptions;
+    use codex_file_system::WriteFileOptions;
+    use codex_protocol::models::AdditionalPermissionProfile;
+    use codex_protocol::models::FileSystemPermissions;
+    use codex_protocol::models::NetworkPermissions;
+    use codex_protocol::models::PermissionProfile;
+    use codex_protocol::permissions::FileSystemAccessMode;
+    use codex_protocol::permissions::FileSystemSandboxEntry;
+    use codex_protocol::permissions::FileSystemSandboxPolicy;
+    use codex_protocol::permissions::NetworkSandboxPolicy;
+    use codex_utils_path_uri::PathUri;
+    let directory = tempfile::tempdir()?;
+    let root = AbsolutePathBuf::from_absolute_path(directory.path())?;
+    let writable = root.join("work");
+    std::fs::create_dir_all(&writable)?;
+    let secret = root.join("private.txt");
+    std::fs::write(&secret, "private fixture")?;
+    let outside = PathUri::from_abs_path(&root.join("outside.txt"));
+    let inside = PathUri::from_abs_path(&writable.join("inside.txt"));
+    let secret_uri = PathUri::from_abs_path(&secret);
+    let selected_root = root.clone();
+    let executable = std::env::current_exe()?;
+    #[cfg(target_os = "linux")]
+    let sandbox_alias = {
+        let path = directory.path().join("codex-linux-sandbox");
+        std::os::unix::fs::symlink(&executable, &path)?;
+        Some(path)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let sandbox_alias = None;
+    let (session, original, _rx) = make_session_and_context_with_auth_and_config_and_rx(
+        codex_login::CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        move |config| {
+            config.codex_self_exe = Some(executable);
+            config.codex_linux_sandbox_exe = sandbox_alias;
+            config.cwd = selected_root.clone();
+            config
+                .permissions
+                .set_workspace_roots(vec![selected_root.clone()]);
+            config
+                .permissions
+                .set_permission_profile(PermissionProfile::Disabled)
+                .expect("full-access fixture");
+        },
+    )
+    .await;
+    let mut policy = FileSystemSandboxPolicy::read_only();
+    policy.entries.push(FileSystemSandboxEntry::new(
+        writable.clone().into(),
+        FileSystemAccessMode::Write,
+    ));
+    policy.entries.push(FileSystemSandboxEntry::new(
+        secret.clone().into(),
+        FileSystemAccessMode::Deny,
+    ));
+    let ceiling =
+        PermissionProfile::from_runtime_permissions(&policy, NetworkSandboxPolicy::Restricted);
+    let grant = AdditionalPermissionProfile {
+        network: Some(NetworkPermissions {
+            enabled: Some(true),
+        }),
+        file_system: Some(FileSystemPermissions {
+            entries: vec![
+                FileSystemSandboxEntry::new(root.into(), FileSystemAccessMode::Write),
+                FileSystemSandboxEntry::new(secret.clone().into(), FileSystemAccessMode::Read),
+            ],
+            glob_scan_max_depth: None,
+        }),
+    };
+    let environment_id = original
+        .initial_environments
+        .primary()
+        .expect("original environment")
+        .selection
+        .environment_id
+        .clone();
+    session
+        .services
+        .record_granted_permissions(&environment_id, grant.clone());
+    let bounded = PreparedTurnInputSettings::prepare(
+        &session,
+        ThreadSettingsOverrides::default(),
+        TurnStartOptions {
+            permission_ceiling: Some(ceiling),
+            tool_ceiling: Some(vec![codex_protocol::ToolName::plain("exec_command")]),
+            inference_allowance: Some(codex_protocol::turn_input::TurnInferenceAllowance {
+                max_provider_attempts: 1,
+                max_request_bytes: 4096,
+                deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+            }),
+            ..Default::default()
+        },
+    )
+    .await?
+    .apply_started(
+        &session,
+        "restricted-file-access".into(),
+        TurnStartKind::User,
+    )
+    .await?
+    .expect("admitted context");
+    bounded.record_granted_permissions(&environment_id, grant.clone(), false);
+    let cancellation = CancellationToken::new();
+    let step = session
+        .capture_speculative_step_context(Arc::clone(&bounded), &cancellation)
+        .await?;
+    let environment = step.environments.primary().expect("restricted environment");
+    assert_eq!(
+        environment
+            .sandbox_context_with_permissions(Some(grant))?
+            .permissions
+            .network_sandbox_policy(),
+        NetworkSandboxPolicy::Restricted
+    );
+    // Use the broader pre-existing environment explicitly: the accessor must
+    // still apply its originating turn's immutable ceiling after live grants.
+    let files = step.fs_accessor(
+        original
+            .initial_environments
+            .primary()
+            .expect("broader environment"),
+    )?;
+    assert!(
+        files
+            .read_file(&secret_uri, ReadFileOptions::default())
+            .await
+            .is_err()
+    );
+    assert!(
+        files
+            .write_file(&outside, b"forbidden".to_vec(), WriteFileOptions::default())
+            .await
+            .is_err()
+    );
+    files
+        .write_file(&inside, b"allowed".to_vec(), WriteFileOptions::default())
+        .await?;
+    assert_eq!(std::fs::read(writable.join("inside.txt"))?, b"allowed");
+    let ordinary = PreparedTurnInputSettings::prepare(
+        &session,
+        ThreadSettingsOverrides::default(),
+        TurnStartOptions::default(),
+    )
+    .await?
+    .apply_started(&session, "ordinary-file-access".into(), TurnStartKind::User)
+    .await?
+    .expect("ordinary context");
+    assert!(ordinary.permission_ceiling().is_none());
+    assert_eq!(ordinary.permission_profile(), PermissionProfile::Disabled);
+    assert!(
+        ordinary.granted_permissions(&environment_id).is_some(),
+        "existing grants were not deleted"
+    );
+    let ordinary_step = StepContext::for_test(Arc::clone(&ordinary));
+    let files = ordinary_step.fs_accessor(
+        ordinary_step
+            .environments
+            .primary()
+            .expect("ordinary environment"),
+    )?;
+    assert_eq!(
+        files
+            .read_file(&secret_uri, ReadFileOptions::default())
+            .await?,
+        b"private fixture"
+    );
+    files
+        .write_file(&outside, b"human".to_vec(), WriteFileOptions::default())
+        .await?;
+    assert_eq!(
+        files
+            .read_file(&outside, ReadFileOptions::default())
+            .await?,
+        b"human"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn host_permission_ceiling_does_not_wait_for_an_unrelated_unavailable_environment()
+-> anyhow::Result<()> {
+    use crate::environment_selection::TurnEnvironmentState;
+    use codex_protocol::models::PermissionProfile;
+    let (_, context, _rx) = make_session_and_context_with_rx().await;
+    let mut environments = context.initial_environments.clone();
+    let mut selection = environments
+        .primary()
+        .expect("qualified environment")
+        .selection
+        .clone();
+    selection.environment_id = "unavailable-fixture".into();
+    environments
+        .environments
+        .push(TurnEnvironmentState::Failed {
+            selection,
+            required_skills: Vec::new(),
+            error: "fixture unavailable".into(),
+        });
+    let restricted = environments.restrict_permissions(&PermissionProfile::read_only())?;
+    assert_eq!(restricted.turn_environments().count(), 1);
+    assert!(
+        matches!(&restricted.environments[1], TurnEnvironmentState::Failed { error, .. } if error == "fixture unavailable")
+    );
+    Ok(())
 }

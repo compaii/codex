@@ -339,8 +339,13 @@ configured provider, including profile and app-server launch overrides. The JSON
 `currentModelProvider`, `modelProviderNotConfigured` identifies a missing provider, and
 `modelProviderPolicyConflict` identifies a mandatory-policy conflict. Clients can still use
 `thread/read` to display history and disable the composer with the error's explanation.
-Changing the resume request's provider does not bypass validation of the saved provider;
-switch the configured provider back to continue the chat. Input is also rejected when the
+Changing the resume request's provider does not bypass validation of the saved provider.
+This fork additionally preserves an explicitly reasserted saved per-thread provider when its
+exact definition remains in current owner configuration. This allows an existing selected
+profile to coexist with the server default without selecting a new provider. Missing/changed
+routes and managed restrictions still refuse; a retained or request-injected definition alone
+does not qualify. Threads without an explicit session selection retain the default mismatch
+check; switch the configured provider back to continue those chats. Input is also rejected when the
 current provider configuration cannot be loaded. Older clients retain their normal error
 fallback for unrecognized structured error variants.
 
@@ -703,6 +708,35 @@ Omitted or null cursors preserve normal first-page behavior. Continue anchored
 pages with the returned opaque string `nextCursor`; response fields and
 `backwardsCursor` semantics are unchanged.
 
+### Strict idle-only turn admission
+
+`turn/startIfIdle` accepts the same `TurnStartParams` and returns the same
+`TurnStartResponse` as `turn/start`, but uses Core's atomic start-if-idle path.
+It never steers or queues its input into an existing turn. Busy/pending-trigger
+refusal returns an invalid-request error without recording the submitted input
+or calling the model. Existing direct-input authority, model/provider admission,
+maintenance/drain, settings and automatic-input/Plan-mode rules still apply.
+The normal `turn/start` start-or-steer behavior is unchanged. Idle-only requests
+preserve the thread's existing client identity and MCP elicitation policy rather
+than applying the requesting connection's metadata before busy admission. The
+removed `permissionProfile` input is rejected consistently for both methods.
+Idle-admission refusal error data includes `submitted: false` with a stable `reason` such as
+`notIdle`, `pendingTriggerTurn` or `planMode`; lost acknowledgments remain uncertain.
+
+For internally attributed application context, supply `input: []` with the
+existing named `toolOutput`; do not fabricate a user utterance. For example:
+
+```json
+{"id":7,"method":"turn/startIfIdle","params":{"threadId":"selected-thread","input":[],"toolOutput":{"name":"application_attention","output":"Attributed source evidence","retain":true}}}
+```
+
+An accepted response identifies a newly started physical turn, allowing the
+application to retain its execution ownership separately from human publication.
+The application still owns generation, pause, budget and takeover controls; this
+method installs no scheduler and grants no automatic attention or extra funding.
+A caller requiring exclusivity must not fall back to `turn/start` after an
+unsupported-method response from an older server. Submission uncertainty keeps
+its original identity and must not be retried as another input.
 ## Workspace switching (experimental)
 
 For a managed ChatGPT login, `accountSession/list` returns an opaque
@@ -775,3 +809,14 @@ Tracestate requirements merge individual fields within each member. For example,
 requiring `otel.tracestate.vendor.tenant` preserves an ordinary `vendor.region`.
 Only required fields and edits to their ancestors are protected; sibling fields
 retain their origins and remain writable.
+
+### Bounded idle-turn support observation
+
+The read-only `initialize` response includes `boundedIdleTurn: true` when this
+server implements `turn/startBoundedIfIdle`. Omission means unsupported; it must
+not trigger a mutation probe, ordinary-turn fallback or model call. This is an
+advertisement of the actual serving implementation, not permission, funding,
+provider health, idle capacity or proof of execution. A client reporting current
+operational readiness must separately inspect its selected thread/profile,
+finite resources, exact generation fences and live source observation. The
+existing bounded admission still revalidates the request atomically.

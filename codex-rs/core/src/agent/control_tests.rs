@@ -2703,6 +2703,7 @@ async fn spawn_agent_fork_sanitizes_inherited_compaction_metadata() {
         multi_agent_version: Some(MultiAgentVersion::V2),
         last_started_turn_id: Some("parent-turn".to_string()),
         turn_attribution: Some(codex_history::TurnAttribution {
+            inference_allowance: None,
             turn_id: "parent-turn".to_string(),
             turn_trigger: Some("automation".to_string()),
             parent_turn_id: Some("initiating-turn".to_string()),
@@ -5084,7 +5085,8 @@ async fn resume_thread_subagent_restores_stored_metadata() {
     let parent_turn = parent_thread
         .session
         .new_turn_with_default_settings("parent-deselected".to_string(), Default::default())
-        .await;
+        .await
+        .expect("build turn context");
     assert_eq!(
         parent_turn.initial_environments.selected_capability_roots(),
         Vec::new()
@@ -5137,7 +5139,8 @@ async fn resume_thread_subagent_restores_stored_metadata() {
     let child_turn = resumed_thread
         .session
         .new_turn_with_default_settings("child-reselected".to_string(), Default::default())
-        .await;
+        .await
+        .expect("build turn context");
     assert_eq!(
         child_turn.initial_environments.selected_capability_roots(),
         roots

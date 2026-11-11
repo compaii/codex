@@ -240,6 +240,7 @@ async fn file_system_sandbox_context_preserves_executor_workspace_permissions() 
     let manager = SandboxManager::new();
     let sandbox_policy_cwd = PathUri::from_abs_path(&path);
     let attempt = SandboxAttempt {
+        permission_ceiling: None,
         sandbox_override: SandboxOverride::NoOverride,
         sandbox: SandboxType::MacosSeatbelt,
         sandbox_requested: true,
@@ -258,6 +259,7 @@ async fn file_system_sandbox_context_preserves_executor_workspace_permissions() 
     };
 
     let sandbox = ApplyPatchRuntime::file_system_sandbox_context_for_attempt(&req, &attempt)
+        .expect("permission qualification")
         .expect("sandbox context");
 
     let file_system_policy =
@@ -308,6 +310,7 @@ async fn file_system_sandbox_context_respects_sandbox_request() {
     let manager = SandboxManager::new();
     let sandbox_policy_cwd = PathUri::from_abs_path(&path);
     let attempt = SandboxAttempt {
+        permission_ceiling: None,
         sandbox_override: SandboxOverride::NoOverride,
         sandbox: SandboxType::None,
         sandbox_requested: false,
@@ -326,7 +329,8 @@ async fn file_system_sandbox_context_respects_sandbox_request() {
     };
 
     assert_eq!(
-        ApplyPatchRuntime::file_system_sandbox_context_for_attempt(&req, &attempt),
+        ApplyPatchRuntime::file_system_sandbox_context_for_attempt(&req, &attempt)
+            .expect("permission qualification"),
         None
     );
 
@@ -344,7 +348,8 @@ async fn file_system_sandbox_context_respects_sandbox_request() {
     };
 
     assert_eq!(
-        ApplyPatchRuntime::file_system_sandbox_context_for_attempt(&req, &attempt),
+        ApplyPatchRuntime::file_system_sandbox_context_for_attempt(&req, &attempt)
+            .expect("permission qualification"),
         Some(FileSystemSandboxContext {
             sandbox_override: SandboxOverride::NoOverride,
             permissions,

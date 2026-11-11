@@ -1,4 +1,5 @@
 use super::ActivePermissionProfile;
+use super::AdditionalContextEntry;
 use super::ApprovalsReviewer;
 use super::AskForApproval;
 use super::SandboxMode;
@@ -930,6 +931,114 @@ pub struct ThreadGoalClearParams {
 #[ts(export_to = "v2/")]
 pub struct ThreadGoalClearResponse {
     pub cleared: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadGoalSnapshotParams {
+    pub thread_id: String,
+}
+
+/// A consistent goal/definition snapshot. Revision survives clear/recreate and
+/// excludes ordinary usage accounting; it is not an authorization credential.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadGoalSnapshotResponse {
+    pub goal: Option<ThreadGoal>,
+    pub revision: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadGoalConditionalActivateParams {
+    pub thread_id: String,
+    pub expected_revision: String,
+    #[ts(optional = nullable)]
+    pub origin: Option<ThreadGoalMutationOrigin>,
+    #[ts(optional = nullable)]
+    pub objective: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::protocol::serde_helpers::deserialize_double_option",
+        serialize_with = "crate::protocol::serde_helpers::serialize_double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional = nullable, type = "number | null")]
+    pub token_budget: Option<Option<i64>>,
+    pub additional_context: HashMap<String, AdditionalContextEntry>,
+}
+
+/// Admission is not evidence of incorporation, goal completion or hearing.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(export_to = "v2/")]
+pub enum ThreadGoalActivationDisposition {
+    Uncertain { reason: String },
+    Started { turn_id: String },
+    Steered { turn_id: String },
+    NotStarted { reason: String },
+}
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadGoalConditionalActivateResponse {
+    pub goal: ThreadGoal,
+    pub revision: String,
+    pub activation: ThreadGoalActivationDisposition,
+}
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadGoalConditionalSetParams {
+    pub thread_id: String,
+    pub expected_revision: String,
+    #[ts(optional = nullable)]
+    pub origin: Option<ThreadGoalMutationOrigin>,
+    #[ts(optional = nullable)]
+    pub objective: Option<String>,
+    #[ts(optional = nullable)]
+    pub status: Option<ThreadGoalStatus>,
+    #[serde(
+        default,
+        deserialize_with = "crate::protocol::serde_helpers::deserialize_double_option",
+        serialize_with = "crate::protocol::serde_helpers::serialize_double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional = nullable, type = "number | null")]
+    pub token_budget: Option<Option<i64>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadGoalConditionalSetResponse {
+    pub goal: ThreadGoal,
+    pub revision: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadGoalConditionalClearParams {
+    pub thread_id: String,
+    pub expected_revision: String,
+    #[ts(optional = nullable)]
+    pub origin: Option<ThreadGoalMutationOrigin>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadGoalConditionalClearResponse {
+    pub cleared: bool,
+    pub revision: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]

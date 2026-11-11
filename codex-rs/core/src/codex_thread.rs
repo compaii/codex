@@ -488,6 +488,18 @@ impl CodexThread {
             .await
     }
 
+    /// Reserve an internal goal continuation through submission. This is not a
+    /// user input or a goal mutation. A deferred callback must revalidate state.
+    pub fn admit_goal_continuation(
+        &self,
+        on_deferred: Box<dyn FnOnce() + Send>,
+    ) -> Option<Box<dyn Send>> {
+        self.session
+            .services
+            .extensions
+            .admit_goal_continuation(self.session.thread_id, on_deferred)
+    }
+
     /// Starts a regular turn only when the thread is idle.
     ///
     /// Core declines the input without recording or enqueueing it when idle
@@ -687,6 +699,21 @@ impl CodexThread {
             return Err(items);
         }
         self.session.inject_if_running(items).await
+    }
+
+    /// Context-aware internal steering, fenced to the selected regular turn.
+    pub async fn inject_context_for_running_turn(
+        &self,
+        expected_turn: &str,
+        items: Vec<ResponseItem>,
+        context: std::collections::BTreeMap<
+            String,
+            codex_protocol::protocol::AdditionalContextEntry,
+        >,
+    ) -> Option<String> {
+        self.session
+            .inject_context_for_running_turn(expected_turn, items, context)
+            .await
     }
 
     /// Environment selections captured by the active turn, before later settings updates.
@@ -1130,6 +1157,12 @@ impl CodexThread {
             .into_iter()
             .map(Into::into)
             .collect()
+    }
+
+    /// Whether full resolved resume config and startup-owned runtime settings
+    /// are unchanged. Unknown/changed state conservatively requires rebuilding.
+    pub async fn can_reuse_resolved_resume_config(&self, config: &crate::config::Config) -> bool {
+        self.session.can_reuse_resolved_resume_config(config).await
     }
 
     pub async fn config(&self) -> Arc<crate::config::Config> {

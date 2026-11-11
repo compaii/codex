@@ -43,6 +43,7 @@ use codex_api::AgentIdentityTelemetry;
 use codex_api::ApiError;
 use codex_api::AuthProvider;
 use codex_api::Compression;
+use codex_api::InferenceAllowance;
 use codex_api::MemoriesClient as ApiMemoriesClient;
 use codex_api::MemorySummarizeInput as ApiMemorySummarizeInput;
 use codex_api::MemorySummarizeOutput as ApiMemorySummarizeOutput;
@@ -327,6 +328,7 @@ pub struct ModelClient {
 /// contract and can cause routing bugs.
 pub struct ModelClientSession {
     client: ModelClient,
+    inference_allowance: Option<Arc<InferenceAllowance>>,
     websocket_session: WebsocketSession,
     /// Turn state for sticky routing.
     ///
@@ -345,6 +347,7 @@ pub struct ModelClientSession {
 /// Executes HTTP Responses requests without owning a turn's WebSocket state.
 pub(crate) struct ResponsesHttpExecutor<'a> {
     client: &'a ModelClient,
+    inference_allowance: Option<Arc<InferenceAllowance>>,
 }
 
 #[derive(Debug, Clone)]
@@ -753,6 +756,7 @@ impl ModelClient {
         }
         ModelClientSession {
             client: self.clone(),
+            inference_allowance: None,
             websocket_session,
             turn_state: Arc::new(OnceLock::new()),
         }
@@ -1555,6 +1559,14 @@ impl Drop for ModelClientSession {
 }
 
 impl ModelClientSession {
+    /// Attach an already-reserved turn allowance before prewarm or inference.
+    /// The same value remains in force across sampling, auth and HTTP fallback.
+    /// This does not reserve a durable allocation or constrain external tools.
+    pub fn with_inference_allowance(mut self, allowance: Arc<InferenceAllowance>) -> Self {
+        self.inference_allowance = Some(allowance);
+        self
+    }
+
     pub(crate) fn inference_tools_changed(&self, tools: &Arc<[ToolSpec]>) -> bool {
         let previous = self
             .client
@@ -1569,7 +1581,18 @@ impl ModelClientSession {
 
 impl<'a> ResponsesHttpExecutor<'a> {
     pub(crate) fn new(client: &'a ModelClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            inference_allowance: None,
+        }
+    }
+
+    pub(crate) fn with_inference_allowance(
+        mut self,
+        allowance: Option<Arc<InferenceAllowance>>,
+    ) -> Self {
+        self.inference_allowance = allowance;
+        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1942,7 +1965,17 @@ impl ResponsesHttpExecutor<'_> {
                 .client
                 .responses_headers(client_setup.auth.as_ref(), &model_info.slug);
             tracing::Span::current().record("api.path", "/responses");
-            let transport = client_setup.build_api_transport("/responses")?;
+            let transport = if self.inference_allowance.is_some() {
+                let client = codex_login::default_client::create_single_attempt_client_for_route(
+                    &self.client.http_client_factory,
+                    &client_setup.api_provider.url_for_path("/responses"),
+                    ClientRouteClass::Api,
+                )
+                .map_err(std::io::Error::from)?;
+                ReqwestTransport::from_http_client(client)
+            } else {
+                client_setup.build_api_transport("/responses")?
+            };
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
                 client_setup.api_auth.as_ref(),
@@ -2020,12 +2053,15 @@ impl ResponsesHttpExecutor<'_> {
                 request.input = input;
             }
             inference_trace_attempt.record_started(&request);
-            let client = ApiResponsesClient::new(
+            let mut client = ApiResponsesClient::new(
                 transport,
                 client_setup.api_provider,
                 client_setup.api_auth,
             )
             .with_telemetry(Some(request_telemetry), Some(sse_telemetry));
+            if let Some(allowance) = &self.inference_allowance {
+                client = client.with_inference_allowance(Arc::clone(allowance));
+            }
             let stream_result = client.stream_request(request, options).await;
 
             match stream_result {
@@ -2328,6 +2364,41 @@ impl ModelClientSession {
                 inference_trace_attempt.record_started(&ws_request);
             }
 
+            // Include final metadata/framing AND the full logical context even
+            // when the wire payload only appends a small incremental delta.
+            let complete_request_bytes = if self.inference_allowance.is_some() {
+                let mut logical = serde_json::to_value(&ws_request).map_err(|error| {
+                    self.client
+                        .state
+                        .provider
+                        .map_api_error(ApiError::InvalidRequest {
+                            message: error.to_string(),
+                        })
+                })?;
+                logical["input"] = serde_json::to_value(&request.input).map_err(|error| {
+                    self.client
+                        .state
+                        .provider
+                        .map_api_error(ApiError::InvalidRequest {
+                            message: error.to_string(),
+                        })
+                })?;
+                Some(
+                    serde_json::to_vec(&logical)
+                        .map_err(|error| {
+                            self.client
+                                .state
+                                .provider
+                                .map_api_error(ApiError::InvalidRequest {
+                                    message: error.to_string(),
+                                })
+                        })?
+                        .len(),
+                )
+            } else {
+                None
+            };
+
             let websocket_connection =
                 self.websocket_session.connection.as_ref().ok_or_else(|| {
                     self.client.state.provider.map_api_error(ApiError::Stream(
@@ -2349,13 +2420,25 @@ impl ModelClientSession {
                     ),
                 ],
             );
-            let stream_result = websocket_connection
-                .stream_request(
-                    ws_request,
-                    self.websocket_session.connection_reused(),
-                    Some(Arc::clone(&self.turn_state)),
-                )
-                .await;
+            let stream_result = if let Some(allowance) = &self.inference_allowance {
+                websocket_connection
+                    .stream_request_with_allowance(
+                        ws_request,
+                        self.websocket_session.connection_reused(),
+                        Some(Arc::clone(&self.turn_state)),
+                        complete_request_bytes.unwrap_or(usize::MAX),
+                        Arc::clone(allowance),
+                    )
+                    .await
+            } else {
+                websocket_connection
+                    .stream_request(
+                        ws_request,
+                        self.websocket_session.connection_reused(),
+                        Some(Arc::clone(&self.turn_state)),
+                    )
+                    .await
+            };
             if let Some(original_item_ids) = original_item_ids {
                 for (item, original_item_id) in request.input.iter_mut().zip(original_item_ids) {
                     item.set_id(original_item_id);
@@ -2507,6 +2590,13 @@ impl ModelClientSession {
         responses_metadata: &CodexResponsesMetadata,
         inference_trace: &InferenceTraceContext,
     ) -> Result<ResponseStream> {
+        let projected_prompt = crate::turn_inference::project_prompt(
+            prompt,
+            self.inference_allowance.as_ref(),
+            responses_metadata.turn_id.as_deref(),
+        )
+        .await?;
+        let prompt = projected_prompt.as_ref();
         let wire_api = self.client.state.provider.info().wire_api;
         match wire_api {
             WireApi::Responses => {
@@ -2535,6 +2625,7 @@ impl ModelClientSession {
                 }
 
                 ResponsesHttpExecutor::new(&self.client)
+                    .with_inference_allowance(self.inference_allowance.clone())
                     .stream_responses_http(
                         &self.turn_state,
                         /*expected_auth_owner*/ None,

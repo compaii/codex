@@ -1339,6 +1339,31 @@ fn insert_definition(
             return Ok(());
         }
 
+        // Schemars emits root-only title/$schema metadata when a request is
+        // exported itself, and omits it when the identical request is nested.
+        // Accept only that exact representational difference; real definitions
+        // (including constraints/descriptions and conflicting titles) still collide.
+        let mut existing_body = existing.clone();
+        let mut candidate_body = schema.clone();
+        if strip_matching_root_metadata(&mut existing_body, &name)
+            && strip_matching_root_metadata(&mut candidate_body, &name)
+            && existing_body == candidate_body
+        {
+            let mut canonical = existing.clone();
+            for key in ["title", "$schema"] {
+                if canonical.get(key).is_none()
+                    && let Some(value) = schema.get(key)
+                {
+                    canonical
+                        .as_object_mut()
+                        .context("canonical schema must be an object")?
+                        .insert(key.into(), value.clone());
+                }
+            }
+            definitions.insert(name, canonical);
+            return Ok(());
+        }
+
         let existing_title = existing
             .get("title")
             .and_then(Value::as_str)
@@ -1354,6 +1379,24 @@ fn insert_definition(
 
     definitions.insert(name, schema);
     Ok(())
+}
+
+fn strip_matching_root_metadata(value: &mut Value, name: &str) -> bool {
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+    if object
+        .get("title")
+        .is_some_and(|title| title.as_str() != Some(name))
+        || object
+            .get("$schema")
+            .is_some_and(|draft| draft.as_str() != Some("http://json-schema.org/draft-07/schema#"))
+    {
+        return false;
+    }
+    object.remove("title");
+    object.remove("$schema");
+    true
 }
 
 fn write_json_schema_with_return<T>(out_dir: &Path, name: &str) -> Result<GeneratedSchema>
@@ -2182,6 +2225,25 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
+    fn root_metadata_does_not_hide_real_definition_collisions() -> Result<()> {
+        let body = serde_json::json!({"type":"object","properties":{"input":{"type":"string"}}});
+        let mut root = body.clone();
+        root["title"] = "Request".into();
+        root["$schema"] = "http://json-schema.org/draft-07/schema#".into();
+        let mut definitions = Map::new();
+        insert_definition(&mut definitions, "Request".into(), root.clone(), "test")?;
+        insert_definition(&mut definitions, "Request".into(), body.clone(), "test")?;
+        assert_eq!(definitions["Request"], root);
+        let mut changed = body.clone();
+        changed["properties"]["input"]["maxLength"] = 3.into();
+        assert!(insert_definition(&mut definitions, "Request".into(), changed, "test").is_err());
+        let mut renamed = body;
+        renamed["title"] = "Other".into();
+        assert!(insert_definition(&mut definitions, "Request".into(), renamed, "test").is_err());
+        Ok(())
+    }
+
+    #[test]
     fn generated_ts_optional_nullable_fields_only_in_params() -> Result<()> {
         // Assert that "?: T | null" only appears in generated *Params types.
         let fixture_tree = read_schema_fixture_subtree(&schema_root()?, "typescript")?;
@@ -2920,6 +2982,13 @@ permissionProfile?: string | null};
         let output_dir = std::env::temp_dir().join(format!("codex_schema_{}", Uuid::now_v7()));
         fs::create_dir(&output_dir)?;
         generate_json_with_experimental(&output_dir, /*experimental_api*/ false)?;
+
+        let ordinary = read_json_value(&output_dir.join("v2/TurnStartParams.json"))?;
+        let bounded = read_json_value(&output_dir.join("v2/TurnStartBoundedIfIdleParams.json"))?;
+        assert_eq!(
+            ordinary["properties"], bounded["definitions"]["TurnStartParams"]["properties"],
+            "nested admission must preserve stable experimental-field filtering"
+        );
 
         let thread_start_json =
             fs::read_to_string(output_dir.join("v2").join("ThreadStartParams.json"))?;

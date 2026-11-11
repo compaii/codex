@@ -18,8 +18,6 @@ use codex_core_plugins::ResolvedPluginMetricsOperation;
 use codex_core_plugins::TrustedPluginRoots;
 use codex_exec_server::ExecutorFileSystem;
 use codex_extension_api::SelectedPluginSnapshot;
-use codex_file_system::EnvironmentAccess;
-use codex_file_system::FileSystemEnvironmentAccessor;
 use codex_file_system::FileSystemSandboxContext;
 use codex_model_provider::SharedModelProvider;
 use codex_protocol::SessionId;
@@ -68,6 +66,7 @@ pub(crate) struct ShellSnapshotCacheKey {
 #[derive(Clone)]
 pub(crate) struct TurnEnvironment {
     pub(crate) selection: TurnEnvironmentSelection,
+    permission_ceiling: Option<PermissionProfile>,
     pub(crate) config_origin: EnvironmentConfigOrigin,
     pub(crate) environment: Arc<Environment>,
     /// Cached from the selected executor; `None` means it did not report one.
@@ -93,6 +92,7 @@ impl TurnEnvironment {
         debug_assert!(matches!(selection.config, EnvironmentConfigState::Ready(_)));
         Self {
             selection,
+            permission_ceiling: None,
             config_origin,
             environment,
             user_home_dir: None,
@@ -220,32 +220,70 @@ impl TurnEnvironment {
         self.config().permission_profile.permission_profile()
     }
 
-    /// Borrows this snapshot's filesystem using its permissions and any additional grants.
-    pub(crate) fn fs_accessor(
+    pub(crate) fn permission_ceiling(&self) -> Option<&PermissionProfile> {
+        self.permission_ceiling.as_ref()
+    }
+
+    pub(crate) fn restrict_permissions(&mut self, ceiling: &PermissionProfile) -> CodexResult<()> {
+        if self.environment.is_remote() {
+            return Err(CodexErr::InvalidRequest(
+                "host permission ceiling requires a qualified local executor".into(),
+            ));
+        }
+        let cwd = self.cwd().to_abs_path()?;
+        let roots = self
+            .workspace_roots()
+            .iter()
+            .map(PathUri::to_abs_path)
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let authority = self
+            .permission_profile()
+            .clone()
+            .materialize_project_roots_with_workspace_roots(&roots);
+        let requested = ceiling
+            .clone()
+            .materialize_project_roots_with_workspace_roots(&roots);
+        let permissions =
+            codex_protocol::intersect_effective_permission_profiles(&authority, &requested, &cwd)
+                .map_err(|error| {
+                CodexErr::InvalidRequest(format!("cannot enforce host permission ceiling: {error}"))
+            })?;
+        let EnvironmentConfigState::Ready(config) = &mut self.selection.config else {
+            unreachable!("a ready environment has resolved configuration");
+        };
+        config.permission_profile =
+            codex_protocol::models::PermissionProfileSnapshot::legacy(permissions.clone());
+        self.permission_ceiling = Some(permissions);
+        self.shell_snapshot = futures::future::ready(None).boxed().shared();
+        self.shell_snapshot_builder = None;
+        self.shell_snapshot_cache = Arc::default();
+        Ok(())
+    }
+
+    pub(crate) fn cap_permissions(
         &self,
-        additional_permissions: Option<AdditionalPermissionProfile>,
-    ) -> impl EnvironmentAccess + '_ {
-        FileSystemEnvironmentAccessor::new(
-            self.environment.filesystem_ref(),
-            self.sandbox_context(additional_permissions),
-        )
+        effective: PermissionProfile,
+        cwd: &PathUri,
+    ) -> CodexResult<PermissionProfile> {
+        match &self.permission_ceiling {
+            None => Ok(effective),
+            Some(ceiling) => codex_protocol::intersect_effective_permission_profiles(
+                ceiling,
+                &effective,
+                &cwd.to_abs_path()?,
+            )
+            .map_err(|error| {
+                CodexErr::InvalidRequest(format!("cannot enforce host permission ceiling: {error}"))
+            }),
+        }
     }
 
     /// Sandbox context for this environment, including any additional permission grants.
-    pub(crate) fn sandbox_context(
-        &self,
-        additional_permissions: Option<AdditionalPermissionProfile>,
-    ) -> FileSystemSandboxContext {
+    pub(crate) fn sandbox_context(&self) -> FileSystemSandboxContext {
         let config = self.config();
-        // Grant-adjusted permissions take precedence over the environment's baseline;
-        // paths and sandbox backend settings remain environment-owned.
-        let permissions = effective_permission_profile(
-            self.permission_profile(),
-            additional_permissions.as_ref(),
-        );
         FileSystemSandboxContext {
             sandbox_override: SandboxOverride::NoOverride,
-            permissions,
+            permissions: self.permission_profile().clone(),
             cwd: self.cwd().clone(),
             workspace_roots: self.workspace_roots().to_vec(),
             user_home_dir: self.user_home_dir.clone(),
@@ -258,6 +296,22 @@ impl TurnEnvironment {
             windows_sandbox_proxy_settings_mode: None,
             use_legacy_landlock: config.use_legacy_landlock,
         }
+    }
+
+    /// Apply grants, then reapply the immutable execution ceiling.
+    pub(crate) fn sandbox_context_with_permissions(
+        &self,
+        additional_permissions: Option<AdditionalPermissionProfile>,
+    ) -> CodexResult<FileSystemSandboxContext> {
+        let mut context = self.sandbox_context();
+        context.permissions = self.cap_permissions(
+            effective_permission_profile(
+                self.permission_profile(),
+                additional_permissions.as_ref(),
+            ),
+            self.cwd(),
+        )?;
+        Ok(context)
     }
 
     pub(crate) fn windows_sandbox_selection_for_turn_metadata(
@@ -315,9 +369,18 @@ impl std::fmt::Debug for TurnEnvironment {
 /// Request options for one turn, separate from persistent thread settings.
 #[derive(Default)]
 pub(crate) struct NewTurnContextOptions {
+    pub(crate) permission_ceiling: Option<PermissionProfile>,
+    pub(crate) tool_ceiling: Option<Vec<codex_protocol::ToolName>>,
     pub(crate) final_output_json_schema: Option<Value>,
     pub(crate) cyber_access_program: Option<CyberAccessProgram>,
 }
+
+/// Private attachment: extensions cannot replace this host-captured ceiling.
+#[derive(Clone, Debug)]
+struct TurnToolCeiling(codex_extension_api::ToolPolicy);
+
+#[derive(Clone, Debug)]
+struct TurnPermissionCeiling(Arc<PermissionProfile>);
 
 /// The context needed for a single turn of the thread.
 #[derive(Debug)]
@@ -400,6 +463,36 @@ enum TurnContextBuildMode {
 }
 
 impl TurnContext {
+    pub(crate) fn permission_ceiling(&self) -> Option<Arc<PermissionProfile>> {
+        self.extension_data
+            .get::<TurnPermissionCeiling>()
+            .map(|ceiling| Arc::clone(&ceiling.0))
+    }
+
+    pub(crate) fn restrict_environments(
+        &self,
+        environments: TurnEnvironmentSnapshot,
+    ) -> CodexResult<TurnEnvironmentSnapshot> {
+        match self.permission_ceiling() {
+            None => Ok(environments),
+            Some(ceiling) => environments.restrict_permissions(&ceiling),
+        }
+    }
+
+    pub(crate) fn has_tool_ceiling(&self) -> bool {
+        self.extension_data.get::<TurnToolCeiling>().is_some()
+    }
+
+    pub(crate) fn effective_tool_policy(
+        &self,
+        session_policy: &Arc<codex_extension_api::ToolPolicy>,
+    ) -> Arc<codex_extension_api::ToolPolicy> {
+        match self.extension_data.get::<TurnToolCeiling>() {
+            Some(ceiling) => Arc::new(session_policy.intersect(&ceiling.0)),
+            None => Arc::clone(session_policy),
+        }
+    }
+
     /// Returns the resolved causal root for this admitted turn.
     pub(crate) fn root_turn_id(&self) -> String {
         self.turn_metadata_state
@@ -419,6 +512,12 @@ impl TurnContext {
         let session_telemetry = step_settings.telemetry(&self.session_telemetry);
         let extension_data = Arc::new(codex_extension_api::ExtensionData::new(sub_id.clone()));
         extension_data.insert(self.skills_snapshot().as_ref().clone());
+        if let Some(ceiling) = self.extension_data.get::<TurnToolCeiling>() {
+            extension_data.insert_arc(ceiling);
+        }
+        if let Some(ceiling) = self.extension_data.get::<TurnPermissionCeiling>() {
+            extension_data.insert_arc(ceiling);
+        }
 
         Self {
             sub_id,
@@ -530,6 +629,10 @@ impl TurnContext {
 
     pub(crate) fn attribution(&self) -> codex_history::TurnAttribution {
         codex_history::TurnAttribution {
+            inference_allowance: self
+                .extension_data
+                .get::<codex_protocol::turn_input::TurnInferenceAllowance>()
+                .map(|spec| Box::new(spec.as_ref().clone())),
             turn_id: self.sub_id.clone(),
             turn_trigger: self.turn_metadata_state.current_turn_trigger(),
             parent_turn_id: self.turn_metadata_state.parent_turn_id(),
@@ -1222,7 +1325,7 @@ impl Session {
         let turn_environments = self.activate_turn_environments(&configuration).await;
         let turn_context = self
             .new_turn_from_configuration(sub_id, configuration, turn_environments, options)
-            .await;
+            .await?;
         Ok(Some((turn_context, commit.snapshot)))
     }
 
@@ -1233,7 +1336,7 @@ impl Session {
         session_configuration: SessionConfiguration,
         turn_environments: TurnEnvironmentSnapshot,
         options: NewTurnContextOptions,
-    ) -> Arc<TurnContext> {
+    ) -> CodexResult<Arc<TurnContext>> {
         // Keep context construction out of the enclosing turn and history futures.
         Box::pin(self.new_turn_context_from_configuration(
             sub_id,
@@ -1246,6 +1349,10 @@ impl Session {
         .await
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "default-only context construction cannot fail host permission qualification"
+    )]
     async fn new_startup_prewarm_turn_from_configuration(
         &self,
         sub_id: String,
@@ -1261,6 +1368,7 @@ impl Session {
             GitEnrichmentPolicy::Skip,
         ))
         .await
+        .expect("default turn construction has no host permission ceiling")
     }
 
     #[instrument(name = "turn_context.build", level = "trace", skip_all, fields(?build_mode))]
@@ -1272,7 +1380,11 @@ impl Session {
         options: NewTurnContextOptions,
         build_mode: TurnContextBuildMode,
         git_enrichment_policy: GitEnrichmentPolicy,
-    ) -> Arc<TurnContext> {
+    ) -> CodexResult<Arc<TurnContext>> {
+        let turn_environments = match options.permission_ceiling.as_ref() {
+            Some(ceiling) => turn_environments.restrict_permissions(ceiling)?,
+            None => turn_environments,
+        };
         let primary_turn_environment = turn_environments.primary();
         let per_turn_config =
             self.build_per_turn_config(&session_configuration, turn_environments.local_selection());
@@ -1386,6 +1498,21 @@ impl Session {
         );
         turn_context.realtime_active = self.conversation.running_state().await.is_some();
 
+        if let Some(ceiling) = options.permission_ceiling {
+            turn_context
+                .extension_data
+                .insert(TurnPermissionCeiling(Arc::new(ceiling)));
+        }
+        if let Some(allowed_tools) = options.tool_ceiling {
+            turn_context
+                .extension_data
+                .insert(TurnToolCeiling(codex_extension_api::ToolPolicy {
+                    allowed_tools: Some(allowed_tools),
+                    require_managed_sandbox: true,
+                    require_unified_exec: true,
+                    expose_additional_permissions: false,
+                }));
+        }
         turn_context.final_output_json_schema = options.final_output_json_schema;
         turn_context.cyber_access_program =
             cyber_access_program::for_provider(&turn_context.config, options.cyber_access_program);
@@ -1404,7 +1531,7 @@ impl Session {
                 .turn_metadata_state
                 .spawn_git_enrichment_task(Arc::clone(&self.services.git_root_discovery));
         }
-        turn_context
+        Ok(turn_context)
     }
 
     pub(crate) async fn maybe_emit_model_warnings_for_turn(&self, tc: &TurnContext) {
@@ -1456,6 +1583,10 @@ impl Session {
             .await
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "default-only context construction cannot fail host permission qualification"
+    )]
     async fn new_default_turn_for(&self, build_mode: TurnContextBuildMode) -> Arc<TurnContext> {
         let session_configuration = self.default_turn_configuration().await;
         let turn_environments = self.services.turn_environments.snapshot().await;
@@ -1468,6 +1599,7 @@ impl Session {
             self.git_enrichment_policy,
         ))
         .await
+        .expect("default turn construction has no host permission ceiling")
     }
 
     /// Prepares new work on the saved environments; context-only callers keep the current ones.
@@ -1475,7 +1607,7 @@ impl Session {
         &self,
         sub_id: String,
         options: NewTurnContextOptions,
-    ) -> Arc<TurnContext> {
+    ) -> CodexResult<Arc<TurnContext>> {
         let session_configuration = self.default_turn_configuration().await;
         self.new_turn_with_configuration(sub_id, session_configuration, options)
             .await
@@ -1487,7 +1619,7 @@ impl Session {
         sub_id: String,
         session_configuration: SessionConfiguration,
         options: NewTurnContextOptions,
-    ) -> Arc<TurnContext> {
+    ) -> CodexResult<Arc<TurnContext>> {
         let turn_environments = self
             .activate_turn_environments(&session_configuration)
             .await;

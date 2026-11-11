@@ -5,6 +5,7 @@ use codex_app_server_protocol::ThreadGuardianAssessment;
 use codex_app_server_protocol::ThreadGuardianReviewParams;
 use codex_app_server_protocol::ThreadGuardianReviewResponse;
 use codex_app_server_protocol::ThreadItem;
+use codex_core::StartIfIdleSubmission;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
@@ -93,7 +94,7 @@ pub(crate) struct TurnRequestProcessor {
     turn_cost_worker: Option<crate::turn_cost_worker::TurnCostWorkerHandle>,
 }
 
-fn map_additional_context(
+pub(super) fn map_additional_context(
     additional_context: Option<HashMap<String, AdditionalContextEntry>>,
 ) -> BTreeMap<String, CoreAdditionalContextEntry> {
     additional_context
@@ -172,6 +173,7 @@ impl TurnRequestProcessor {
         params: TurnStartParams,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
+        only_if_idle: bool,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         validate_user_input_image_urls(&params.input)?;
         self.turn_start_inner(
@@ -179,9 +181,66 @@ impl TurnRequestProcessor {
             params,
             app_server_client_name,
             app_server_client_version,
+            only_if_idle,
+            None,
+            None,
+            false,
+            None,
         )
         .await
-        .map(|response| Some(response.into()))
+        .map(|response| {
+            Some(if only_if_idle {
+                ClientResponsePayload::TurnStartIfIdle(response)
+            } else {
+                response.into()
+            })
+        })
+    }
+
+    pub(crate) async fn turn_start_bounded_if_idle(
+        &self,
+        request_id: ConnectionRequestId,
+        params: codex_app_server_protocol::TurnStartBoundedIfIdleParams,
+        app_server_client_name: Option<String>,
+        app_server_client_version: Option<String>,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        validate_user_input_image_urls(&params.turn.input)?;
+        if let Some(cycle_id) = &params.provider_reservation_cycle_id {
+            let valid = uuid::Uuid::parse_str(cycle_id).is_ok_and(|id| id.to_string() == *cycle_id);
+            if !valid {
+                return Err(invalid_request(
+                    "canonical provider reservation cycle UUID required",
+                ));
+            }
+        }
+        if params.provider_usage_observations == Some(true)
+            && params.provider_reservation_cycle_id.is_none()
+        {
+            return Err(invalid_request(
+                "Usage observations require the existing owner reservation cycle",
+            ));
+        }
+        if params.provider_max_output_tokens == Some(0)
+            || (params.provider_max_output_tokens.is_some()
+                && params.provider_reservation_cycle_id.is_none())
+        {
+            return Err(invalid_request(
+                "Positive owner output ceiling requires its reservation cycle",
+            ));
+        }
+        self.turn_start_inner(
+            request_id,
+            params.turn,
+            app_server_client_name,
+            app_server_client_version,
+            true,
+            Some(params.allowance),
+            params.provider_reservation_cycle_id,
+            params.provider_usage_observations.unwrap_or(false),
+            params.provider_max_output_tokens,
+        )
+        .await
+        .map(|response| Some(ClientResponsePayload::TurnStartBoundedIfIdle(response)))
     }
 
     pub(crate) async fn thread_guardian_review(
@@ -543,12 +602,18 @@ impl TurnRequestProcessor {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn turn_start_inner(
         &self,
         request_id: ConnectionRequestId,
         params: TurnStartParams,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
+        only_if_idle: bool,
+        inference_allowance: Option<codex_protocol::turn_input::TurnInferenceAllowance>,
+        provider_reservation_cycle_id: Option<String>,
+        provider_usage_observations: bool,
+        provider_max_output_tokens: Option<u32>,
     ) -> Result<TurnStartResponse, JSONRPCErrorError> {
         let (thread_id, thread) =
             self.load_thread(&params.thread_id)
@@ -610,15 +675,20 @@ impl TurnRequestProcessor {
             .inspect_err(|error| {
                 self.track_error_response(&request_id, error, /*error_type*/ None);
             })?;
-        Self::set_app_server_client_info(
-            thread.as_ref(),
-            app_server_client_name,
-            app_server_client_version,
-        )
-        .await
-        .inspect_err(|error| {
-            self.track_error_response(&request_id, error, /*error_type*/ None);
-        })?;
+        // An idle-only refusal must not change an active client's MCP
+        // elicitation policy or sticky client identity. Preserve that existing
+        // thread configuration even when the requesting connection differs.
+        if !only_if_idle {
+            Self::set_app_server_client_info(
+                thread.as_ref(),
+                app_server_client_name,
+                app_server_client_version,
+            )
+            .await
+            .inspect_err(|error| {
+                self.track_error_response(&request_id, error, /*error_type*/ None);
+            })?;
+        }
         let runtime_workspace_roots = params
             .runtime_workspace_roots
             .map(resolve_runtime_workspace_roots);
@@ -670,7 +740,11 @@ impl TurnRequestProcessor {
             .build_thread_settings_overrides(
                 thread.as_ref(),
                 ThreadSettingsBuildParams {
-                    method: "turn/start",
+                    method: if only_if_idle {
+                        "turn/startIfIdle"
+                    } else {
+                        "turn/start"
+                    },
                     disabled_plugin_ids: params.disabled_plugin_ids,
                     environment_override,
                     approval_policy: params.approval_policy,
@@ -687,33 +761,67 @@ impl TurnRequestProcessor {
             )
             .await?;
 
-        let submission = thread
-            .start_or_steer_turn(
-                TurnInputRequest::new(input)
-                    .with_thread_settings(thread_settings)
-                    .on_start(TurnStartOptions {
-                        turn_trigger: params.turn_trigger,
-                        parent_turn_id: params.parent_turn_id,
-                        initiating_agent_path: None,
-                        root_turn_id: params.root_turn_id,
-                        final_output_json_schema: params.output_schema,
-                        service_tier: params.service_tier_for_turn,
-                        cyber_access_program: params.cyber_access_program.map(Into::into),
-                    })
-                    .with_additional_context(additional_context)
-                    .with_responses_metadata(params.responsesapi_client_metadata)
-                    .with_responses_metadata_patch(params.responsesapi_client_metadata_patch)
-                    .with_trace(self.request_trace_context(&request_id).await),
-            )
-            .await
-            .map_err(|err| {
-                let error = match err.details() {
-                    CodexErrorDetails::InvalidRequest(message) => invalid_request(message.clone()),
-                    _ => internal_error(format!("failed to submit turn input: {err}")),
-                };
-                self.track_error_response(&request_id, &error, /*error_type*/ None);
-                error
-            })?;
+        let reservation = provider_reservation_cycle_id.map(|cycle_id| {
+            Arc::new(crate::provider_reservation::OwnerProviderReservation {
+                outgoing: self.outgoing.clone(),
+                owner: request_id.connection_id,
+                thread_id,
+                cycle_id,
+                usage_observations: provider_usage_observations,
+                max_output_tokens: provider_max_output_tokens,
+                deadline_unix_ms: inference_allowance
+                    .as_ref()
+                    .expect("bounded reservation start")
+                    .deadline_unix_ms,
+            }) as Arc<dyn codex_api::ProviderAttemptGate>
+        });
+        let request = TurnInputRequest::new(input)
+            .with_thread_settings(thread_settings)
+            .on_start(TurnStartOptions {
+                permission_ceiling: None,
+                tool_ceiling: None,
+                inference_allowance,
+                provider_attempt_gate: reservation
+                    .map(codex_protocol::provider_attempt::ProviderAttemptGateSelection),
+                turn_trigger: params.turn_trigger,
+                parent_turn_id: params.parent_turn_id,
+                initiating_agent_path: None,
+                root_turn_id: params.root_turn_id,
+                final_output_json_schema: params.output_schema,
+                service_tier: params.service_tier_for_turn,
+                cyber_access_program: params.cyber_access_program.map(Into::into),
+            })
+            .with_additional_context(additional_context)
+            .with_responses_metadata(params.responsesapi_client_metadata)
+            .with_responses_metadata_patch(params.responsesapi_client_metadata_patch)
+            .with_trace(self.request_trace_context(&request_id).await);
+        let submission = if only_if_idle {
+            thread
+                .start_turn_if_idle(request)
+                .await
+                .map(|submission| match submission {
+                    StartIfIdleSubmission::Started {
+                        turn_id,
+                        root_turn_id,
+                    } => TurnInputSubmission::Started {
+                        turn_id,
+                        root_turn_id,
+                    },
+                    StartIfIdleSubmission::NotSubmitted { reason } => {
+                        TurnInputSubmission::NotSubmitted { reason }
+                    }
+                })
+        } else {
+            thread.start_or_steer_turn(request).await
+        }
+        .map_err(|err| {
+            let error = match err.details() {
+                CodexErrorDetails::InvalidRequest(message) => invalid_request(message.clone()),
+                _ => internal_error(format!("failed to submit turn input: {err}")),
+            };
+            self.track_error_response(&request_id, &error, /*error_type*/ None);
+            error
+        })?;
         let (turn_id, root_turn_id, started) = match submission {
             TurnInputSubmission::Started {
                 turn_id,
@@ -726,6 +834,17 @@ impl TurnRequestProcessor {
             TurnInputSubmission::NotSubmitted { reason } => {
                 let error = if reason == NotSubmittedReason::ServerDraining {
                     crate::error_code::server_draining_error()
+                } else if only_if_idle {
+                    let mut error =
+                        invalid_request(format!("idle-only turn was not submitted: {reason:?}"));
+                    let reason = match reason {
+                        NotSubmittedReason::NotIdle => "notIdle",
+                        NotSubmittedReason::PendingTriggerTurn => "pendingTriggerTurn",
+                        NotSubmittedReason::PlanMode => "planMode",
+                        _ => "notSubmitted",
+                    };
+                    error.data = Some(serde_json::json!({"reason":reason,"submitted":false}));
+                    error
                 } else {
                     internal_error(format!("failed to submit turn input: {reason:?}"))
                 };

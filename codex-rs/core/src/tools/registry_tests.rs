@@ -887,3 +887,221 @@ fn test_invocation(
         },
     }
 }
+
+#[tokio::test]
+async fn host_tool_ceiling_rejects_cached_registry_before_handler_and_hooks() {
+    let (mut session, _) = crate::session::tests::make_session_and_context().await;
+    let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+    builder.tool_lifecycle_contributor(Arc::new(ToolLifecycleRecorder {
+        records: Arc::clone(&records),
+    }));
+    session.services.extensions = Arc::new(builder.build());
+    let session = Arc::new(session);
+    let denied_tool = codex_tools::ToolName::plain("cached_human_tool");
+    let registry = ToolRegistry::from_tools([Arc::new(TestHandler {
+        tool_name: denied_tool.clone(),
+    }) as Arc<dyn CoreToolRuntime>]);
+    let turn = session
+        .new_turn_with_default_settings(
+            "restricted-dispatch".into(),
+            crate::session::turn_context::NewTurnContextOptions {
+                tool_ceiling: Some(vec![]),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("build turn context");
+    let result = registry
+        .dispatch_any_with_state(
+            test_invocation(Arc::clone(&session), turn, "blocked-call", denied_tool),
+            None,
+        )
+        .await;
+    assert_eq!(
+        result.err().expect("deny cached tool").to_string(),
+        "tool is outside this turn's host ceiling"
+    );
+    assert!(records.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn host_tool_ceiling_rejects_retained_context_without_active_owner() {
+    let (session, _) = crate::session::tests::make_session_and_context().await;
+    let session = Arc::new(session);
+    let tool = codex_tools::ToolName::plain("allowed_tool");
+    let registry = ToolRegistry::from_tools([Arc::new(TestHandler {
+        tool_name: tool.clone(),
+    }) as Arc<dyn CoreToolRuntime>]);
+    let turn = session
+        .new_turn_with_default_settings(
+            "retired-restricted-dispatch".into(),
+            crate::session::turn_context::NewTurnContextOptions {
+                tool_ceiling: Some(vec![tool.clone()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("build turn context");
+    let result = registry
+        .dispatch_any_with_state(test_invocation(session, turn, "retained-call", tool), None)
+        .await;
+    assert_eq!(
+        result.err().expect("deny retired authority").to_string(),
+        "retained tool context is not the active restricted turn"
+    );
+}
+
+struct HostCeilingWaitingTask;
+impl crate::tasks::SessionTask for HostCeilingWaitingTask {
+    fn kind(&self) -> crate::state::TaskKind {
+        crate::state::TaskKind::Regular
+    }
+    fn span_name(&self) -> &'static str {
+        "host_ceiling_test"
+    }
+    async fn run(
+        self: Arc<Self>,
+        _: Arc<Session>,
+        _: Arc<crate::session::turn_context::TurnContext>,
+        _: Vec<crate::session::TurnInput>,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> crate::tasks::SessionTaskResult {
+        cancellation.cancelled().await;
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn host_tool_ceiling_allows_current_owner_but_rejects_older_human_context() {
+    let (session, old_turn, _rx) = crate::session::tests::make_session_and_context_with_rx().await;
+    let tool = codex_tools::ToolName::plain("allowed_tool");
+    let registry = ToolRegistry::from_tools([Arc::new(TestHandler {
+        tool_name: tool.clone(),
+    }) as Arc<dyn CoreToolRuntime>]);
+    let turn = session
+        .new_turn_with_default_settings(
+            "current-restricted-owner".into(),
+            crate::session::turn_context::NewTurnContextOptions {
+                tool_ceiling: Some(vec![tool.clone()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("build turn context");
+    session
+        .spawn_task(Arc::clone(&turn), Vec::new(), HostCeilingWaitingTask)
+        .await;
+    let allowed = registry
+        .dispatch_any_with_state(
+            test_invocation(Arc::clone(&session), turn, "owned-call", tool.clone()),
+            None,
+        )
+        .await;
+    assert!(allowed.is_ok(), "current owner must retain allowed tools");
+    let stale = registry
+        .dispatch_any_with_state(
+            test_invocation(Arc::clone(&session), old_turn, "old-human-call", tool),
+            None,
+        )
+        .await;
+    assert_eq!(
+        stale
+            .err()
+            .expect("deny earlier human authority")
+            .to_string(),
+        "retained tool context is not the active restricted turn"
+    );
+    session
+        .abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted)
+        .await;
+}
+
+#[tokio::test]
+async fn host_permission_ceiling_restricts_a_runtime_resolved_broader_environment() {
+    use codex_protocol::models::PermissionProfile;
+    use codex_protocol::models::PermissionProfileSnapshot;
+    struct Runtime {
+        environment: Arc<crate::session::turn_context::TurnEnvironment>,
+        observed: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl ToolExecutor<ToolInvocation> for Runtime {
+        fn tool_name(&self) -> codex_tools::ToolName {
+            codex_tools::ToolName::plain("inspect_permissions")
+        }
+        fn spec(&self) -> codex_tools::ToolSpec {
+            test_spec(&self.tool_name())
+        }
+        fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+        where
+            ToolInvocation: 'a,
+        {
+            Box::pin(async move {
+                let ToolEnvironments::Arguments(environments) = &invocation.environments else {
+                    panic!("resolved environment");
+                };
+                let profile = environments[0].1.permission_profile();
+                assert!(matches!(profile, PermissionProfile::Managed { .. }));
+                assert!(
+                    !profile
+                        .file_system_sandbox_policy()
+                        .has_full_disk_write_access()
+                );
+                self.observed.store(true, Ordering::SeqCst);
+                TestHandler {
+                    tool_name: self.tool_name(),
+                }
+                .handle(invocation)
+                .await
+            })
+        }
+    }
+    impl CoreToolRuntime for Runtime {
+        fn environments_for_input(
+            &self,
+            _: &ToolInvocation,
+        ) -> Result<ToolEnvironments, FunctionCallError> {
+            Ok(ToolEnvironments::single_executor(&self.environment))
+        }
+    }
+    let (session, original, _rx) = crate::session::tests::make_session_and_context_with_rx().await;
+    let mut broader = original
+        .initial_environments
+        .primary()
+        .expect("environment")
+        .clone();
+    broader.config_mut().permission_profile =
+        PermissionProfileSnapshot::legacy(PermissionProfile::Disabled);
+    let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let runtime = Arc::new(Runtime {
+        environment: Arc::new(broader),
+        observed: Arc::clone(&observed),
+    });
+    let name = runtime.tool_name();
+    let registry = ToolRegistry::from_tools([runtime as Arc<dyn CoreToolRuntime>]);
+    let turn = session
+        .new_turn_with_default_settings(
+            "restricted-resolved-environment".into(),
+            crate::session::turn_context::NewTurnContextOptions {
+                permission_ceiling: Some(PermissionProfile::read_only()),
+                tool_ceiling: Some(vec![name.clone()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("restricted context");
+    session
+        .spawn_task(Arc::clone(&turn), Vec::new(), HostCeilingWaitingTask)
+        .await;
+    let result = registry
+        .dispatch_any_with_state(
+            test_invocation(Arc::clone(&session), turn, "resolved-environment", name),
+            None,
+        )
+        .await;
+    assert!(result.is_ok());
+    assert!(observed.load(Ordering::SeqCst));
+    session
+        .abort_all_tasks(codex_protocol::protocol::TurnAbortReason::Interrupted)
+        .await;
+}

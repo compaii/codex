@@ -235,9 +235,7 @@ impl Session {
             let environment = step_context.environments.primary();
             let sandbox = environment
                 .filter(|environment| environment.environment.is_remote())
-                .map(|environment| {
-                    environment.sandbox_context(/*additional_permissions*/ None)
-                });
+                .map(super::turn_context::TurnEnvironment::sandbox_context);
             let paths = sandbox
                 .as_ref()
                 .map(FileSystemSandboxContext::policy_context);
