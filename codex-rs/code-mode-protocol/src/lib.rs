@@ -44,6 +44,8 @@ pub use runtime::WaitRequest;
 pub use runtime::WaitToPendingOutcome;
 pub use runtime::WaitToPendingRequest;
 pub use session::CellId;
+pub use session::CodeModeHostOptions;
+pub use session::CodeModeHostSandbox;
 pub use session::CodeModeOutputTruncation;
 pub use session::CodeModeSession;
 pub use session::CodeModeSessionCellExecutionLimits;

@@ -160,7 +160,7 @@ impl CodeModeService {
             broker: Arc::clone(&self.dispatch_broker),
             step_context,
         });
-        self.session_for_turn(&delegate.step_context.turn)
+        self.session_for_turn(&delegate.step_context)
             .await?
             .execute(request, delegate, preempt)
             .await
