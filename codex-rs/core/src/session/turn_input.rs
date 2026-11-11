@@ -36,6 +36,7 @@ use codex_history::UserInputOrigin;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AdditionalContextEntry;
 use codex_protocol::protocol::CodexErrorInfo;
@@ -117,8 +118,18 @@ impl PreparedTurnInputSettings {
                 "provider reservation requires a finite allowance".into(),
             ));
         }
-        if let Some(tools) = &start_options.tool_ceiling {
-            if start_options.inference_allowance.is_none()
+        if let Some(ceiling) = &start_options.permission_ceiling
+            && (start_options.inference_allowance.is_none()
+                || start_options.tool_ceiling.is_none()
+                || !matches!(ceiling, PermissionProfile::Managed { .. })
+                || ceiling
+                    .file_system_sandbox_policy()
+                    .has_full_disk_write_access())
+        {
+            return Err(CodexErr::InvalidRequest("host permission ceiling requires managed restrictive permissions, a finite allowance and explicit tools".into()));
+        }
+        if let Some(tools) = &start_options.tool_ceiling
+            && (start_options.inference_allowance.is_none()
                 || tools.len() > 256
                 || tools.iter().any(|tool| {
                     tool.name.is_empty()
@@ -127,13 +138,11 @@ impl PreparedTurnInputSettings {
                         || tool.namespace.as_ref().is_some_and(|namespace| {
                             namespace.len() > 200 || namespace.chars().any(char::is_control)
                         })
-                })
-            {
-                return Err(CodexErr::InvalidRequest(
-                    "bounded host tool ceiling requires a finite allowance and bounded names"
-                        .into(),
-                ));
-            }
+                }))
+        {
+            return Err(CodexErr::InvalidRequest(
+                "bounded host tool ceiling requires a finite allowance and bounded names".into(),
+            ));
         }
         let inference_allowance = start_options
             .inference_allowance
@@ -178,6 +187,7 @@ impl PreparedTurnInputSettings {
         kind: TurnStartKind,
     ) -> CodexResult<Option<Arc<TurnContext>>> {
         let TurnStartOptions {
+            permission_ceiling,
             tool_ceiling,
             inference_allowance: inference_spec,
             provider_attempt_gate,
@@ -199,41 +209,42 @@ impl PreparedTurnInputSettings {
         updates.service_tier_for_turn = service_tier;
 
         let options = NewTurnContextOptions {
+            permission_ceiling,
             tool_ceiling,
             final_output_json_schema,
             cyber_access_program,
         };
         let has_allowance = self.inference_allowance.is_some();
-        let turn_context =
-            if has_allowance && provider_attempt_gate.is_none() && kind != TurnStartKind::Automatic
-            {
-                Some(
-                    session
-                        .new_turn_with_sub_id(submission_id.clone(), updates, options)
-                        .await?,
-                )
-            } else {
+        let turn_context = if has_allowance
+            && provider_attempt_gate.is_none()
+            && kind != TurnStartKind::Automatic
+        {
+            Some(
                 session
-                    .new_turn_with_sub_id_if(
-                        submission_id.clone(),
-                        updates,
-                        options,
-                        |current, proposed| {
-                            // Evaluate the actual committed host attachment, not the
-                            // earlier preview. Refusal never commits thread settings.
-                            let funding_selected = proposed
-                                .turn_extension_init
-                                .get::<Arc<dyn codex_api::ProviderAttemptGate>>()
-                                .is_some();
-                            // A per-turn caller cannot replace an already selected host policy.
-                            (!funding_selected || provider_attempt_gate.is_none())
-                                && (!funding_selected || has_allowance)
-                                && (kind != TurnStartKind::Automatic
-                                    || kind.permits_settings(current, proposed))
-                        },
-                    )
-                    .await?
-            };
+                    .new_turn_with_sub_id(submission_id.clone(), updates, options)
+                    .await?,
+            )
+        } else {
+            session
+                .new_turn_with_sub_id_if(
+                    submission_id.clone(),
+                    updates,
+                    options,
+                    |current, proposed| {
+                        // Evaluate the actual committed host attachment, not the
+                        // earlier preview. Refusal never commits thread settings.
+                        let funding_selected = proposed
+                            .turn_extension_init
+                            .get::<Arc<dyn codex_api::ProviderAttemptGate>>()
+                            .is_some();
+                        // A per-turn caller cannot replace an already selected host policy.
+                        (!funding_selected || (provider_attempt_gate.is_none() && has_allowance))
+                            && (kind != TurnStartKind::Automatic
+                                || kind.permits_settings(current, proposed))
+                    },
+                )
+                .await?
+        };
         let Some((turn_context, settings_snapshot)) = turn_context else {
             return Ok(None);
         };
@@ -325,7 +336,10 @@ pub(super) async fn handle(
         .values()
         .try_for_each(AdditionalContextEntry::validate)
         .map_err(|message| CodexErr::InvalidRequest(message.to_owned()))?;
-    if request.request.start.tool_ceiling.is_some() && !matches!(mode, TurnInputMode::StartIfIdle) {
+    if (request.request.start.tool_ceiling.is_some()
+        || request.request.start.permission_ceiling.is_some())
+        && !matches!(mode, TurnInputMode::StartIfIdle)
+    {
         return Err(CodexErr::InvalidRequest(
             "a host tool ceiling requires idle-only turn admission".into(),
         ));

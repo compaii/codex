@@ -113,7 +113,7 @@ impl EnvironmentCommandExecutor {
         };
         let sandbox = network_proxy.as_ref().map(|_| {
             // Enforce managed network policy with the hook owner's filesystem access.
-            let mut sandbox = environment.sandbox_context(/*additional_permissions*/ None);
+            let mut sandbox = environment.sandbox_context();
             sandbox.permissions = PermissionProfile::Disabled;
             sandbox
         });

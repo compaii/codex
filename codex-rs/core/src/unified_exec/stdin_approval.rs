@@ -17,6 +17,7 @@ use crate::windows_sandbox::windows_sandbox_level_for_legacy_checks;
 use codex_features::Feature;
 use codex_file_system::FileSystemSandboxContext;
 use codex_network_proxy::EnvironmentNetworkPolicy;
+use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::SandboxPermissions;
@@ -56,8 +57,8 @@ impl TerminalPolicy {
         turn: &TurnContext,
         sandbox_source: TerminalSandboxSource,
         additional_permissions: Option<AdditionalPermissionProfile>,
-    ) -> Self {
-        let mut sandbox = environment.sandbox_context(additional_permissions);
+    ) -> CodexResult<Self> {
+        let mut sandbox = environment.sandbox_context_with_permissions(additional_permissions)?;
         if matches!(sandbox_source, TerminalSandboxSource::Native)
             && windows_sandbox_level_for_legacy_checks(
                 environment.config().windows_sandbox_type,
@@ -69,12 +70,12 @@ impl TerminalPolicy {
             sandbox.windows_sandbox_selection =
                 codex_protocol::config_types::WindowsSandboxLevel::Disabled.into();
         }
-        Self {
+        Ok(Self {
             sandbox,
             environment_network: environment.config().network_policy.clone(),
             controller_network: turn.config.permissions.network.clone(),
             controller_proxy: turn.network.is_some(),
-        }
+        })
     }
 
     fn file_system_context(&self) -> FileSystemSandboxContext {
@@ -95,22 +96,22 @@ impl TerminalPermissions {
         launch_permissions: SandboxPermissions,
         additional_permissions: Option<&AdditionalPermissionProfile>,
         internal_permissions: Option<&AdditionalPermissionProfile>,
-    ) -> Self {
-        Self {
+    ) -> CodexResult<Self> {
+        Ok(Self {
             owner_turn_id: turn.sub_id.clone(),
             policy: TerminalPolicy::capture(
                 environment,
                 turn,
                 sandbox_source,
                 merge_permission_profiles(additional_permissions, internal_permissions),
-            ),
+            )?,
             sandbox_source,
             // Retain the successful attempt's authority independently from its baseline.
             launch_permissions,
             filesystem_escalated: false,
             additional_permissions: additional_permissions.cloned(),
             internal_permissions: internal_permissions.cloned(),
-        }
+        })
     }
 
     pub(crate) fn with_filesystem_escalation(mut self) -> Self {
@@ -240,7 +241,8 @@ impl ProcessEntry {
                 permissions.additional_permissions.as_ref(),
                 permissions.internal_permissions.as_ref(),
             ),
-        );
+        )
+        .map_err(|error| UnifiedExecError::StdinApproval(ToolError::Codex(error)))?;
         let sandbox_permissions = permissions
             .review_requirement(&current, environment.permission_profile())
             .map_err(approval_error)?;

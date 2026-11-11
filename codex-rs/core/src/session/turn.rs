@@ -1339,7 +1339,14 @@ async fn build_extension_turn_input_items(
         return Some(Vec::new());
     }
 
-    let environment_accessors = step_context.environments();
+    let environment_accessors = match step_context.environments() {
+        Ok(environments) => environments,
+        Err(error) => {
+            sess.send_event(turn_context, EventMsg::Error(error.to_error_event(None)))
+                .await;
+            return None;
+        }
+    };
     let environments = environment_accessors
         .iter()
         .enumerate()

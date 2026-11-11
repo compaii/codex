@@ -255,8 +255,7 @@ impl<'a> ParsedExecCommand<'a> {
         let exec_permission_approvals_enabled =
             session.features().enabled(Feature::ExecPermissionApprovals);
         let requested_additional_permissions = args.additional_permissions.take();
-        let sandbox_context =
-            turn_environment.sandbox_context(/*additional_permissions*/ None);
+        let sandbox_context = turn_environment.sandbox_context();
         let permission_context = file_system_sandbox_policy_context_for_cwd(&sandbox_context, &cwd);
         let mut permissions = apply_granted_turn_permissions(
             step,

@@ -59,7 +59,7 @@ async fn patch_approval_requirement_uses_action_policy_before_turn_policy() {
         .clone();
     environment.config_mut().permission_profile =
         PermissionProfileSnapshot::legacy(permission_profile);
-    let sandbox = environment.sandbox_context(/*additional_permissions*/ None);
+    let sandbox = environment.sandbox_context();
     let context = sandbox.policy_context();
 
     let requirement = patch_approval_requirement(

@@ -100,6 +100,10 @@ pub async fn inter_agent_communication(
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "default-only context construction cannot fail host permission qualification"
+)]
 pub async fn run_user_shell_command(
     sess: &Arc<Session>,
     sub_id: String,
@@ -126,7 +130,8 @@ pub async fn run_user_shell_command(
 
     let turn_context = sess
         .new_turn_with_default_settings(sub_id, Default::default())
-        .await;
+        .await
+        .expect("default turn construction has no host permission ceiling");
     sess.spawn_task(
         turn_context,
         Vec::new(),
@@ -263,12 +268,17 @@ pub async fn reload_user_config(sess: &Arc<Session>) {
     Box::pin(sess.reload_user_config_layer()).await;
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "default-only context construction cannot fail host permission qualification"
+)]
 pub async fn compact(sess: &Arc<Session>, sub_id: String) {
     // Stop the old turn before the compact task picks up the next turn's environments.
     sess.abort_all_tasks(TurnAbortReason::Replaced).await;
     let turn_context = sess
         .new_turn_with_default_settings(sub_id, Default::default())
-        .await;
+        .await
+        .expect("default turn construction has no host permission ceiling");
 
     sess.spawn_task(turn_context, Vec::new(), CompactTask).await;
 }
@@ -419,6 +429,10 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
     true
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "default-only context construction cannot fail host permission qualification"
+)]
 pub async fn review(
     sess: &Arc<Session>,
     config: &Arc<Config>,
@@ -427,7 +441,8 @@ pub async fn review(
 ) {
     let turn_context = sess
         .new_turn_with_default_settings(sub_id.clone(), Default::default())
-        .await;
+        .await
+        .expect("default turn construction has no host permission ceiling");
     sess.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
         .await;
     #[allow(deprecated)]

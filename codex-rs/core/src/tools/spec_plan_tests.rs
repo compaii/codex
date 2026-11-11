@@ -3429,7 +3429,8 @@ async fn host_tool_ceiling_filters_actual_router_without_changing_session_policy
                 ..Default::default()
             },
         )
-        .await;
+        .await
+        .expect("build turn context");
     let step = StepContext::for_test(Arc::clone(&turn));
     let router = super::build_tool_router(
         &session,

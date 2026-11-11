@@ -55,7 +55,7 @@ pub(super) fn for_environment(
     if let Some(environment) = environment
         && native_cwd.is_none()
     {
-        let sandbox = environment.sandbox_context(/*additional_permissions*/ None);
+        let sandbox = environment.sandbox_context();
         let paths = sandbox.policy_context();
         let mut denied_globs = file_system_policy
             .get_unreadable_globs_with_context(&paths)
