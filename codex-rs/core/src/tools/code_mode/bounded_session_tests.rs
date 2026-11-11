@@ -214,13 +214,14 @@ fn bounded_code_mode_native_sessions_isolate_heap_names_state_and_lifetime() -> 
                 WaitOutcome::LiveCell(RuntimeResponse::Yielded { .. })
             ));
             if mode == "heap" {
-                // V8 heap OOM is fatal to this private child, never the human host.
+                // A finite allocation exceeds32MiB but fits the ordinary default heap.
+                // V8 OOM must kill this private child, never the human host.
                 let result = tokio::time::timeout(
                     Duration::from_secs(5),
                     run(
                         &service,
                         &turn,
-                        "const a=[]; while(true) a.push(new Array(65536).fill(1));",
+                        "const a=[]; for(let i=0;i<512;i++) a.push(new Array(65536).fill(1)); text('bounded allocation unexpectedly fit');",
                     ),
                 )
                 .await?;
