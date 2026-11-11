@@ -129,7 +129,7 @@ impl CodeModeService {
     }
 
     fn output_truncation(&self, turn: &TurnContext) -> CodeModeOutputTruncation {
-        if crate::turn_inference::allowance(turn).is_some() {
+        if bounded_session::uses_isolated_session(turn) {
             return turn
                 .extension_data
                 .get::<bounded_session::BoundedSessionState>()

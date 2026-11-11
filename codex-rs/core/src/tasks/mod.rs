@@ -1047,7 +1047,7 @@ impl Session {
         trace!(task_kind = ?task.kind, sub_id, "aborting running task");
         task.cancellation_token.cancel();
         if reason == TurnAbortReason::Interrupted
-            && bounded.is_none()
+            && !crate::tools::code_mode::bounded_session::uses_isolated_session(&task.turn_context)
             && task
                 .turn_context
                 .config

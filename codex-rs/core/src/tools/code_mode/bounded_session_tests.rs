@@ -134,6 +134,32 @@ fn bounded_code_mode_native_sessions_isolate_heap_names_state_and_lifetime() -> 
         assert_eq!(result_text(&response), "42");
         let human_pid = recorder.pid()?;
         let human_session = service.session().await.map_err(anyhow::Error::msg)?;
+        let (legacy, _) = session
+            .new_turn_with_sub_id(
+                "legacy-allowance-only".into(),
+                SessionSettingsUpdate {
+                    turn_extension_init: Some(ExtensionDataInit::new()),
+                    ..Default::default()
+                },
+                Default::default(),
+            )
+            .await?;
+        let legacy_allowance = Arc::new(codex_api::InferenceAllowance::new(
+            1,
+            4096,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )?);
+        legacy.extension_data.insert(Arc::clone(&legacy_allowance));
+        assert!(Arc::ptr_eq(
+            &human_session,
+            &service
+                .session_for_turn(&legacy)
+                .await
+                .map_err(anyhow::Error::msg)?
+        ));
+        let (_, response) = run(&service, &legacy, "text(load('human'));").await?;
+        assert_eq!(result_text(&response), "42");
+        legacy_allowance.close();
         let (human_cell, response) = run(
             &service,
             &human,

@@ -52,6 +52,15 @@ pub(crate) fn capture_options(data: &ExtensionData) {
     }
 }
 
+/// Legacy allowance-only attention has no host isolation policy. Preserve its
+/// existing session until the owner selects a complete restricted profile.
+pub(crate) fn uses_isolated_session(turn: &TurnContext) -> bool {
+    crate::turn_inference::allowance(turn).is_some()
+        && (turn.has_tool_ceiling()
+            || turn.permission_ceiling().is_some()
+            || turn.extension_data.get::<BoundedSessionState>().is_some())
+}
+
 impl CodeModeService {
     pub(super) async fn session_for_cell(
         &self,
@@ -64,6 +73,9 @@ impl CodeModeService {
         allowance
             .check_execution_open()
             .map_err(|e| e.to_string())?;
+        if !uses_isolated_session(turn) {
+            return self.session().await;
+        }
         if !id
             .as_str()
             .starts_with(&format!("bounded:{}:", turn.sub_id))
@@ -86,6 +98,9 @@ impl CodeModeService {
         allowance
             .check_execution_open()
             .map_err(|e| e.to_string())?;
+        if !uses_isolated_session(turn) {
+            return self.session().await;
+        }
         if self.shutdown_token.is_cancelled() {
             return Err("code mode session is shutting down".into());
         }

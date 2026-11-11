@@ -337,11 +337,13 @@ call, account change or production activation is introduced by this host option.
 A trusted embedding host supplies `BoundedCodeModeOptions(CodeModeSessionOptions)`
 through the existing `WithTurnExtensionData` initializer. Core privately captures
 that policy for each new turn; later attachment changes cannot replace its limits.
-A bounded Code Mode execution requires positive heap and observation limits. An
-ordinary turn ignores this bounded policy and keeps its existing thread session.
+Selecting this policy, a host tool ceiling or a permission ceiling makes positive
+heap and observation limits mandatory for Code Mode. Ordinary turns and legacy
+allowance-only attention retain their existing thread session; the legacy path
+is not qualified for monetary isolation and must migrate before funded rollout.
 This is not a model-selected option or a public bounded-start JSON field.
 
-Bounded turns use the provider's process-isolated session operation. Unsupported
+Host-restricted bounded turns use the provider's process-isolated session operation. Unsupported
 providers refuse before opening an ordinary/shared session. Core's local gRPC
 provider gives each bounded turn its own host process. Session close, turn drop,
 service shutdown and the original allocation deadline close only that session;
