@@ -323,7 +323,8 @@ async fn websocket_peer_mode(
                                 json!({"type":"response.incomplete","response":{
                                     "id":id,"status":"incomplete","output":[],
                                     "incomplete_details":{"reason":"max_output_tokens"},
-                                    "usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}
+                                    "usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10},
+                                "usage_metadata":{"amount":"0.0123"}
                                 }})
                                 .to_string()
                                 .into(),
@@ -1075,7 +1076,8 @@ async fn incomplete_http_response_reports_consumption_but_remains_failed() {
                         "type":"response.incomplete","response":{
                             "id":"limited-response","status":"incomplete","output":[],
                             "incomplete_details":{"reason":"max_output_tokens"},
-                            "usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}
+                            "usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10},
+                                "usage_metadata":{"amount":"0.0123"}
                         }
                     })
                 )),
@@ -1113,7 +1115,20 @@ async fn incomplete_http_response_reports_consumption_but_remains_failed() {
     assert_eq!(usage[0].attempt_id, claims[0].0);
     assert_eq!(usage[0].response_id, "limited-response");
     assert_eq!(usage[0].token_usage.as_ref().unwrap().total_tokens, 10);
-    assert!(usage[0].usage_metadata.is_none());
+    assert_eq!(
+        usage[0].usage_metadata.as_ref().unwrap().amount.as_deref(),
+        Some("0.0123")
+    );
+    assert_eq!(
+        usage[0]
+            .usage_metadata
+            .as_ref()
+            .unwrap()
+            .metadata
+            .as_ref()
+            .unwrap()["total_tokens"],
+        10
+    );
 }
 
 #[tokio::test]
@@ -1145,6 +1160,20 @@ async fn incomplete_websocket_usage_requires_matching_creation_and_remains_faile
                 assert_eq!(usage.len(), 1);
                 assert_eq!(usage[0].attempt_id, gate.claims.lock().unwrap()[0].0);
                 assert_eq!(usage[0].token_usage.as_ref().unwrap().total_tokens, 10);
+                assert_eq!(
+                    usage[0].usage_metadata.as_ref().unwrap().amount.as_deref(),
+                    Some("0.0123")
+                );
+                assert_eq!(
+                    usage[0]
+                        .usage_metadata
+                        .as_ref()
+                        .unwrap()
+                        .metadata
+                        .as_ref()
+                        .unwrap()["total_tokens"],
+                    10
+                );
             } else {
                 assert!(usage.is_empty());
             }

@@ -206,6 +206,22 @@ impl ResponsesStreamEvent {
         &self.kind
     }
 
+    /// Preserve upstream terminal accounting evidence before error conversion.
+    /// Neither an amount string nor token counters establish billing authority.
+    pub(crate) fn incomplete_usage_metadata(&self) -> Option<ResponseUsageMetadata> {
+        if self.kind != "response.incomplete" {
+            return None;
+        }
+        let response = self.response.as_ref()?;
+        let mut metadata: Option<ResponseUsageMetadata> = response
+            .get("usage_metadata")
+            .and_then(|value| serde_json::from_value(value.clone()).ok());
+        if let Some(usage) = response.get("usage").filter(|value| !value.is_null()) {
+            metadata.get_or_insert_default().metadata = Some(usage.clone());
+        }
+        metadata
+    }
+
     /// Returns the effective model reported by the server, if present.
     ///
     /// Precedence:
@@ -665,6 +681,7 @@ async fn process_sse_with_treatment(
         let metadata_events = event.metadata_events(safety_buffering);
 
         let model = event.response_model();
+        let incomplete_metadata = event.incomplete_usage_metadata();
         let processed = process_responses_event(event);
         if let Ok(Some(ref event)) = processed
             && let Some(observer) = &observer
@@ -681,7 +698,7 @@ async fn process_sse_with_treatment(
             tokio::select! {
                 biased;
                 _=tx_event.closed()=>return,
-                _=observer.observe_incomplete(error, model.clone().or_else(|| last_server_model.clone()))=>{},
+                _=observer.observe_incomplete(error, model.clone().or_else(|| last_server_model.clone()), incomplete_metadata)=>{},
             }
         }
         if let Some(model) = model

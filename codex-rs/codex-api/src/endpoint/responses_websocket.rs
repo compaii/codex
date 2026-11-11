@@ -1037,6 +1037,7 @@ async fn run_websocket_response_stream(
                     continue;
                 }
                 let model = event.response_model();
+                let incomplete_metadata = event.incomplete_usage_metadata();
                 // Preserve terminal usage before any accompanying notification can block.
                 let event = match process_responses_event(event) {
                     Ok(Some(event @ ResponseEvent::Completed { .. })) => {
@@ -1096,7 +1097,9 @@ async fn run_websocket_response_stream(
                             if let Some(observer) = &observer
                                 && response_id.as_ref() == Some(id)
                             {
-                                observer.observe_incomplete(&error, model.clone()).await;
+                                observer
+                                    .observe_incomplete(&error, model.clone(), incomplete_metadata)
+                                    .await;
                             }
                         }
                         Err(ResponsesEventError::Api(ApiError::ResponseIncomplete(

@@ -56,6 +56,7 @@ impl AttemptObserver {
         &self,
         error: &codex_protocol::error::ResponseIncompleteError,
         model: Option<String>,
+        usage_metadata: Option<codex_protocol::ResponseUsageMetadata>,
     ) {
         // A failed response may still consume tokens. Keep its existing error
         // semantics; this owner-only observation is never a completion/refund.
@@ -70,7 +71,7 @@ impl AttemptObserver {
                 response_id: id.clone(),
                 model: model.or_else(|| self.initial_model.clone()),
                 token_usage: error.token_usage.clone(),
-                usage_metadata: None,
+                usage_metadata,
             };
             let _ =
                 tokio::time::timeout_at(self.attempt.deadline, gate.0.observe_usage(usage)).await;
