@@ -84,7 +84,10 @@ impl StepContext {
             None => environment.sandbox_context_with_permissions(grants)?,
             Some(ceiling) => {
                 let mut restricted = environment.clone();
-                restricted.restrict_permissions(&ceiling)?;
+                restricted.restrict_permissions(
+                    &ceiling,
+                    self.turn.command_environment_policy().as_deref(),
+                )?;
                 restricted.sandbox_context_with_permissions(grants)?
             }
         };

@@ -1239,11 +1239,15 @@ pub struct TurnEnvironmentSnapshot {
 impl TurnEnvironmentSnapshot {
     /// Restrict a captured local execution view, never the thread-owned selection.
     /// An unavailable selection does not block independent qualified environments.
-    pub(crate) fn restrict_permissions(mut self, ceiling: &PermissionProfile) -> CodexResult<Self> {
+    pub(crate) fn restrict_permissions(
+        mut self,
+        ceiling: &PermissionProfile,
+        command_environment: Option<&codex_protocol::config_types::ShellEnvironmentPolicy>,
+    ) -> CodexResult<Self> {
         for state in &mut self.environments {
             let failure = match state {
                 TurnEnvironmentState::Ready(environment) => environment
-                    .restrict_permissions(ceiling)
+                    .restrict_permissions(ceiling, command_environment)
                     .err()
                     .map(|error| {
                         (

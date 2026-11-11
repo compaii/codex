@@ -118,6 +118,22 @@ impl PreparedTurnInputSettings {
                 "provider reservation requires a finite allowance".into(),
             ));
         }
+        if let Some(policy) = &start_options.command_environment_policy
+            && (start_options.permission_ceiling.is_none()
+                || !matches!(
+                    policy.inherit,
+                    codex_protocol::config_types::ShellEnvironmentPolicyInherit::None
+                )
+                || policy.use_profile
+                || policy.r#set.len() > 256
+                || policy.r#set.iter().fold(0usize, |size, (key, value)| {
+                    size.saturating_add(key.len()).saturating_add(value.len())
+                }) > 64 * 1024)
+        {
+            return Err(CodexErr::InvalidRequest(
+                "host command environment requires explicit bounded values, no parent inheritance or profile, and a permission ceiling".into(),
+            ));
+        }
         if let Some(ceiling) = &start_options.permission_ceiling
             && (start_options.inference_allowance.is_none()
                 || start_options.tool_ceiling.is_none()
@@ -187,6 +203,7 @@ impl PreparedTurnInputSettings {
         kind: TurnStartKind,
     ) -> CodexResult<Option<Arc<TurnContext>>> {
         let TurnStartOptions {
+            command_environment_policy,
             permission_ceiling,
             tool_ceiling,
             inference_allowance: inference_spec,
@@ -209,6 +226,7 @@ impl PreparedTurnInputSettings {
         updates.service_tier_for_turn = service_tier;
 
         let options = NewTurnContextOptions {
+            command_environment_policy,
             permission_ceiling,
             tool_ceiling,
             final_output_json_schema,
@@ -337,7 +355,8 @@ pub(super) async fn handle(
         .try_for_each(AdditionalContextEntry::validate)
         .map_err(|message| CodexErr::InvalidRequest(message.to_owned()))?;
     if (request.request.start.tool_ceiling.is_some()
-        || request.request.start.permission_ceiling.is_some())
+        || request.request.start.permission_ceiling.is_some()
+        || request.request.start.command_environment_policy.is_some())
         && !matches!(mode, TurnInputMode::StartIfIdle)
     {
         return Err(CodexErr::InvalidRequest(

@@ -418,3 +418,32 @@ location, startup file, inherited descriptor, Code Mode host, enabled-network
 proxy/provider route or receiving package. The production owner must still select
 and qualify its exact private roots, trusted binaries/startup, complete exposure
 and real accounting authority. It is not automatic funded-profile activation.
+
+### Host-selected per-turn command environment
+
+The non-serialized Rust `TurnStartOptions.command_environment_policy` selects an
+existing `ShellEnvironmentPolicy` for one bounded execution. It requires the
+existing permission ceiling (and therefore its finite allowance, explicit tools
+and idle-only admission), `inherit = None`, `use_profile = false`, and at most256
+explicit values totaling64KiB of names/values. It is not a model tool argument or
+new app-server JSON option. The host supplies an appropriate explicit PATH when
+its launcher needs system tools; Core does not guess a receiving PATH.
+
+Core copies the policy into private turn state, applies it to the initial local
+environments and reapplies it at step capture and runtime-resolved tool bindings.
+Review contexts preserve that same policy. The resulting turn-local environment
+disables the tool login-shell option and broader snapshots through the existing host
+permission path. Thread configuration, ordinary turns and existing allowance-only
+attention retain their previous policy. No persistent environment or account is
+rewritten.
+
+The native process witness now gives the ordinary configuration an explicit
+fixture variable and selects a different environment for the bounded turn. The
+bounded process cannot see that variable; the following ordinary process still
+receives it. The file, parent-environment, Unix-socket and useful-write checks run
+through the same native preparation/sandbox path.
+
+This binds shell preparation to a host selection; it does not sanitize arbitrary
+host-provided values or prove every runtime-added variable, descriptor, startup
+hook, Code Mode host, provider route or receiving funded profile. Those remain
+explicit parts of complete-profile qualification and accounting authority.
