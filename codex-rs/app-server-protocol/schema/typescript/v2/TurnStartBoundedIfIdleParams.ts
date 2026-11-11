@@ -19,4 +19,9 @@ providerReservationCycleId?: string,
  * Opt in to owner-only completion observations. Older closed readers
  * reject this field; legacy reservation-only clients omit it.
  */
-providerUsageObservations?: boolean, };
+providerUsageObservations?: boolean,
+/**
+ * Owner-selected output ceiling, applied at HTTP/WS request construction.
+ * Requires the same reservation cycle; older closed readers reject it.
+ */
+providerMaxOutputTokens?: number, };

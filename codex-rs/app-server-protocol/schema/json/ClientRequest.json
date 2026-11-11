@@ -6047,6 +6047,15 @@
         "allowance": {
           "$ref": "#/definitions/TurnInferenceAllowance"
         },
+        "providerMaxOutputTokens": {
+          "description": "Owner-selected output ceiling, applied at HTTP/WS request construction. Requires the same reservation cycle; older closed readers reject it.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "providerReservationCycleId": {
           "description": "Owner journal cycle whose exact physical attempts require a reservation response from this initiating connection. This is not a budget grant. Older bounded-start servers reject this field rather than ignore it.",
           "type": [

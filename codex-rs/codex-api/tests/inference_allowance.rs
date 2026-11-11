@@ -56,10 +56,14 @@ struct ReservationGate {
     claims: Mutex<Vec<(uuid::Uuid, u32, usize)>>,
     usage: Mutex<Vec<ProviderAttemptUsage>>,
     hang_observer: bool,
+    output_limit: Option<u32>,
     observed: tokio::sync::Notify,
 }
 
 impl ProviderAttemptGate for ReservationGate {
+    fn max_output_tokens(&self) -> Option<u32> {
+        self.output_limit
+    }
     fn reserve(&self, attempt: ProviderAttempt) -> ProviderAttemptReservation<'_> {
         self.claims.lock().expect("gate fixture").push((
             attempt.id,
@@ -294,6 +298,13 @@ async fn websocket_peer_mode(
                 let value: serde_json::Value =
                     serde_json::from_str(&text).expect("loopback allowance fixture");
                 if value["type"] == "response.create" {
+                    if mode == "output-bound" {
+                        assert_eq!(value["max_output_tokens"], 13);
+                        assert!(
+                            text.contains("[              {"),
+                            "RawValue tool spacing changed"
+                        );
+                    }
                     let ordinal = observed.fetch_add(1, Ordering::SeqCst) + 1;
                     if complete {
                         let id = if mode == "legacy" {
@@ -301,7 +312,7 @@ async fn websocket_peer_mode(
                         } else {
                             format!("verified-response-{ordinal}")
                         };
-                        if matches!(mode, "verified" | "stale") {
+                        if matches!(mode, "verified" | "stale" | "output-bound") {
                             let created=Message::Text(json!({"type":"response.created","response":{"id":id,"status":"in_progress"}}).to_string().into());
                             if ws.send(created).await.is_err() {
                                 break;
@@ -741,7 +752,8 @@ async fn successful_http_retry_reports_usage_for_only_its_exact_physical_claim()
     let requests = Arc::new(AtomicUsize::new(0));
     let observed = requests.clone();
     Mock::given(method("POST")).and(path("/responses"))
-        .respond_with(move |_: &wiremock::Request| {
+        .respond_with(move |request: &wiremock::Request| {
+            assert_eq!(request.body_json::<serde_json::Value>().unwrap()["max_output_tokens"],11);
             if observed.fetch_add(1,Ordering::SeqCst)==0 {ResponseTemplate::new(500)} else {
                 ResponseTemplate::new(200).insert_header("content-type","text/event-stream")
                     .insert_header("openai-model","effective-loopback")
@@ -750,6 +762,7 @@ async fn successful_http_retry_reports_usage_for_only_its_exact_physical_claim()
         }).expect(2).mount(&server).await;
     let gate = Arc::new(ReservationGate {
         permitted: 2,
+        output_limit: Some(11),
         claims: Mutex::default(),
         usage: Mutex::default(),
         ..Default::default()
@@ -933,4 +946,105 @@ async fn pending_usage_observer_cannot_erase_completion_at_websocket_cancel_dead
     assert_eq!(response, "verified-response-1");
     drop(connection);
     server.await.expect("closed cancelled peer");
+}
+
+#[tokio::test]
+async fn owner_output_bound_preserves_tighter_http_cap_and_rejects_invalid_before_send() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let gate = Arc::new(ReservationGate {
+        permitted: 1,
+        output_limit: Some(11),
+        ..Default::default()
+    });
+    let allowance = Arc::new(
+        InferenceAllowance::new(1, 4096, Instant::now() + Duration::from_secs(5))
+            .unwrap()
+            .with_provider_attempt_gate(gate),
+    );
+    let client = client(&server, allowance.clone());
+    for invalid in [json!(0), json!("4"), json!(-1)] {
+        assert!(
+            client
+                .stream(
+                    json!({"model":"loopback","max_output_tokens":invalid}),
+                    HeaderMap::new(),
+                    Compression::None,
+                    None
+                )
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(allowance.attempted().unwrap(), 0);
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(
+        client
+            .stream(
+                json!({"model":"loopback","max_output_tokens":3}),
+                HeaderMap::new(),
+                Compression::None,
+                None
+            )
+            .await
+            .is_err()
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].body_json::<serde_json::Value>().unwrap()["max_output_tokens"],
+        3
+    );
+}
+
+#[tokio::test]
+async fn websocket_output_bound_counts_new_field_in_complete_request_and_real_write() {
+    let (connection, received, server) = websocket_peer_mode(true, "output-bound").await;
+    let tools = serde_json::value::RawValue::from_string(
+        "[              {\"type\":\"function\",\"name\":\"raw-tool\"}              ]".into(),
+    )
+    .unwrap();
+    let request = || {
+        let ResponsesWsRequest::ResponseCreate(base) = ws_request();
+        ResponsesWsRequest::ResponseCreate(ResponseCreateWsRequest {
+            tools: Some(&tools),
+            ..base
+        })
+    };
+    let gate = Arc::new(ReservationGate {
+        permitted: 1,
+        output_limit: Some(13),
+        ..Default::default()
+    });
+    let allowance = Arc::new(
+        InferenceAllowance::new(1, 512, Instant::now() + Duration::from_secs(5))
+            .unwrap()
+            .with_provider_attempt_gate(gate),
+    );
+    assert!(
+        connection
+            .stream_request_with_allowance(request(), false, None, 512, allowance.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(allowance.attempted().unwrap(), 0);
+    assert_eq!(received.load(Ordering::SeqCst), 0);
+    let mut stream = connection
+        .stream_request_with_allowance(request(), false, None, 400, allowance)
+        .await
+        .unwrap();
+    while let Some(event) = stream.next().await {
+        event.unwrap();
+    }
+    assert_eq!(received.load(Ordering::SeqCst), 1);
+    drop(stream);
+    drop(connection);
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
 }

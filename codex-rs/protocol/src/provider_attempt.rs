@@ -39,6 +39,12 @@ pub type ProviderAttemptObservation<'a> = Pin<Box<dyn Future<Output = ()> + Send
 pub trait ProviderAttemptGate: Send + Sync {
     fn reserve(&self, attempt: ProviderAttempt) -> ProviderAttemptReservation<'_>;
 
+    /// Optional owner-selected output ceiling for every physical request.
+    /// It is not a billing receipt or a provider/account selection.
+    fn max_output_tokens(&self) -> Option<u32> {
+        None
+    }
+
     /// Existing owners without an accounting observer retain maximum exposure.
     /// Missing usage or an unobserved callback never implies zero consumption.
     fn observe_usage(&self, _usage: ProviderAttemptUsage) -> ProviderAttemptObservation<'_> {

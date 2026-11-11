@@ -77,6 +77,14 @@ impl AttemptObserver {
     }
 }
 
+/// Preserve typed/raw nested payloads while adding only the owner field.
+#[derive(serde::Serialize)]
+pub(crate) struct OutputBoundRequest<'a, T: ?Sized> {
+    #[serde(flatten)]
+    request: &'a T,
+    max_output_tokens: u32,
+}
+
 #[derive(Debug, Default)]
 struct State {
     attempted: u32,
@@ -156,6 +164,53 @@ impl InferenceAllowance {
 
     pub fn deadline(&self) -> Instant {
         self.deadline
+    }
+
+    pub fn max_output_tokens(&self) -> Option<u32> {
+        self.provider_attempt_gate
+            .as_ref()
+            .and_then(|gate| gate.0.max_output_tokens())
+    }
+
+    pub(crate) fn output_bound_request<'a, T: ?Sized>(
+        &self,
+        request: &'a T,
+    ) -> Result<Option<OutputBoundRequest<'a, T>>, InferenceAllowanceError> {
+        match self.max_output_tokens() {
+            None => Ok(None),
+            Some(0) => Err(InferenceAllowanceError::InvalidLimits),
+            Some(max_output_tokens) => Ok(Some(OutputBoundRequest {
+                request,
+                max_output_tokens,
+            })),
+        }
+    }
+
+    /// Apply only the selected owner's ceiling, preserving a tighter caller
+    /// ceiling. Must run before compression, byte validation and physical sends.
+    pub(crate) fn bound_output(
+        &self,
+        body: &mut serde_json::Value,
+    ) -> Result<(), InferenceAllowanceError> {
+        let Some(limit) = self.max_output_tokens() else {
+            return Ok(());
+        };
+        if limit == 0 {
+            return Err(InferenceAllowanceError::InvalidLimits);
+        }
+        let object = body
+            .as_object_mut()
+            .ok_or(InferenceAllowanceError::InvalidLimits)?;
+        let selected = match object.get("max_output_tokens") {
+            None | Some(serde_json::Value::Null) => u64::from(limit),
+            Some(value) => value
+                .as_u64()
+                .filter(|value| *value > 0)
+                .ok_or(InferenceAllowanceError::InvalidLimits)?
+                .min(u64::from(limit)),
+        };
+        object.insert("max_output_tokens".into(), serde_json::json!(selected));
+        Ok(())
     }
 
     pub fn max_request_bytes(&self) -> usize {

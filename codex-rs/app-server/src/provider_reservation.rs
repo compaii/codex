@@ -25,6 +25,7 @@ pub(crate) struct OwnerProviderReservation {
     pub(crate) thread_id: ThreadId,
     pub(crate) cycle_id: String,
     pub(crate) usage_observations: bool,
+    pub(crate) max_output_tokens: Option<u32>,
     pub(crate) deadline_unix_ms: i64,
 }
 
@@ -48,6 +49,9 @@ impl Drop for PendingReservation {
 }
 
 impl ProviderAttemptGate for OwnerProviderReservation {
+    fn max_output_tokens(&self) -> Option<u32> {
+        self.max_output_tokens
+    }
     fn reserve(&self, attempt: ProviderAttempt) -> ProviderAttemptReservation<'_> {
         Box::pin(async move {
             let Ok(max_request_bytes) = u32::try_from(attempt.max_request_bytes) else {

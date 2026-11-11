@@ -90,8 +90,21 @@ impl<T: HttpTransport> ResponsesClient<T> {
             compression,
             turn_state,
         } = options;
-        let body = EncodedJsonBody::encode(&request)
-            .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
+        let bounded = self
+            .session
+            .inference_allowance()
+            .map(|allowance| allowance.output_bound_request(&request))
+            .transpose()
+            .map_err(|error| ApiError::InvalidRequest {
+                message: error.to_string(),
+            })?
+            .flatten();
+        let body = if let Some(bounded) = bounded {
+            EncodedJsonBody::encode(&bounded)
+        } else {
+            EncodedJsonBody::encode(&request)
+        }
+        .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
 
         let mut headers = extra_headers;
         if let Some(ref thread_id) = thread_id {
@@ -124,6 +137,14 @@ impl<T: HttpTransport> ResponsesClient<T> {
         compression: Compression,
         turn_state: Option<Arc<OnceLock<String>>>,
     ) -> Result<ResponseStream, ApiError> {
+        let mut body = body;
+        if let Some(allowance) = self.session.inference_allowance() {
+            allowance
+                .bound_output(&mut body)
+                .map_err(|error| ApiError::InvalidRequest {
+                    message: error.to_string(),
+                })?;
+        }
         let body = EncodedJsonBody::encode(&body)
             .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
         self.stream_encoded(body, extra_headers, compression, turn_state)

@@ -326,6 +326,11 @@ pub struct TurnStartBoundedIfIdleParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub provider_usage_observations: Option<bool>,
+    /// Owner-selected output ceiling, applied at HTTP/WS request construction.
+    /// Requires the same reservation cycle; older closed readers reject it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub provider_max_output_tokens: Option<u32>,
 }
 
 /// Host accounting request, never a model tool or human approval ceremony.

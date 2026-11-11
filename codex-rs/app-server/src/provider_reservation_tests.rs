@@ -14,6 +14,7 @@ fn gate(outgoing: Arc<OutgoingMessageSender>, thread_id: ThreadId) -> OwnerProvi
         thread_id,
         cycle_id: uuid::Uuid::new_v4().to_string(),
         usage_observations: false,
+        max_output_tokens: None,
         deadline_unix_ms: 123456789,
     }
 }

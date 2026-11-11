@@ -347,10 +347,30 @@ impl ResponsesWebsocketConnection {
             warmup: ws_request.generate == Some(false),
             connection_reused,
         };
-        let request_text = serialize_websocket_request(&request)?;
+        let mut request_text = serialize_websocket_request(&request)?;
+        let original_bytes = request_text.len();
+        if let Some((allowance, _)) = &allowance
+            && let Some(bounded) = allowance.output_bound_request(&request).map_err(|error| {
+                ApiError::InvalidRequest {
+                    message: error.to_string(),
+                }
+            })?
+        {
+            // Serialize the same typed/raw fields directly. Normalizing RawValue
+            // tools would change payload bytes and erase the added-field delta.
+            request_text = serde_json::to_string(&bounded)
+                .map_err(|error| ApiError::Stream(error.to_string()))?;
+        }
         if let Some((allowance, complete_bytes)) = &allowance {
+            // The caller's complete logical byte count predates the owner field;
+            // account for that delta even when the wire carries only a WS diff.
+            let complete_bytes = complete_bytes
+                .checked_add(request_text.len().saturating_sub(original_bytes))
+                .ok_or_else(|| ApiError::InvalidRequest {
+                    message: "complete output-bounded request exceeds byte allowance".into(),
+                })?;
             allowance
-                .validate_request((*complete_bytes).max(request_text.len()))
+                .validate_request(complete_bytes.max(request_text.len()))
                 .map_err(|error| ApiError::InvalidRequest {
                     message: error.to_string(),
                 })?;
