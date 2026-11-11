@@ -1225,3 +1225,153 @@ async fn bounded_terminal_ownership_rejects_poll_write_and_interrupt_without_tou
     assert!(session.terminate_background_terminal(human_pid).await);
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bounded_process_lifetime_ends_owned_process_on_close_or_deadline_and_preserves_human()
+-> anyhow::Result<()> {
+    core_test_support::test_codex::run_test_with_large_stack("bounded-process-lifetime", || async {
+        use crate::tools::handlers::unified_exec::preparation::ExecCommandLifetime;
+        use crate::tools::handlers::unified_exec::preparation::ParsedExecCommand;
+        skip_if_sandbox!(Ok(()));
+        async fn launch(
+            session: &Arc<Session>,
+            turn: &Arc<TurnContext>,
+            command: &str,
+        ) -> anyhow::Result<ExecCommandToolOutput> {
+            let context = UnifiedExecContext::new(
+                Arc::clone(session),
+                crate::session::step_context::StepContext::for_test(Arc::clone(turn)),
+                tokio_util::sync::CancellationToken::new(),
+                "bounded-lifetime-call".into(),
+            );
+            let arguments =
+                serde_json::json!({"cmd": command, "tty": true, "yield_time_ms": 100}).to_string();
+            let prepared = ParsedExecCommand::parse(
+                &arguments,
+                session,
+                &context.step_context,
+                turn.initial_environments.primary().expect("environment"),
+            )?
+            .prepare(ExecCommandLifetime::Interactive)?;
+            let manager = &session.services.unified_exec_manager;
+            Ok(Box::pin(manager.exec_command(
+                ExecCommandRequest {
+                    prepared,
+                    process_id: manager.allocate_process_id().await,
+                    network: None,
+                },
+                &context,
+            ))
+            .await?)
+        }
+        let (session, human, _events) = Box::pin(
+            crate::session::tests::make_session_and_context_with_auth_and_config_and_rx(
+                codex_login::CodexAuth::from_api_key("Test API Key"),
+                Vec::new(),
+                |config| {
+                    config
+                        .permissions
+                        .set_permission_profile(codex_protocol::models::PermissionProfile::Disabled)
+                        .expect("test permissions");
+                    config.permissions.approval_policy = codex_config::Constrained::allow_any(
+                        codex_protocol::protocol::AskForApproval::Never,
+                    );
+                    config
+                        .features
+                        .enable(codex_features::Feature::UnifiedExecTty)
+                        .expect("TTY fixture");
+                },
+            ),
+        )
+        .await;
+        let shell = r#"while IFS= read -r -t 20 line; do printf 'received:%s\n' "$line"; done"#;
+        let opened = launch(&session, &human, shell).await?;
+        let human_id = opened.process_id.expect("human terminal");
+        let manager = &session.services.unified_exec_manager;
+        let human_terminal = manager.resolve_terminal(human_id, &human).await?;
+        let directory = tempfile::tempdir()?;
+        for mode in ["close_after_yield", "deadline", "close_during_start"] {
+            let bounded = session
+                .new_turn_with_default_settings(
+                    format!("bounded-process-{mode}"),
+                    Default::default(),
+                )
+                .await
+                .expect("bounded context");
+            let allowance = Arc::new(codex_api::InferenceAllowance::new(
+                1,
+                4096,
+                Instant::now()
+                    + if mode != "deadline" {
+                        Duration::from_secs(30)
+                    } else {
+                        Duration::from_secs(2)
+                    },
+            )?);
+            allowance.claim_attempt()?; // Finishing tools require no second provider attempt.
+            bounded.extension_data.insert(Arc::clone(&allowance));
+            let pid_file = directory.path().join(format!("owned-{mode}.pid"));
+            let command = format!("printf '%s\\n' \"$$\" > '{}'; {shell}", pid_file.display());
+            let opened = if mode == "close_during_start" {
+                let (opened, closed) = tokio::join!(launch(&session, &bounded, &command), async {
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while !pid_file.exists() {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                    })
+                    .await?;
+                    let pid = std::fs::read_to_string(&pid_file)?.trim().parse::<u32>()?;
+                    assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+                    allowance.close();
+                    Ok::<(), anyhow::Error>(())
+                });
+                closed?;
+                opened?
+            } else {
+                launch(&session, &bounded, &command).await?
+            };
+            let terminal = match opened.process_id {
+                Some(process_id) => Some(manager.resolve_terminal(process_id, &bounded).await?),
+                None => None,
+            };
+            let native_pid = std::fs::read_to_string(&pid_file)?.trim().parse::<u32>()?;
+            let proc_path = std::path::PathBuf::from(format!("/proc/{native_pid}"));
+            if mode != "close_during_start" {
+                assert!(proc_path.exists(), "real process started and yielded");
+                assert!(terminal.is_some());
+            }
+            if mode == "close_after_yield" {
+                drop(crate::turn_inference::CloseOnExit(Arc::clone(&allowance)));
+            }
+            tokio::time::timeout(Duration::from_secs(4), async {
+                while proc_path.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await?;
+            if let Some(terminal) = terminal {
+                assert!(terminal.process.has_exited());
+                assert!(
+                    terminal
+                        .process
+                        .termination_requested
+                        .load(std::sync::atomic::Ordering::Acquire)
+                );
+            }
+            assert!(!human_terminal.process.has_exited());
+            assert_eq!(allowance.attempted()?, 1);
+            let rejected = launch(&session, &bounded, "echo must-not-run").await;
+            assert!(
+                rejected.is_err(),
+                "ended execution cannot launch another process"
+            );
+        }
+        let output = write_stdin(&session, &human, human_id, "human\n", 100)
+            .await?
+            .truncated_output(1000);
+        assert!(output.contains("received:human"), "{output}");
+        assert!(session.terminate_background_terminal(human_id).await);
+        Ok(())
+    })
+}

@@ -540,6 +540,13 @@ impl UnifiedExecProcessManager {
         context: &UnifiedExecContext,
         mut completion: Option<&mut Completion<'_>>,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
+        let allowance = crate::turn_inference::allowance(&context.step_context.turn);
+        if let Some(allowance) = &allowance
+            && let Err(error) = allowance.check_execution_open()
+        {
+            self.release_process_id(request.process_id).await;
+            return Err(UnifiedExecError::process_failed(error.to_string()));
+        }
         let prepared = &request.prepared;
         let command = &prepared.resolved.command;
         let cwd = prepared.cwd.clone();
@@ -558,6 +565,11 @@ impl UnifiedExecProcessManager {
             permissions,
         } = attempt;
         let process = Arc::new(process);
+        if let Some(allowance) = allowance {
+            // Bind immediately after spawn, before any later await or store insertion.
+            // Closure racing startup therefore cannot leave an unowned live process.
+            process.bind_execution_lifetime(allowance);
+        }
         if let Some(completion) = completion.as_ref() {
             let _ = completion.process.set(Arc::clone(&process));
         }

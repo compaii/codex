@@ -285,6 +285,22 @@ Rejected borrowing neither consumes output nor writes, interrupts or terminates
 the other turn's process. Ordinary human turns keep their existing cross-turn
 terminal access and approval policy.
 
+A unified-exec process opened by a finite turn is bound to that same allowance's
+close and absolute deadline, before any post-spawn await or store insertion.
+Normal return, cancellation/forced task drop and explicit allowance refusal all
+use the existing close path. A closure racing startup still triggers cleanup;
+an already closed or expired execution cannot start another process. Completing
+tools after the final allowed provider attempt does not reserve another attempt.
+
+Each retained process owns one cleanup task, cancelled when that process is
+dropped; the existing 64-process store bound remains unchanged. The task waits
+without holding the process strongly, then uses existing termination with a
+two-second response bound and records failure before fallback termination. It
+neither closes other turns' processes nor installs a producer or model wakeup.
+Remote termination confirmation, detached descendants/independent process groups
+and Code Mode sessions retain their separate qualification requirements; this is
+not a process-containment or complete financial-isolation claim.
+
 A host can also set `TurnStartOptions.permission_ceiling` to an already resolved
 `PermissionProfile` (including a profile resolved from the existing named-profile
 configuration). This requires managed restrictive permissions, explicit tools and
