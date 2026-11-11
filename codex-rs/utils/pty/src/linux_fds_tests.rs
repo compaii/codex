@@ -224,6 +224,28 @@ fn cleanup_fallback_preserves_exec_failure_reporting() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn strict_cleanup_refuses_launch_when_descriptor_isolation_is_unavailable() -> anyhow::Result<()> {
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", "exit 42"]);
+    // SAFETY: both hooks use only child-local fork-safe syscalls.
+    unsafe {
+        command.pre_exec(|| {
+            deny_syscall(libc::SYS_close_range)?;
+            crate::require_explicit_descriptors()
+        });
+    }
+    let error = match command.spawn() {
+        Err(error) => error,
+        Ok(mut child) => {
+            child.wait()?;
+            anyhow::bail!("strict descriptor failure launched a child");
+        }
+    };
+    assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+    Ok(())
+}
+
 #[tokio::test]
 async fn cleanup_failures_do_not_prevent_explicit_launch() -> anyhow::Result<()> {
     let mut command = crate::Command::new("/bin/sh");

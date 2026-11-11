@@ -461,7 +461,7 @@ refusing isolated admission instead of creating a shared/default session.
 An omitted policy retains the existing ordinary/shared and legacy allowance-only
 behavior. Private-host lifetime, cell namespace, heap acknowledgment and cleanup
 use their existing controls. Environment selection composes with the Linux host
-sandbox below; inherited descriptors, total RSS, trusted startup and the exact
+sandbox below; total RSS, trusted startup and the exact
 receiving provider/accounting profile remain separately unqualified.
 
 
@@ -490,7 +490,21 @@ owned descendants using executable, inner PID and a unique fixture marker, with
 bounded process/task scans. Inner namespace PIDs are not controller PIDs or
 operating authority. No model or provider call is part of this qualification.
 
+The private Linux host also requires stdio-only descriptor inheritance. Pathname
+denial does not revoke a file or Unix socket already open in the parent; the
+native fixture reproduced that bypass before this correction. Before exec, the
+launcher uses the shared Linux descriptor primitive with mandatory
+`close_range(CLOSE_RANGE_CLOEXEC)` success. Unavailable/denied cleanup refuses the
+launch, while retaining Rust's spawn-error reporting. Ordinary host launches and
+the existing best-effort descriptor cleanup keep their prior behavior.
+
+The fixture first proves that an ordinary direct child can read its intentionally
+inheritable fake file and identify its owner-like socket. The sandboxed host must
+inherit neither authority and still complete its real V8 session, permitted work
+and stdio lifecycle. No actual credential or service socket is inspected. This
+qualifies these private-host descriptor routes, not every tool/executor route.
+
 This implements and exercises the host kernel boundary, not every receiving
-private path or the complete economic profile. Total RSS/external buffers, inherited
-descriptors, trusted startup, full tool/provider exposure, real accounting authority
+private path or the complete economic profile. Total RSS/external buffers,
+trusted startup, full tool/provider exposure, real accounting authority
 and composed receiving selection remain required.
