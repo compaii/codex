@@ -321,6 +321,11 @@ pub struct TurnStartBoundedIfIdleParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub provider_reservation_cycle_id: Option<String>,
+    /// Opt in to owner-only completion observations. Older closed readers
+    /// reject this field; legacy reservation-only clients omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub provider_usage_observations: Option<bool>,
 }
 
 /// Host accounting request, never a model tool or human approval ceremony.
@@ -334,6 +339,32 @@ pub struct ProviderAttemptReservationParams {
     pub ordinal: u32,
     pub max_request_bytes: u32,
     pub deadline_unix_ms: i64,
+}
+
+/// Exact physical response evidence, not a financial settlement or grant.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct ProviderAttemptUsageParams {
+    pub thread_id: String,
+    pub cycle_id: String,
+    pub attempt_id: String,
+    pub ordinal: u32,
+    pub response_id: String,
+    pub model: Option<String>,
+    pub token_usage: Option<super::TokenUsageBreakdown>,
+    pub usage_metadata: Option<super::ResponseUsageMetadata>,
+}
+
+/// True acknowledges retained evidence only. A missing/false acknowledgment
+/// never proves absence or authorizes releasing conservative exposure.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct ProviderAttemptUsageResponse {
+    pub cycle_id: String,
+    pub attempt_id: String,
+    pub recorded: bool,
 }
 
 /// Authorizes only the exact retained journal operation. A lost response must

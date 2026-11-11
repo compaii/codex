@@ -980,6 +980,13 @@
         "null"
       ]
     },
+    "providerUsageObservations": {
+      "description": "Opt in to owner-only completion observations. Older closed readers reject this field; legacy reservation-only clients omit it.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
     "turn": {
       "$ref": "#/definitions/TurnStartParams"
     }

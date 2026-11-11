@@ -104,6 +104,7 @@ impl SideParentStatus {
             | ServerRequest::ApplyPatchApproval { .. }
             | ServerRequest::ExecCommandApproval { .. } => Some(SideParentStatus::NeedsApproval),
             ServerRequest::ProviderAttemptReservation { .. }
+            | ServerRequest::ProviderAttemptUsage { .. }
             | ServerRequest::DynamicToolCall { .. }
             | ServerRequest::AttestationGenerate { .. }
             | ServerRequest::CurrentTimeRead { .. }

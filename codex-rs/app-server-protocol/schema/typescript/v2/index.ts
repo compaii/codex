@@ -424,6 +424,8 @@ export type { ProjectRoot } from "./ProjectRoot";
 export type { ProjectSortKey } from "./ProjectSortKey";
 export type { ProviderAttemptReservationParams } from "./ProviderAttemptReservationParams";
 export type { ProviderAttemptReservationResponse } from "./ProviderAttemptReservationResponse";
+export type { ProviderAttemptUsageParams } from "./ProviderAttemptUsageParams";
+export type { ProviderAttemptUsageResponse } from "./ProviderAttemptUsageResponse";
 export type { QueuedSubmission } from "./QueuedSubmission";
 export type { RateLimitReachedType } from "./RateLimitReachedType";
 export type { RateLimitResetCredit } from "./RateLimitResetCredit";

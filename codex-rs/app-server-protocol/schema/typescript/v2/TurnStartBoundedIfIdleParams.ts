@@ -14,4 +14,9 @@ export type TurnStartBoundedIfIdleParams = { turn: TurnStartParams, allowance: T
  * response from this initiating connection. This is not a budget grant.
  * Older bounded-start servers reject this field rather than ignore it.
  */
-providerReservationCycleId?: string, };
+providerReservationCycleId?: string,
+/**
+ * Opt in to owner-only completion observations. Older closed readers
+ * reject this field; legacy reservation-only clients omit it.
+ */
+providerUsageObservations?: boolean, };

@@ -215,8 +215,18 @@ client session and background with the same inherited turn allowance. The unary
 `EndpointSession::execute_with` route does not provide this completion observer.
 Source routing is not a real-model or compaction acceptance claim.
 
-The app-server reservation owner currently retains its default observer. Sending
-this evidence to the initiating App owner, signing/verifying exact usage under
-the existing accounting authority, full exposure/credential-route qualification
-and receiving adoption remain unfinished. No new balance, signer, account,
-provider selection, model call or runtime activation follows from this increment.
+A bounded start may explicitly select `providerUsageObservations: true` together
+with its existing `providerReservationCycleId`. The app-server then sends
+`turn/providerAttempt/usage` only to the initiating reservation owner. The closed
+payload contains thread/cycle/attempt/ordinal/response identity and optional model,
+token usage and provider metadata, capped at32KiB. Other subscribers cannot list,
+replay or acknowledge it. Cancellation retires the outstanding callback; all
+reporting remains inside the original deadline. Omission retains Core17 behavior;
+older readers reject the explicit new field instead of silently accepting a
+requested observation contract.
+
+The exact `cycleId`/`attemptId`/`recorded` reply acknowledges retained observation
+only. It grants no provider call and settles no money. Signing/verifying exact
+usage under the existing accounting authority, full exposure/credential-route
+qualification and receiving adoption remain unfinished. No new balance, signer,
+account, provider selection, model call or runtime activation follows here.

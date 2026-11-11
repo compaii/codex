@@ -1891,6 +1891,11 @@ server_request_definitions! {
         params: v2::ProviderAttemptReservationParams,
         response: v2::ProviderAttemptReservationResponse,
     },
+    /// Exact usage observation for the initiating accounting owner only.
+    ProviderAttemptUsage => "turn/providerAttempt/usage" {
+        params: v2::ProviderAttemptUsageParams,
+        response: v2::ProviderAttemptUsageResponse,
+    },
     /// NEW APIs
     /// Sent when approval is requested for a specific command execution.
     /// This request is used for Turns started via turn/start.

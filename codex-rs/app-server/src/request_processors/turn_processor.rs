@@ -184,6 +184,7 @@ impl TurnRequestProcessor {
             only_if_idle,
             None,
             None,
+            false,
         )
         .await
         .map(|response| {
@@ -211,6 +212,13 @@ impl TurnRequestProcessor {
                 ));
             }
         }
+        if params.provider_usage_observations == Some(true)
+            && params.provider_reservation_cycle_id.is_none()
+        {
+            return Err(invalid_request(
+                "Usage observations require the existing owner reservation cycle",
+            ));
+        }
         self.turn_start_inner(
             request_id,
             params.turn,
@@ -219,6 +227,7 @@ impl TurnRequestProcessor {
             true,
             Some(params.allowance),
             params.provider_reservation_cycle_id,
+            params.provider_usage_observations.unwrap_or(false),
         )
         .await
         .map(|response| Some(ClientResponsePayload::TurnStartBoundedIfIdle(response)))
@@ -593,6 +602,7 @@ impl TurnRequestProcessor {
         only_if_idle: bool,
         inference_allowance: Option<codex_protocol::turn_input::TurnInferenceAllowance>,
         provider_reservation_cycle_id: Option<String>,
+        provider_usage_observations: bool,
     ) -> Result<TurnStartResponse, JSONRPCErrorError> {
         let (thread_id, thread) =
             self.load_thread(&params.thread_id)
@@ -746,6 +756,7 @@ impl TurnRequestProcessor {
                 owner: request_id.connection_id,
                 thread_id,
                 cycle_id,
+                usage_observations: provider_usage_observations,
                 deadline_unix_ms: inference_allowance
                     .as_ref()
                     .expect("bounded reservation start")
