@@ -265,7 +265,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest<'_>, UnifiedExecAttempt> for UnifiedExec
         ));
         let environment_is_remote = prepared.turn_environment.environment.is_remote();
         let credential_broker_available = !environment_is_remote
-            && req.network.is_some()
+            && managed_network.is_some()
             && ctx
                 .step_context
                 .turn

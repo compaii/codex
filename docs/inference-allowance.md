@@ -371,3 +371,14 @@ checksum-verified artifacts, as CI does; the generic Deno release does not publi
 this Codex sandbox variant. Retain a single useful version in bounded build
 storage. Do not substitute an unverified artifact or start a source rebuild merely
 because the generic downloader fails.
+
+### Offline process preparation
+
+The host permission ceiling is applied when selecting an execution proxy, before
+Unified Exec prepares shell snapshots or broker credentials. An offline ceiling
+withholds both an execution-owned proxy and the thread fallback; the broker cannot
+select a credential-enabled shell on the basis of a broader thread configuration.
+Final sandbox enforcement remains mandatory. This closes proxy-assisted credential
+preparation, not inherited environment values, private credential files, arbitrary
+IPC or provider routes; those still require complete-profile qualification. Human
+and network-enabled host policies retain their existing behavior.
