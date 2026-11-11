@@ -17,6 +17,8 @@ pub struct CodeModeHostRecorder {
     pid: PathBuf,
     #[cfg(unix)]
     _listener: std::os::unix::net::UnixListener,
+    #[cfg(target_os = "linux")]
+    descriptor: fs::File,
 }
 
 impl CodeModeHostRecorder {
@@ -32,6 +34,22 @@ impl CodeModeHostRecorder {
         fs::write(&credential, "private fixture")?;
         #[cfg(unix)]
         let listener = std::os::unix::net::UnixListener::bind(&socket)?;
+        #[cfg(unix)]
+        let socket_descriptor_number = {
+            use std::os::fd::AsRawFd;
+            listener.as_raw_fd()
+        };
+        #[cfg(not(unix))]
+        let socket_descriptor_number = -1;
+        #[cfg(target_os = "linux")]
+        let descriptor = fs::File::open(&credential)?;
+        #[cfg(target_os = "linux")]
+        let descriptor_number = {
+            use std::os::fd::AsRawFd;
+            descriptor.as_raw_fd()
+        };
+        #[cfg(not(target_os = "linux"))]
+        let descriptor_number = -1;
         let host_program = codex_utils_cargo_bin::cargo_bin("codex-code-mode-host")?;
         let quoted_host =
             shlex::try_quote(host_program.to_str().context("host path is not UTF-8")?)?;
@@ -47,8 +65,26 @@ impl CodeModeHostRecorder {
             &format!(
                 r#"#!/bin/sh
 if [ "${{CODEX_TEST_CODE_MODE_RECORDER-}}" = {quoted_directory} ]; then
-/usr/bin/python3 - {quoted_credential} {quoted_socket} {quoted_result} <<'PY'
-import errno, socket, sys
+/usr/bin/python3 - {quoted_credential} {quoted_socket} {quoted_result} 2>{quoted_result} <<'PY'
+import errno, os, socket, sys
+# Opening the path and borrowing an already-open parent descriptor are
+# different routes. A sandbox may reuse this number for its own pipe, so
+# pread avoids blocking and checks the exact fixture bytes, not just EBADF.
+try:
+    inherited = os.pread({descriptor_number}, 15, 0)
+except OSError:
+    pass
+else:
+    assert inherited != b'private fixture', 'private descriptor inherited'
+try:
+    borrowed = socket.socket(fileno=os.dup({socket_descriptor_number}))
+except OSError:
+    pass
+else:
+    try:
+        assert borrowed.getsockname() != sys.argv[2], 'owner socket descriptor inherited'
+    finally:
+        borrowed.close()
 try:
     open(sys.argv[1], 'rb').read(1)
 except OSError as e:
@@ -84,7 +120,43 @@ exec {quoted_host} "$@"
             pid,
             #[cfg(unix)]
             _listener: listener,
+            #[cfg(target_os = "linux")]
+            descriptor,
         })
+    }
+
+    /// Establish that the controlled file and socket are actually inheritable
+    /// before the sandbox probe. No ambient descriptor or credential is read.
+    #[cfg(target_os = "linux")]
+    pub async fn enable_inheritable_descriptor_probe(&self) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        let fd = self.descriptor.as_raw_fd();
+        let socket_fd = self._listener.as_raw_fd();
+        for fd in [fd, socket_fd] {
+            // SAFETY: this fixture owns both live descriptors through every
+            // child launch; only its harmless file/socket become inheritable.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            anyhow::ensure!(flags >= 0, "fixture descriptor flags unavailable");
+            let changed = unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) };
+            anyhow::ensure!(changed == 0, "fixture descriptor not inheritable");
+        }
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::process::Command::new("/usr/bin/python3")
+                .args([
+                    "-c",
+                    "import os,socket,sys; assert os.pread(int(sys.argv[1]),15,0)==b'private fixture'; s=socket.socket(fileno=os.dup(int(sys.argv[2]))); assert s.getsockname()==sys.argv[3]",
+                    &fd.to_string(),
+                    &socket_fd.to_string(),
+                    self._directory.path().join("owner socket").to_str().context("socket path")?,
+                ])
+                .env_clear()
+                .kill_on_drop(true)
+                .status(),
+        )
+        .await??;
+        anyhow::ensure!(status.success(), "ordinary descriptor control failed");
+        Ok(())
     }
 
     pub fn program(&self) -> PathBuf {

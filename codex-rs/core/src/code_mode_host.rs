@@ -428,6 +428,15 @@ impl HostConnection {
         };
         #[cfg(unix)]
         command.process_group(/*pgroup*/ 0);
+        #[cfg(target_os = "linux")]
+        if host_sandbox.is_some() {
+            // SAFETY: the existing strict cleanup uses only a fork-safe syscall.
+            // Marking CLOEXEC preserves Rust's spawn-error pipe until exec;
+            // failure refuses the private host rather than inheriting authority.
+            unsafe {
+                command.pre_exec(codex_utils_pty::require_explicit_descriptors);
+            }
+        }
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

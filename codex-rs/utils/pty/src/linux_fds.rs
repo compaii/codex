@@ -7,6 +7,31 @@ use std::ffi::CStr;
 use std::io;
 use std::os::fd::RawFd;
 
+/// Require stdio-only inheritance at exec, or refuse the child launch.
+/// Call only after fork, before exec. Unlike ordinary best-effort cleanup this
+/// cannot silently retain a parent's file/socket authority on an older kernel
+/// or under a syscall policy that prevents descriptor isolation.
+pub fn require_explicit_descriptors() -> io::Result<()> {
+    mark_range_cloexec(3, u32::MAX)
+}
+
+fn mark_range_cloexec(first: u32, last: u32) -> io::Result<()> {
+    // SAFETY: close_range has no pointers and changes only this child's FDs.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            first,
+            last,
+            libc::CLOSE_RANGE_CLOEXEC,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 pub(crate) fn close_inherited_fds_except(preserved_fds: &[RawFd]) {
     // Mark rather than close: std::process still needs its CLOEXEC error
     // pipe if exec fails. Do not alter flags on explicitly preserved FDs.
@@ -21,17 +46,7 @@ pub(crate) fn close_inherited_fds_except(preserved_fds: &[RawFd]) {
             .filter(|&fd| fd >= first)
             .min();
         let last = next.map_or(u32::MAX, |fd| fd - 1);
-        if first <= last
-        // SAFETY: close_range has no pointers and changes only this child's FDs.
-        && unsafe {
-            libc::syscall(
-                libc::SYS_close_range,
-                first,
-                last,
-                libc::CLOSE_RANGE_CLOEXEC,
-            )
-        } != 0
-        {
+        if first <= last && mark_range_cloexec(first, last).is_err() {
             break;
         }
         match next {

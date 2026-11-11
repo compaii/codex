@@ -1,6 +1,7 @@
 use super::bounded_session::*;
 use super::*;
 use crate::session::session::SessionSettingsUpdate;
+use anyhow::Context as _;
 use codex_code_mode::CodeModeSessionCellExecutionLimits;
 use codex_code_mode::CodeModeSessionOptions;
 #[cfg(target_os = "linux")]
@@ -178,6 +179,7 @@ fn result_text(response: &RuntimeResponse) -> String {
 fn bounded_code_mode_native_sessions_isolate_heap_names_state_and_lifetime() -> anyhow::Result<()> {
     core_test_support::test_codex::run_test_with_large_stack("bounded-code-mode", || async {
         let recorder = CodeModeHostRecorder::new()?;
+        recorder.enable_inheritable_descriptor_probe().await?;
         let recorder_program = recorder.program();
         let recording_directory = recorder_program.parent().expect("recording directory");
         let (session, human, _events) = sandbox_session().await;
@@ -261,7 +263,11 @@ fn bounded_code_mode_native_sessions_isolate_heap_names_state_and_lifetime() -> 
                 &turn,
                 "store('own',7); text(typeof load('human'));",
             )
-            .await?;
+            .await
+            .with_context(|| {
+                std::fs::read_to_string(recording_directory.join("guard result"))
+                    .unwrap_or_else(|error| format!("fixture probe unavailable: {error}"))
+            })?;
             assert_eq!(result_text(&response), "undefined");
             assert!(
                 owned_id

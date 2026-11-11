@@ -8,6 +8,8 @@ pub use child_command::ProcessMode;
 pub use child_command::SpawnFallback;
 #[cfg(target_os = "linux")]
 mod linux_fds;
+#[cfg(target_os = "linux")]
+pub use linux_fds::require_explicit_descriptors;
 pub mod pipe;
 mod process;
 pub mod process_group;

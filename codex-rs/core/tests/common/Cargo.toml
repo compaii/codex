@@ -37,6 +37,7 @@ codex-utils-cargo-bin = { workspace = true }
 codex-utils-path-uri = { workspace = true }
 ctor = { workspace = true }
 futures = { workspace = true }
+libc = { workspace = true }
 notify = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
