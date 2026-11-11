@@ -224,7 +224,11 @@ impl TurnEnvironment {
         self.permission_ceiling.as_ref()
     }
 
-    pub(crate) fn restrict_permissions(&mut self, ceiling: &PermissionProfile) -> CodexResult<()> {
+    pub(crate) fn restrict_permissions(
+        &mut self,
+        ceiling: &PermissionProfile,
+        command_environment: Option<&ShellEnvironmentPolicy>,
+    ) -> CodexResult<()> {
         if self.environment.is_remote() {
             return Err(CodexErr::InvalidRequest(
                 "host permission ceiling requires a qualified local executor".into(),
@@ -253,6 +257,10 @@ impl TurnEnvironment {
         };
         config.permission_profile =
             codex_protocol::models::PermissionProfileSnapshot::legacy(permissions.clone());
+        if let Some(policy) = command_environment {
+            config.shell_environment_policy = policy.clone();
+            config.allow_login_shell = false;
+        }
         self.permission_ceiling = Some(permissions);
         self.shell_snapshot = futures::future::ready(None).boxed().shared();
         self.shell_snapshot_builder = None;
@@ -369,6 +377,7 @@ impl std::fmt::Debug for TurnEnvironment {
 /// Request options for one turn, separate from persistent thread settings.
 #[derive(Default)]
 pub(crate) struct NewTurnContextOptions {
+    pub(crate) command_environment_policy: Option<ShellEnvironmentPolicy>,
     pub(crate) permission_ceiling: Option<PermissionProfile>,
     pub(crate) tool_ceiling: Option<Vec<codex_protocol::ToolName>>,
     pub(crate) final_output_json_schema: Option<Value>,
@@ -381,6 +390,9 @@ struct TurnToolCeiling(codex_extension_api::ToolPolicy);
 
 #[derive(Clone, Debug)]
 struct TurnPermissionCeiling(Arc<PermissionProfile>);
+
+#[derive(Clone, Debug)]
+struct TurnCommandEnvironmentPolicy(Arc<ShellEnvironmentPolicy>);
 
 /// The context needed for a single turn of the thread.
 #[derive(Debug)]
@@ -463,6 +475,12 @@ enum TurnContextBuildMode {
 }
 
 impl TurnContext {
+    pub(crate) fn command_environment_policy(&self) -> Option<Arc<ShellEnvironmentPolicy>> {
+        self.extension_data
+            .get::<TurnCommandEnvironmentPolicy>()
+            .map(|policy| Arc::clone(&policy.0))
+    }
+
     pub(crate) fn permission_ceiling(&self) -> Option<Arc<PermissionProfile>> {
         self.extension_data
             .get::<TurnPermissionCeiling>()
@@ -475,7 +493,8 @@ impl TurnContext {
     ) -> CodexResult<TurnEnvironmentSnapshot> {
         match self.permission_ceiling() {
             None => Ok(environments),
-            Some(ceiling) => environments.restrict_permissions(&ceiling),
+            Some(ceiling) => environments
+                .restrict_permissions(&ceiling, self.command_environment_policy().as_deref()),
         }
     }
 
@@ -517,6 +536,9 @@ impl TurnContext {
         }
         if let Some(ceiling) = self.extension_data.get::<TurnPermissionCeiling>() {
             extension_data.insert_arc(ceiling);
+        }
+        if let Some(policy) = self.extension_data.get::<TurnCommandEnvironmentPolicy>() {
+            extension_data.insert_arc(policy);
         }
 
         Self {
@@ -1383,7 +1405,8 @@ impl Session {
         git_enrichment_policy: GitEnrichmentPolicy,
     ) -> CodexResult<Arc<TurnContext>> {
         let turn_environments = match options.permission_ceiling.as_ref() {
-            Some(ceiling) => turn_environments.restrict_permissions(ceiling)?,
+            Some(ceiling) => turn_environments
+                .restrict_permissions(ceiling, options.command_environment_policy.as_ref())?,
             None => turn_environments,
         };
         let primary_turn_environment = turn_environments.primary();
@@ -1499,6 +1522,11 @@ impl Session {
         );
         turn_context.realtime_active = self.conversation.running_state().await.is_some();
 
+        if let Some(policy) = options.command_environment_policy {
+            turn_context
+                .extension_data
+                .insert(TurnCommandEnvironmentPolicy(Arc::new(policy)));
+        }
         if let Some(ceiling) = options.permission_ceiling {
             turn_context
                 .extension_data

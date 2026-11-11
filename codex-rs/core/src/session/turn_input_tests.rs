@@ -2008,7 +2008,7 @@ async fn host_permission_ceiling_does_not_wait_for_an_unrelated_unavailable_envi
             required_skills: Vec::new(),
             error: "fixture unavailable".into(),
         });
-    let restricted = environments.restrict_permissions(&PermissionProfile::read_only())?;
+    let restricted = environments.restrict_permissions(&PermissionProfile::read_only(), None)?;
     assert_eq!(restricted.turn_environments().count(), 1);
     assert!(
         matches!(&restricted.environments[1], TurnEnvironmentState::Failed { error, .. } if error == "fixture unavailable")
@@ -2106,6 +2106,10 @@ fn host_profile_raw_process_enforces_private_files_offline_ipc_and_empty_inherit
                         .shell_environment_policy
                         .r#set
                         .insert("PATH".into(), "/usr/bin:/bin".into());
+                    config.permissions.shell_environment_policy.r#set.insert(
+                        "PROFILE_PRIVATE".into(),
+                        "private fixture environment".into(),
+                    );
                 },
             ),
         )
@@ -2125,6 +2129,16 @@ fn host_profile_raw_process_enforces_private_files_offline_ipc_and_empty_inherit
             &session,
             ThreadSettingsOverrides::default(),
             TurnStartOptions {
+                command_environment_policy: Some(
+                    codex_protocol::config_types::ShellEnvironmentPolicy {
+                        inherit: ShellEnvironmentPolicyInherit::None,
+                        r#set: std::collections::HashMap::from([(
+                            "PATH".into(),
+                            "/usr/bin:/bin".into(),
+                        )]),
+                        ..Default::default()
+                    },
+                ),
                 permission_ceiling: Some(ceiling),
                 tool_ceiling: Some(vec![codex_protocol::ToolName::plain("exec_command")]),
                 inference_allowance: Some(codex_protocol::turn_input::TurnInferenceAllowance {
@@ -2142,7 +2156,7 @@ fn host_profile_raw_process_enforces_private_files_offline_ipc_and_empty_inherit
         let script = format!(
             r#"import errno, os, socket
 assert os.environ['PATH'] == '/usr/bin:/bin'
-for key in ('HOME', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN'):
+for key in ('PROFILE_PRIVATE', 'HOME', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN'):
     assert key not in os.environ, key
 for path in ({secret}, '/proc/{parent_pid}/environ'):
     try:
@@ -2183,7 +2197,7 @@ print('private-files-denied ipc-denied inheritance-empty work-written')"#,
         .await?
         .expect("human turn");
         let script = format!(
-            "import socket\nassert open({secret}).read() == 'private fixture'\ns=socket.socket(socket.AF_UNIX)\ns.connect({socket})\ns.close()\nprint('human-access-preserved')",
+            "import os, socket\nassert os.environ['PROFILE_PRIVATE'] == 'private fixture environment'\nassert open({secret}).read() == 'private fixture'\ns=socket.socket(socket.AF_UNIX)\ns.connect({socket})\ns.close()\nprint('human-access-preserved')",
             secret = serde_json::to_string(secret.as_path())?,
             socket = serde_json::to_string(socket.as_path())?
         );
@@ -2194,4 +2208,71 @@ print('private-files-denied ipc-denied inheritance-empty work-written')"#,
         );
         Ok(())
     })
+}
+
+#[tokio::test]
+async fn host_command_environment_requires_explicit_bounded_non_profile_values() {
+    use codex_protocol::config_types::ShellEnvironmentPolicy;
+    use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
+    let (session, _, _rx) = make_session_and_context_with_rx().await;
+    let explicit = ShellEnvironmentPolicy {
+        inherit: ShellEnvironmentPolicyInherit::None,
+        ..Default::default()
+    };
+    for (policy, permissions) in [
+        (ShellEnvironmentPolicy::default(), true),
+        (
+            ShellEnvironmentPolicy {
+                use_profile: true,
+                ..explicit.clone()
+            },
+            true,
+        ),
+        (
+            ShellEnvironmentPolicy {
+                r#set: std::collections::HashMap::from([("LARGE".into(), "x".repeat(64 * 1024))]),
+                ..explicit.clone()
+            },
+            true,
+        ),
+        (explicit.clone(), false),
+    ] {
+        let options = TurnStartOptions {
+            command_environment_policy: Some(policy),
+            permission_ceiling: permissions
+                .then(codex_protocol::models::PermissionProfile::read_only),
+            tool_ceiling: Some(vec![]),
+            inference_allowance: Some(codex_protocol::turn_input::TurnInferenceAllowance {
+                max_provider_attempts: 1,
+                max_request_bytes: 4096,
+                deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+            }),
+            ..Default::default()
+        };
+        assert!(
+            PreparedTurnInputSettings::prepare(
+                &session,
+                ThreadSettingsOverrides::default(),
+                options
+            )
+            .await
+            .is_err()
+        );
+    }
+    let options = TurnStartOptions {
+        command_environment_policy: Some(explicit),
+        permission_ceiling: Some(codex_protocol::models::PermissionProfile::read_only()),
+        tool_ceiling: Some(vec![]),
+        inference_allowance: Some(codex_protocol::turn_input::TurnInferenceAllowance {
+            max_provider_attempts: 1,
+            max_request_bytes: 4096,
+            deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+        }),
+        ..Default::default()
+    };
+    assert!(
+        PreparedTurnInputSettings::prepare(&session, ThreadSettingsOverrides::default(), options)
+            .await
+            .is_ok()
+    );
 }

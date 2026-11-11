@@ -1040,6 +1040,18 @@ async fn host_permission_ceiling_restricts_a_runtime_resolved_broader_environmen
                 let ToolEnvironments::Arguments(environments) = &invocation.environments else {
                     panic!("resolved environment");
                 };
+                let selected = &environments[0].1;
+                assert!(!selected.config().allow_login_shell);
+                assert!(matches!(
+                    selected.shell_environment_policy().inherit,
+                    codex_protocol::config_types::ShellEnvironmentPolicyInherit::None
+                ));
+                assert!(
+                    !selected
+                        .shell_environment_policy()
+                        .r#set
+                        .contains_key("RUNTIME_PRIVATE")
+                );
                 let profile = environments[0].1.permission_profile();
                 assert!(matches!(profile, PermissionProfile::Managed { .. }));
                 assert!(
@@ -1072,6 +1084,11 @@ async fn host_permission_ceiling_restricts_a_runtime_resolved_broader_environmen
         .clone();
     broader.config_mut().permission_profile =
         PermissionProfileSnapshot::legacy(PermissionProfile::Disabled);
+    broader
+        .config_mut()
+        .shell_environment_policy
+        .r#set
+        .insert("RUNTIME_PRIVATE".into(), "fixture".into());
     let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let runtime = Arc::new(Runtime {
         environment: Arc::new(broader),
@@ -1083,6 +1100,12 @@ async fn host_permission_ceiling_restricts_a_runtime_resolved_broader_environmen
         .new_turn_with_default_settings(
             "restricted-resolved-environment".into(),
             crate::session::turn_context::NewTurnContextOptions {
+                command_environment_policy: Some(
+                    codex_protocol::config_types::ShellEnvironmentPolicy {
+                        inherit: codex_protocol::config_types::ShellEnvironmentPolicyInherit::None,
+                        ..Default::default()
+                    },
+                ),
                 permission_ceiling: Some(PermissionProfile::read_only()),
                 tool_ceiling: Some(vec![name.clone()]),
                 ..Default::default()

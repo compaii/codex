@@ -234,6 +234,9 @@ pub struct TurnInferenceAllowance {
 /// child input, Core also compares root lineage to detect ambiguity.
 #[derive(Clone, Debug, Default)]
 pub struct TurnStartOptions {
+    /// Host-only explicit shell policy for this bounded execution, not thread state.
+    /// Requires a permission ceiling; parent inheritance and login profiles are disabled.
+    pub command_environment_policy: Option<crate::config_types::ShellEnvironmentPolicy>,
     /// Resolved host-only permission ceiling for one bounded turn. Requires an
     /// explicit tool ceiling; this never changes persistent thread permissions.
     pub permission_ceiling: Option<crate::models::PermissionProfile>,
