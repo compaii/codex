@@ -7,7 +7,9 @@ use codex_api::InferenceAllowance;
 use codex_api::Provider;
 use codex_api::ProviderAttempt;
 use codex_api::ProviderAttemptGate;
+use codex_api::ProviderAttemptObservation;
 use codex_api::ProviderAttemptReservation;
+use codex_api::ProviderAttemptUsage;
 use codex_api::ReqwestTransport;
 use codex_api::ResponseCreateWsRequest;
 use codex_api::ResponseEvent;
@@ -48,10 +50,13 @@ impl AuthProvider for NoAuth {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct ReservationGate {
     permitted: u32,
     claims: Mutex<Vec<(uuid::Uuid, u32, usize)>>,
+    usage: Mutex<Vec<ProviderAttemptUsage>>,
+    hang_observer: bool,
+    observed: tokio::sync::Notify,
 }
 
 impl ProviderAttemptGate for ReservationGate {
@@ -62,6 +67,15 @@ impl ProviderAttemptGate for ReservationGate {
             attempt.max_request_bytes,
         ));
         Box::pin(async move { attempt.ordinal <= self.permitted })
+    }
+    fn observe_usage(&self, usage: ProviderAttemptUsage) -> ProviderAttemptObservation<'_> {
+        self.usage.lock().expect("gate usage fixture").push(usage);
+        self.observed.notify_one();
+        Box::pin(async move {
+            if self.hang_observer {
+                std::future::pending::<()>().await;
+            }
+        })
     }
 }
 
@@ -241,6 +255,17 @@ async fn websocket_peer(
     Arc<AtomicUsize>,
     tokio::task::JoinHandle<()>,
 ) {
+    websocket_peer_mode(complete, "legacy").await
+}
+
+async fn websocket_peer_mode(
+    complete: bool,
+    mode: &'static str,
+) -> (
+    ResponsesWebsocketConnection,
+    Arc<AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("loopback allowance fixture");
@@ -269,9 +294,26 @@ async fn websocket_peer(
                 let value: serde_json::Value =
                     serde_json::from_str(&text).expect("loopback allowance fixture");
                 if value["type"] == "response.create" {
-                    observed.fetch_add(1, Ordering::SeqCst);
+                    let ordinal = observed.fetch_add(1, Ordering::SeqCst) + 1;
                     if complete {
-                        ws.send(Message::Text(json!({"type":"response.completed","response":{"id":"allowance-response","status":"completed","output":[]}}).to_string().into())).await.expect("loopback allowance fixture");
+                        let id = if mode == "legacy" {
+                            "allowance-response".into()
+                        } else {
+                            format!("verified-response-{ordinal}")
+                        };
+                        if matches!(mode, "verified" | "stale") {
+                            let created=Message::Text(json!({"type":"response.created","response":{"id":id,"status":"in_progress"}}).to_string().into());
+                            if ws.send(created).await.is_err() {
+                                break;
+                            }
+                        }
+                        let terminal=Message::Text(json!({"type":"response.completed","response":{"id":id,"status":"completed","output":[]}}).to_string().into());
+                        if ws.send(terminal.clone()).await.is_err() {
+                            break;
+                        }
+                        if mode == "stale" && ordinal == 1 {
+                            let _ = ws.send(terminal).await;
+                        }
                     }
                 }
             }
@@ -612,6 +654,8 @@ async fn provider_gate_refuses_before_http_and_closes_retries() {
     let gate = Arc::new(ReservationGate {
         permitted: 1,
         claims: Mutex::default(),
+        usage: Mutex::default(),
+        ..Default::default()
     });
     let allowance = Arc::new(
         InferenceAllowance::new(8, 4096, Instant::now() + Duration::from_secs(30))
@@ -646,6 +690,8 @@ async fn provider_gate_refuses_websocket_write_and_http_fallback() {
     let gate = Arc::new(ReservationGate {
         permitted: 0,
         claims: Mutex::default(),
+        usage: Mutex::default(),
+        ..Default::default()
     });
     let allowance = Arc::new(
         InferenceAllowance::new(8, 4096, Instant::now() + Duration::from_secs(30))
@@ -687,4 +733,204 @@ async fn provider_gate_refuses_websocket_write_and_http_fallback() {
         .await
         .expect("gate fixture")
         .expect("gate fixture");
+}
+
+#[tokio::test]
+async fn successful_http_retry_reports_usage_for_only_its_exact_physical_claim() {
+    let server = MockServer::start().await;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let observed = requests.clone();
+    Mock::given(method("POST")).and(path("/responses"))
+        .respond_with(move |_: &wiremock::Request| {
+            if observed.fetch_add(1,Ordering::SeqCst)==0 {ResponseTemplate::new(500)} else {
+                ResponseTemplate::new(200).insert_header("content-type","text/event-stream")
+                    .insert_header("openai-model","effective-loopback")
+                    .set_body_string("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"success-after-retry\",\"usage\":{\"input_tokens\":7,\"output_tokens\":5,\"total_tokens\":12}}}\n\n")
+            }
+        }).expect(2).mount(&server).await;
+    let gate = Arc::new(ReservationGate {
+        permitted: 2,
+        claims: Mutex::default(),
+        usage: Mutex::default(),
+        ..Default::default()
+    });
+    let allowance = Arc::new(
+        InferenceAllowance::new(2, 4096, Instant::now() + Duration::from_secs(30))
+            .expect("usage fixture")
+            .with_provider_attempt_gate(gate.clone()),
+    );
+    let mut stream = client(&server, allowance)
+        .stream(
+            json!({"model":"loopback"}),
+            HeaderMap::new(),
+            Compression::None,
+            None,
+        )
+        .await
+        .expect("usage fixture");
+    while let Some(event) = stream.next().await {
+        event.expect("usage fixture");
+    }
+    let claims = gate.claims.lock().expect("claims");
+    let usage = gate.usage.lock().expect("usage");
+    assert_eq!(claims.len(), 2);
+    assert_ne!(claims[0].0, claims[1].0);
+    assert_eq!(usage.len(), 1);
+    assert_eq!((usage[0].attempt_id, usage[0].ordinal), (claims[1].0, 2));
+    assert_eq!(usage[0].response_id, "success-after-retry");
+    assert_eq!(usage[0].model.as_deref(), Some("effective-loopback"));
+    assert_eq!(
+        usage[0]
+            .token_usage
+            .as_ref()
+            .expect("observed usage")
+            .total_tokens,
+        12
+    );
+}
+
+#[tokio::test]
+async fn reused_websocket_reports_each_completion_with_its_own_claim_and_unknown_usage() {
+    let (connection, received, server) = websocket_peer_mode(true, "verified").await;
+    let gate = Arc::new(ReservationGate {
+        permitted: 2,
+        claims: Mutex::default(),
+        usage: Mutex::default(),
+        ..Default::default()
+    });
+    let allowance = Arc::new(
+        InferenceAllowance::new(2, 4096, Instant::now() + Duration::from_secs(30))
+            .expect("usage fixture")
+            .with_provider_attempt_gate(gate.clone()),
+    );
+    for _ in 0..2 {
+        let mut stream = connection
+            .stream_request_with_allowance(ws_request(), false, None, 512, allowance.clone())
+            .await
+            .expect("usage fixture");
+        while let Some(event) = stream.next().await {
+            event.expect("usage fixture");
+        }
+    }
+    assert_eq!(received.load(Ordering::SeqCst), 2);
+    {
+        let claims = gate.claims.lock().expect("claims");
+        let usage = gate.usage.lock().expect("usage");
+        assert_eq!(usage.len(), 2);
+        for (index, usage) in usage.iter().enumerate() {
+            assert_eq!(usage.attempt_id, claims[index].0);
+            assert_eq!(usage.ordinal, index as u32 + 1);
+            assert!(usage.token_usage.is_none());
+            assert!(usage.model.is_none());
+        }
+    }
+    drop(connection);
+    server.await.expect("peer closed");
+}
+
+#[tokio::test]
+async fn late_duplicate_completion_never_becomes_usage_of_next_websocket_attempt() {
+    let (connection, _, server) = websocket_peer_mode(true, "stale").await;
+    let gate = Arc::new(ReservationGate {
+        permitted: 2,
+        ..Default::default()
+    });
+    let allowance = Arc::new(
+        InferenceAllowance::new(2, 4096, Instant::now() + Duration::from_secs(5))
+            .expect("stale fixture")
+            .with_provider_attempt_gate(gate.clone()),
+    );
+    let mut first = connection
+        .stream_request_with_allowance(ws_request(), false, None, 512, allowance.clone())
+        .await
+        .expect("first");
+    while let Some(event) = first.next().await {
+        event.expect("first completion");
+    }
+    let mut next = connection
+        .stream_request_with_allowance(ws_request(), true, None, 512, allowance)
+        .await
+        .expect("next");
+    let mut refused = false;
+    while let Some(event) = next.next().await {
+        if event.is_err() {
+            refused = true;
+        }
+    }
+    assert!(refused);
+    assert_eq!(gate.claims.lock().expect("claims").len(), 2);
+    assert_eq!(gate.usage.lock().expect("usage").len(), 1);
+    drop(connection);
+    server.await.expect("closed stale peer");
+}
+
+#[tokio::test]
+async fn websocket_without_creation_proof_preserves_completion_but_never_invents_usage_binding() {
+    let (connection, _, server) = websocket_peer_mode(true, "no-created").await;
+    let gate = Arc::new(ReservationGate {
+        permitted: 1,
+        ..Default::default()
+    });
+    let allowance = Arc::new(
+        InferenceAllowance::new(1, 4096, Instant::now() + Duration::from_secs(5))
+            .expect("source fixture")
+            .with_provider_attempt_gate(gate.clone()),
+    );
+    let mut stream = connection
+        .stream_request_with_allowance(ws_request(), false, None, 512, allowance)
+        .await
+        .expect("stream");
+    let mut completed = false;
+    while let Some(event) = stream.next().await {
+        completed |= matches!(event.expect("event"), ResponseEvent::Completed { .. });
+    }
+    assert!(completed);
+    assert_eq!(gate.claims.lock().expect("claims").len(), 1);
+    assert!(gate.usage.lock().expect("usage").is_empty());
+    drop(connection);
+    server.await.expect("closed source peer");
+}
+
+#[tokio::test]
+async fn pending_usage_observer_cannot_erase_completion_at_websocket_cancel_deadline() {
+    let (connection, _, server) = websocket_peer_mode(true, "verified").await;
+    let gate = Arc::new(ReservationGate {
+        permitted: 1,
+        hang_observer: true,
+        ..Default::default()
+    });
+    let allowance = Arc::new(
+        InferenceAllowance::new(1, 4096, Instant::now() + Duration::from_secs(5))
+            .expect("cancel fixture")
+            .with_provider_attempt_gate(gate.clone()),
+    );
+    let mut stream = connection
+        .stream_request_with_allowance(ws_request(), false, None, 512, allowance)
+        .await
+        .expect("stream");
+    tokio::time::timeout(Duration::from_secs(1), gate.observed.notified())
+        .await
+        .expect("usage parsed");
+    stream
+        .interrupt
+        .take()
+        .expect("interrupt")
+        .send(codex_api::ResponseInterrupt::Cancel {
+            deadline: Instant::now() + Duration::from_millis(100),
+        })
+        .unwrap_or_else(|_| panic!("interrupt admitted"));
+    let response = tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(event) = stream.next().await {
+            if let ResponseEvent::Completed { response_id, .. } = event.expect("retained terminal")
+            {
+                return response_id;
+            }
+        }
+        panic!("Parsed completion disappeared");
+    })
+    .await
+    .expect("must not await original five-second bound");
+    assert_eq!(response, "verified-response-1");
+    drop(connection);
+    server.await.expect("closed cancelled peer");
 }

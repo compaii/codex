@@ -1,4 +1,5 @@
 use crate::InferenceAllowance;
+use crate::ProviderAttempt;
 use crate::RESPONSES_PATH;
 use crate::auth::SharedAuthProvider;
 use crate::common::ResponseEvent;
@@ -12,6 +13,7 @@ use crate::endpoint::responses_websocket_probe::ResponsesWebsocketProbe;
 use crate::endpoint::responses_websocket_probe::ResponsesWebsocketProbeError;
 use crate::endpoint::responses_websocket_probe::ResponsesWebsocketProbeFailureStage;
 use crate::error::ApiError;
+use crate::inference_allowance::AttemptObserver;
 use crate::provider::Provider;
 use crate::rate_limits::parse_rate_limit_event;
 use crate::responses_headers::json_headers_to_http_headers;
@@ -57,6 +59,7 @@ use tungstenite::protocol::WebSocketConfig;
 use url::Url;
 
 struct WsStream {
+    completed_responses: std::collections::HashSet<String>,
     routing_affinity: Option<codex_http_client::ChatGptRoutingAffinity>,
     tx_command: mpsc::Sender<WsCommand>,
     rx_message: mpsc::UnboundedReceiver<Result<Message, WsError>>,
@@ -66,7 +69,7 @@ struct WsStream {
 enum WsCommand {
     Send {
         message: Message,
-        tx_result: oneshot::Sender<Result<(), WsError>>,
+        tx_result: oneshot::Sender<Result<Option<ProviderAttempt>, WsError>>,
         inference_allowance: Option<Arc<InferenceAllowance>>,
     },
 }
@@ -91,12 +94,13 @@ impl WsStream {
                                 // expired queued command must not acquire a fresh lease.
                                 let result = if let Some(allowance) = inference_allowance {
                                     match allowance.claim_authorized_attempt().await {
-                                        Ok(remaining) => tokio::time::timeout(remaining, inner.send(message)).await
-                                            .unwrap_or_else(|_| Err(WsError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "native inference allowance deadline expired")))),
+                                        Ok(claimed) => tokio::time::timeout(claimed.remaining, inner.send(message)).await
+                                            .unwrap_or_else(|_| Err(WsError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "native inference allowance deadline expired"))))
+                                            .map(|()| Some(claimed.attempt)),
                                         Err(error) => Err(WsError::Io(std::io::Error::other(error.to_string()))),
                                     }
                                 } else {
-                                    inner.send(message).await
+                                    inner.send(message).await.map(|()| None)
                                 };
                                 let should_break = result.is_err();
                                 let _ = tx_result.send(result);
@@ -141,6 +145,7 @@ impl WsStream {
         });
 
         Self {
+            completed_responses: std::collections::HashSet::new(),
             routing_affinity,
             tx_command,
             rx_message,
@@ -150,8 +155,10 @@ impl WsStream {
 
     async fn request(
         &mut self,
-        make_command: impl FnOnce(oneshot::Sender<Result<(), WsError>>) -> WsCommand,
-    ) -> Result<(), WsError> {
+        make_command: impl FnOnce(
+            oneshot::Sender<Result<Option<ProviderAttempt>, WsError>>,
+        ) -> WsCommand,
+    ) -> Result<Option<ProviderAttempt>, WsError> {
         let (tx_result, rx_result) = oneshot::channel();
         if self.tx_command.send(make_command(tx_result)).await.is_ok()
             && let Ok(result) = rx_result.await
@@ -168,7 +175,7 @@ impl WsStream {
         &mut self,
         message: Message,
         inference_allowance: Option<Arc<InferenceAllowance>>,
-    ) -> Result<(), WsError> {
+    ) -> Result<Option<ProviderAttempt>, WsError> {
         self.request(|tx_result| WsCommand::Send {
             message,
             tx_result,
@@ -862,16 +869,27 @@ async fn run_websocket_response_stream(
         // No request reached the backend, so this socket is still reusable.
         return Ok(());
     }
-    send_websocket_request_with_allowance(
+    // Retain response identities for this socket, never a rolling history that
+    // could make an old terminal eligible again. Saturation requires a fresh
+    // connection for accounting; ordinary unmetered streams remain compatible.
+    if inference_allowance.is_some() && ws_stream.completed_responses.len() >= 1024 {
+        return Err(ApiError::Stream(
+            "provider response identity bound reached".into(),
+        ));
+    }
+    let attempt = send_websocket_request_with_allowance(
         ws_stream,
         request_text,
         idle_timeout,
         telemetry.as_ref(),
         timing_log_context.connection_reused,
-        inference_allowance,
+        inference_allowance.clone(),
     )
     .await?;
 
+    let observer = inference_allowance
+        .zip(attempt)
+        .and_then(|(allowance, attempt)| AttemptObserver::new(allowance, attempt));
     // A response owns its interrupt, and create must be sent before interrupt.
     let mut interrupt_request = interrupt.clone().fuse();
     let mut interruption = None;
@@ -1001,8 +1019,60 @@ async fn run_websocket_response_stream(
                 // Preserve terminal usage before any accompanying notification can block.
                 let event = match process_responses_event(event) {
                     Ok(Some(event @ ResponseEvent::Completed { .. })) => {
+                        if let ResponseEvent::Completed {
+                            response_id: id, ..
+                        } = &event
+                        {
+                            let valid = !id.is_empty() && id.len() <= 200;
+                            let seen = valid && ws_stream.completed_responses.contains(id);
+                            if observer.is_some()
+                                && (!valid
+                                    || seen
+                                    || response_id.as_ref().is_some_and(|expected| expected != id))
+                            {
+                                return Err(ApiError::Stream(
+                                    "provider completion identity is stale or conflicting".into(),
+                                ));
+                            }
+                            if valid && ws_stream.completed_responses.len() < 1024 {
+                                ws_stream.completed_responses.insert(id.clone());
+                            }
+                        }
+                        // Keep parsed terminal evidence before any cancellable
+                        // owner callback, just as before adding usage reports.
                         *completion = Some(event);
+                        if let (
+                            Some(observer),
+                            Some(
+                                event @ ResponseEvent::Completed {
+                                    response_id: id, ..
+                                },
+                            ),
+                        ) = (&observer, completion.as_ref())
+                            && response_id.as_ref() == Some(id)
+                        {
+                            // A raw model field or unrelated socket metadata is
+                            // not proof of the model for this exact response.
+                            observer.observe(event, model.clone()).await;
+                        }
                         Ok(None)
+                    }
+                    Ok(Some(event @ ResponseEvent::Created { .. })) => {
+                        if let ResponseEvent::Created {
+                            response_id: Some(id),
+                        } = &event
+                            && observer.is_some()
+                            && (id.is_empty()
+                                || id.len() > 200
+                                || ws_stream.completed_responses.contains(id)
+                                || response_id.as_ref().is_some_and(|expected| expected != id))
+                        {
+                            return Err(ApiError::Stream(
+                                "provider response creation identity is stale or conflicting"
+                                    .into(),
+                            ));
+                        }
+                        Ok(Some(event))
                     }
                     event => event,
                 };
@@ -1122,6 +1192,7 @@ async fn send_websocket_request(
         None,
     )
     .await
+    .map(|_| ())
 }
 
 async fn send_websocket_request_with_allowance(
@@ -1131,7 +1202,7 @@ async fn send_websocket_request_with_allowance(
     telemetry: Option<&Arc<dyn WebsocketTelemetry>>,
     connection_reused: bool,
     inference_allowance: Option<Arc<InferenceAllowance>>,
-) -> Result<(), ApiError> {
+) -> Result<Option<ProviderAttempt>, ApiError> {
     let request_start = Instant::now();
     let result = tokio::time::timeout(
         idle_timeout,
@@ -1149,9 +1220,7 @@ async fn send_websocket_request_with_allowance(
         );
     }
 
-    result?;
-
-    Ok(())
+    result
 }
 
 fn serialize_websocket_request(request: &ResponsesWsRequest<'_>) -> Result<String, ApiError> {

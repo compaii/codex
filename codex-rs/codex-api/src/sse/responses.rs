@@ -6,6 +6,7 @@ use crate::common::SafetyBufferingTreatment;
 use crate::error::ApiError;
 use crate::error::parse_terminal_provider_error;
 use crate::guardian_assessment::parse_guardian_assessment;
+use crate::inference_allowance::AttemptObserver;
 use crate::rate_limits::parse_all_rate_limits;
 use crate::safety_buffering::treatment_from_headers;
 use crate::telemetry::SseTelemetry;
@@ -36,11 +37,22 @@ const OPENAI_MODEL_HEADER: &str = "openai-model";
 const REQUEST_ID_HEADER: &str = "x-request-id";
 const TRUSTED_ACCESS_FOR_CYBER_VERIFICATION: &str = "trusted_access_for_cyber";
 
-pub fn spawn_response_stream(
+#[cfg(test)]
+pub(super) fn spawn_response_stream(
     stream_response: StreamResponse,
     idle_timeout: Duration,
     telemetry: Option<Arc<dyn SseTelemetry>>,
     turn_state: Option<Arc<OnceLock<String>>>,
+) -> ResponseStream {
+    spawn_response_stream_with_attempt(stream_response, idle_timeout, telemetry, turn_state, None)
+}
+
+pub(crate) fn spawn_response_stream_with_attempt(
+    stream_response: StreamResponse,
+    idle_timeout: Duration,
+    telemetry: Option<Arc<dyn SseTelemetry>>,
+    turn_state: Option<Arc<OnceLock<String>>>,
+    mut observer: Option<AttemptObserver>,
 ) -> ResponseStream {
     let rate_limit_snapshots = parse_all_rate_limits(&stream_response.headers);
     let models_etag = stream_response
@@ -72,6 +84,9 @@ pub fn spawn_response_stream(
     {
         let _ = turn_state.set(header_value.to_string());
     }
+    if let Some(observer) = observer.as_mut() {
+        observer.initial_model = server_model.clone();
+    }
     let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent, ApiError>>(1600);
     tokio::spawn(async move {
         if let Some(model) = server_model {
@@ -94,6 +109,7 @@ pub fn spawn_response_stream(
             idle_timeout,
             telemetry,
             safety_buffering_treatment,
+            observer,
         )
         .await;
     });
@@ -575,6 +591,7 @@ pub async fn process_sse(
         idle_timeout,
         telemetry,
         SafetyBufferingTreatment::default(),
+        None,
     )
     .await;
 }
@@ -585,6 +602,7 @@ async fn process_sse_with_treatment(
     idle_timeout: Duration,
     telemetry: Option<Arc<dyn SseTelemetry>>,
     safety_buffering_treatment: SafetyBufferingTreatment,
+    observer: Option<AttemptObserver>,
 ) {
     let mut stream = stream.eventsource();
     let mut response_error: Option<ApiError> = None;
@@ -646,7 +664,18 @@ async fn process_sse_with_treatment(
         let safety_buffering = event.safety_buffering(&safety_buffering_treatment);
         let metadata_events = event.metadata_events(safety_buffering);
 
-        if let Some(model) = event.response_model()
+        let model = event.response_model();
+        let processed = process_responses_event(event);
+        if let Ok(Some(ref event)) = processed
+            && let Some(observer) = &observer
+        {
+            tokio::select! {
+                biased;
+                _=tx_event.closed()=>return,
+                _=observer.observe(event, model.clone().or_else(|| last_server_model.clone()))=>{},
+            }
+        }
+        if let Some(model) = model
             && last_server_model.as_deref() != Some(model.as_str())
         {
             if tx_event
@@ -664,7 +693,7 @@ async fn process_sse_with_treatment(
             }
         }
 
-        match process_responses_event(event) {
+        match processed {
             Ok(Some(event)) => {
                 let is_completed = matches!(event, ResponseEvent::Completed { .. });
                 if tx_event.send(Ok(event)).await.is_err() {

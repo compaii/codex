@@ -182,3 +182,41 @@ provided and qualified together before claiming real economic fencing. No new
 budget, signer, API credential, account/provider switch, service, model attention
 or production activation is supplied by this source increment. Legacy callers
 without a selected gate retain their attempt/byte/deadline behavior.
+
+## Exact-attempt completion evidence
+
+`claim_authorized_attempt` returns an `AuthorizedProviderAttempt`, keeping the
+same UUID and ordinal that the owner reserved, alongside the remaining duration.
+The successful HTTP retry returns its own witness with its response stream;
+failed physical attempts do not acquire the following response's usage.
+The WebSocket writer pump returns the witness for that exact response-create
+write. Non-inference control frames do not consume a provider attempt.
+
+A selected host gate may implement `observe_usage(ProviderAttemptUsage)`.
+Responses streaming reports the exact attempt/response IDs, optional server model,
+optional token usage and unchanged provider usage metadata before model-side
+interceptors. These fields are observations, not a signed financial settlement.
+No usage, an absent observer or a lost callback retains maximum exposure.
+Reporting inherits the original absolute attempt deadline; HTTP consumer closure
+cancels it. Parsed WebSocket completion is retained before the callback so a
+shorter cancellation-cleanup deadline cannot erase it.
+
+For accounting on a reused WebSocket, a matching `response.created` is required;
+a terminal without it remains visible but produces no usage association. Stale
+or conflicting response IDs are refused before the observer. Each socket retains
+at most1024 completed IDs of at most200bytes; saturation requires a fresh
+connection for bounded execution instead of forgetting IDs. Ordinary unmetered
+completion delivery remains compatible. The reported WebSocket model comes only
+from that terminal's response headers, never unrelated socket metadata or an
+assumed requested model. HTTP may use its request-bound response header.
+
+Remote compaction v2 uses this Responses stream path: foreground through the
+client session and background with the same inherited turn allowance. The unary
+`EndpointSession::execute_with` route does not provide this completion observer.
+Source routing is not a real-model or compaction acceptance claim.
+
+The app-server reservation owner currently retains its default observer. Sending
+this evidence to the initiating App owner, signing/verifying exact usage under
+the existing accounting authority, full exposure/credential-route qualification
+and receiving adoption remain unfinished. No new balance, signer, account,
+provider selection, model call or runtime activation follows from this increment.

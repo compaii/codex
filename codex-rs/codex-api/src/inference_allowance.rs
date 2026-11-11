@@ -27,8 +27,55 @@ pub enum InferenceAllowanceError {
 
 use codex_protocol::provider_attempt::ProviderAttemptGateSelection as SelectedProviderAttemptGate;
 pub use codex_protocol::provider_attempt::{
-    ProviderAttempt, ProviderAttemptGate, ProviderAttemptReservation,
+    ProviderAttempt, ProviderAttemptGate, ProviderAttemptObservation, ProviderAttemptReservation,
+    ProviderAttemptUsage,
 };
+
+/// Witness returned by the same boundary that authorizes the physical send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedProviderAttempt {
+    pub attempt: ProviderAttempt,
+    pub remaining: Duration,
+}
+
+pub(crate) struct AttemptObserver {
+    pub allowance: Arc<InferenceAllowance>,
+    pub attempt: ProviderAttempt,
+    pub initial_model: Option<String>,
+}
+impl AttemptObserver {
+    pub fn new(allowance: Arc<InferenceAllowance>, attempt: ProviderAttempt) -> Option<Self> {
+        allowance.provider_attempt_gate.as_ref()?;
+        Some(Self {
+            allowance,
+            attempt,
+            initial_model: None,
+        })
+    }
+    pub async fn observe(&self, event: &crate::common::ResponseEvent, model: Option<String>) {
+        if let crate::common::ResponseEvent::Completed {
+            response_id,
+            token_usage,
+            usage_metadata,
+            ..
+        } = event
+            && let Some(gate) = &self.allowance.provider_attempt_gate
+        {
+            let usage = ProviderAttemptUsage {
+                attempt_id: self.attempt.id,
+                ordinal: self.attempt.ordinal,
+                response_id: response_id.clone(),
+                model: model.or_else(|| self.initial_model.clone()),
+                token_usage: token_usage.clone(),
+                usage_metadata: usage_metadata.clone(),
+            };
+            // Reporting cannot renew the original physical-attempt horizon or
+            // hold the provider stream indefinitely. Loss conserves exposure.
+            let _ =
+                tokio::time::timeout_at(self.attempt.deadline, gate.0.observe_usage(usage)).await;
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 struct State {
@@ -75,21 +122,22 @@ impl InferenceAllowance {
     /// Reserve at the actual physical-send boundary under the original absolute
     /// deadline. Refusal/unknown closes this allowance before any provider bytes;
     /// auth retries, WS writes and HTTP fallback cannot bypass the refusal.
-    pub async fn claim_authorized_attempt(&self) -> Result<Duration, InferenceAllowanceError> {
-        let (ordinal, remaining) = self.claim_attempt_number()?;
-        let Some(gate) = &self.provider_attempt_gate else {
-            return Ok(remaining);
-        };
+    pub async fn claim_authorized_attempt(
+        &self,
+    ) -> Result<AuthorizedProviderAttempt, InferenceAllowanceError> {
+        let (ordinal, _) = self.claim_attempt_number()?;
         let attempt = ProviderAttempt {
             id: uuid::Uuid::new_v4(),
             ordinal,
             max_request_bytes: self.max_request_bytes,
             deadline: self.deadline,
         };
-        if !matches!(
-            tokio::time::timeout_at(self.deadline, gate.0.reserve(attempt)).await,
-            Ok(true)
-        ) {
+        if let Some(gate) = &self.provider_attempt_gate
+            && !matches!(
+                tokio::time::timeout_at(self.deadline, gate.0.reserve(attempt.clone())).await,
+                Ok(true)
+            )
+        {
             self.close();
             return Err(InferenceAllowanceError::Reservation);
         }
@@ -100,7 +148,10 @@ impl InferenceAllowance {
         if state.closed {
             return Err(InferenceAllowanceError::Closed);
         }
-        self.remaining_time()
+        Ok(AuthorizedProviderAttempt {
+            attempt,
+            remaining: self.remaining_time()?,
+        })
     }
 
     pub fn deadline(&self) -> Instant {
