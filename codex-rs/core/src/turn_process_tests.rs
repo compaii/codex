@@ -72,7 +72,10 @@ fn bounded_turn_executor_journey(
         let workspace = program.parent().context("recorder workspace")?;
         let path = if legacy_bwrap {
             use std::os::unix::fs::PermissionsExt;
-            let wrapper = workspace.join("bwrap");
+            // Pre-sandbox executable discovery correctly rejects actor-writable
+            // PATH entries. Keep this host-owned test wrapper in the denied
+            // runtime package, outside the actor cwd and writable workspace.
+            let wrapper = package.path().join("bwrap");
             let marker = workspace.join("legacy-bwrap-used");
             let actual_bwrap = std::fs::canonicalize("/usr/bin/bwrap")?;
             std::fs::write(
@@ -84,7 +87,7 @@ fn bounded_turn_executor_journey(
                 ),
             )?;
             std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
-            format!("{}:/usr/bin:/bin", workspace.display())
+            format!("{}:/usr/bin:/bin", package.path().display())
         } else {
             "/usr/bin:/bin".to_string()
         };
@@ -397,7 +400,11 @@ time.sleep(120)
         assert!(backend.start(parameters("after-finish")).await.is_err());
         assert_eq!(std::fs::read_to_string(workspace.join("effect"))?, "once\n");
         if legacy_bwrap {
-            assert!(std::fs::read_to_string(workspace.join("legacy-bwrap-used"))?.contains("used"));
+            assert!(
+                std::fs::read_to_string(workspace.join("legacy-bwrap-used"))
+                    .context("legacy bubblewrap wrapper must have been selected")?
+                    .contains("used")
+            );
         }
         let (ordinary, _) = session
             .new_turn_with_sub_id(
