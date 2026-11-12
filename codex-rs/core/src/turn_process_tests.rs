@@ -28,7 +28,7 @@ fn bounded_turn_bootstraps_packaged_executor_under_denied_native_home() -> anyho
 }
 
 #[test]
-#[ignore = "requires the standalone executor/V8 binaries, system bwrap and an explicitly selected own user manager"]
+#[ignore = "requires the standalone executor/V8 binaries, system bwrap, cc and an explicitly selected own user manager"]
 fn bounded_turn_bootstraps_denied_runtime_with_legacy_bwrap_mounts() -> anyhow::Result<()> {
     bounded_turn_executor_journey(true, true)
 }
@@ -71,22 +71,51 @@ fn bounded_turn_executor_journey(
         let program = recorder.program();
         let workspace = program.parent().context("recorder workspace")?;
         let path = if legacy_bwrap {
-            use std::os::unix::fs::PermissionsExt;
             // Pre-sandbox executable discovery correctly rejects actor-writable
             // PATH entries. Keep this host-owned test wrapper in the denied
             // runtime package, outside the actor cwd and writable workspace.
             let wrapper = package.path().join("bwrap");
             let marker = workspace.join("legacy-bwrap-used");
             let actual_bwrap = std::fs::canonicalize("/usr/bin/bwrap")?;
+            let source = package.path().join("legacy-bwrap.c");
             std::fs::write(
-                &wrapper,
+                &source,
                 format!(
-                    "#!/usr/bin/python3\nimport os,sys\nif '--help' in sys.argv:\n print('--perms')\nelse:\n open({marker:?}, 'a').write('used\\n')\n os.execv({actual_bwrap:?}, [{actual_bwrap:?}] + sys.argv[1:])\n",
+                    r#"#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+int main(int argc, char **argv) {{
+    if (argc == 2 && strcmp(argv[1], "--help") == 0) {{
+        puts("--perms");
+        return 0;
+    }}
+    int marker = open({marker:?}, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (marker < 0 || write(marker, "used\n", 5) != 5) return 110;
+    close(marker);
+    argv[0] = {actual_bwrap:?};
+    execv(argv[0], argv);
+    return 111;
+}}
+"#,
                     marker = marker.to_string_lossy(),
                     actual_bwrap = actual_bwrap.to_string_lossy(),
                 ),
             )?;
-            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
+            // The trusted launcher pins bwrap by descriptor. A shebang wrapper
+            // cannot survive its close-on-exec launcher FD; use a tiny native
+            // fixture without changing production descriptor ownership.
+            let compile = std::process::Command::new("/usr/bin/cc")
+                .args([
+                    source.as_os_str(),
+                    std::ffi::OsStr::new("-o"),
+                    wrapper.as_os_str(),
+                ])
+                .output()?;
+            anyhow::ensure!(
+                compile.status.success(),
+                "legacy bwrap fixture compile failed"
+            );
             format!("{}:/usr/bin:/bin", package.path().display())
         } else {
             "/usr/bin:/bin".to_string()
