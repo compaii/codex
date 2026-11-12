@@ -49,7 +49,6 @@ use codex_attachment_store::AttachmentStore;
 use codex_attachment_store::InlineAttachmentStore;
 use codex_code_mode::CodeModeSessionProvider;
 use codex_code_mode::DisabledCodeModeSessionProvider;
-use codex_code_mode::ProcessOwnedCodeModeSessionProvider;
 use codex_core_plugins::PluginsManager;
 use codex_exec_server::EnvironmentManager;
 use codex_execpolicy::Policy;
@@ -805,9 +804,11 @@ impl ThreadManager {
                 ),
             )
             } else {
-                Arc::new(ProcessOwnedCodeModeSessionProvider::with_host_program(
-                    host_program,
-                ))
+                Arc::new(
+                    crate::code_mode_host::LocalCodeModeSessionProvider::with_host_program(
+                        host_program,
+                    ),
+                )
             };
         if config
             .features

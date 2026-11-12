@@ -60,6 +60,45 @@ async fn execute(
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn default_local_provider_preserves_ordinary_stdio_and_isolates_bounded_sessions()
+-> Result<()> {
+    let recorder = CodeModeHostRecorder::new()?;
+    let provider = super::LocalCodeModeSessionProvider::with_host_program(recorder.program());
+    assert!(recorder.invocations()?.is_empty());
+    let ordinary = provider
+        .create_session()
+        .await
+        .map_err(anyhow::Error::msg)?;
+    execute(&ordinary, "store('ordinary', 42);").await?;
+    assert_eq!(recorder.invocations()?, vec![String::new()]);
+    let isolated = provider
+        .create_isolated_session_with_options(
+            codex_code_mode::CodeModeSessionOptions::default(),
+            codex_code_mode::CodeModeHostOptions::default(),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(
+        execute(&isolated, "text(typeof load('ordinary'));").await?,
+        vec![FunctionCallOutputContentItem::InputText {
+            text: "undefined".into()
+        }]
+    );
+    assert_eq!(
+        recorder.invocations()?,
+        vec![String::new(), "--listen grpc+stdio://".into()]
+    );
+    isolated.shutdown().await.map_err(anyhow::Error::msg)?;
+    assert_eq!(
+        execute(&ordinary, "text(load('ordinary'));").await?,
+        vec![FunctionCallOutputContentItem::InputText { text: "42".into() }]
+    );
+    ordinary.shutdown().await.map_err(anyhow::Error::msg)?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn grpc_stdio_sessions_share_a_host_and_isolate_state() -> Result<()> {
     #[cfg(unix)]
@@ -298,7 +337,7 @@ exec {recorder_program} "$@"
             recorder_program = shlex::try_quote(program.to_str().context("host path")?)?
         ),
     )?;
-    let provider = ProcessOwnedGrpcCodeModeSessionProvider::with_host_program(guarded_program);
+    let provider = super::LocalCodeModeSessionProvider::with_host_program(guarded_program);
     let session = provider
         .create_isolated_session_with_options(
             codex_code_mode::CodeModeSessionOptions {

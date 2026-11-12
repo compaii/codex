@@ -96,6 +96,61 @@ impl CodeModeSessionProvider for LocalServerOutputProvider {
     }
 }
 
+/// Preserve the ordinary stdio host while giving bounded turns their existing
+/// sandboxed, exclusively owned gRPC host. No host starts until session creation.
+pub(crate) struct LocalCodeModeSessionProvider {
+    ordinary: ProcessOwnedCodeModeSessionProvider,
+    isolated: ProcessOwnedGrpcCodeModeSessionProvider,
+}
+
+impl LocalCodeModeSessionProvider {
+    pub(crate) fn with_host_program(host_program: PathBuf) -> Self {
+        Self {
+            ordinary: ProcessOwnedCodeModeSessionProvider::with_host_program(host_program.clone()),
+            isolated: ProcessOwnedGrpcCodeModeSessionProvider::with_host_program(host_program),
+        }
+    }
+}
+
+impl CodeModeSessionProvider for LocalCodeModeSessionProvider {
+    fn availability(&self) -> Result<(), String> {
+        self.ordinary.availability()
+    }
+
+    fn sample_process_metrics(
+        &self,
+    ) -> CodeModeSessionResultFuture<'_, CodeModeProcessMetricsSample> {
+        self.ordinary.sample_process_metrics()
+    }
+
+    fn create_session(&self) -> CodeModeSessionProviderFuture<'_> {
+        self.ordinary.create_session()
+    }
+
+    fn create_session_with_limits<'a>(
+        &'a self,
+        limits: CodeModeSessionCellExecutionLimits,
+    ) -> CodeModeSessionProviderFuture<'a> {
+        self.ordinary.create_session_with_limits(limits)
+    }
+
+    fn create_session_with_options<'a>(
+        &'a self,
+        options: CodeModeSessionOptions,
+    ) -> CodeModeSessionProviderFuture<'a> {
+        self.ordinary.create_session_with_options(options)
+    }
+
+    fn create_isolated_session_with_options<'a>(
+        &'a self,
+        options: CodeModeSessionOptions,
+        host_options: CodeModeHostOptions,
+    ) -> CodeModeSessionProviderFuture<'a> {
+        self.isolated
+            .create_isolated_session_with_options(options, host_options)
+    }
+}
+
 pub struct ProcessOwnedGrpcCodeModeSessionProvider {
     host_program: PathBuf,
     host_environment: Option<Arc<HashMap<String, String>>>,
