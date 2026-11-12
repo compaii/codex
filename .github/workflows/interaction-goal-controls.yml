@@ -39,6 +39,13 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           sudo apt-get update
           sudo apt-get install -y lld pkg-config libssl-dev cmake clang protobuf-compiler libcap-dev bubblewrap
+          # Match setup-ci's namespace prerequisite on this disposable runner.
+          # Keep the actual sandbox tests enabled; never relax receiving hosts here.
+          sudo sysctl -w kernel.unprivileged_userns_clone=1
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --unshare-user --unshare-net --ro-bind / / /bin/true
           df -h .
       - uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7
         id: native-cache
