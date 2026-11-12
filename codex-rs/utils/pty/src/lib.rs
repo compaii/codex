@@ -9,6 +9,8 @@ pub use child_command::SpawnFallback;
 #[cfg(target_os = "linux")]
 mod linux_fds;
 #[cfg(target_os = "linux")]
+pub mod linux_resources;
+#[cfg(target_os = "linux")]
 pub use linux_fds::require_explicit_descriptors;
 pub mod pipe;
 mod process;
