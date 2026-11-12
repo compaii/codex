@@ -820,3 +820,27 @@ provider health, idle capacity or proof of execution. A client reporting current
 operational readiness must separately inspect its selected thread/profile,
 finite resources, exact generation fences and live source observation. The
 existing bounded admission still revalidates the request atomically.
+
+### Host-selected bounded process resources
+
+`turn/startBoundedIfIdle.hostRestrictions.processLimits` optionally selects
+`memoryBytes`, `cpuPercent` and `tasks` for one aggregate on qualified Linux.
+The complete host restriction selection, reserved finite inference allowance and
+idle-only admission are required; this is neither a model tool nor a new resource
+grant. Values must be positive within the existing own-work maxima of 1 GiB,
+100% of one CPU and 128 tasks. Omission preserves earlier bounded/ordinary routes.
+
+The admitted turn captures one private local execution snapshot. Its actual
+stdio executor comes from `codex-exec-server` beside the trusted native executable;
+V8 uses the same process owner. Both receive an explicit environment and a private
+empty HOME/CODEX_HOME; actor permissions further deny host cgroup/manager access
+and the native Codex home. A later tool environment resolution cannot substitute
+the ordinary executor. Start failure is retained for this turn without retrying
+allocation or falling back; completion, cancellation and the same deadline close
+the aggregate despite retained step/client references. Temporary-home cleanup and
+actual group closure have one retained local result.
+
+Select this only after qualifying the complete package, local paths, allowed tools
+and receiving accounting. It does not establish a monetary ceiling, qualify a
+remote SSH front as a resource boundary or make configured state proof of live
+execution. Unsupported hosts/readers reject the selection rather than remove it.

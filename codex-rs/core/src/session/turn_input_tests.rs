@@ -1735,6 +1735,13 @@ async fn code_mode_limits_require_the_complete_bounded_host_selection() {
     use codex_protocol::turn_input::TurnCodeModeLimits;
     let (session, _, _rx) = make_session_and_context_with_rx().await;
     let valid = TurnStartOptions {
+        process_limits: cfg!(target_os = "linux").then_some(
+            codex_protocol::turn_input::TurnProcessLimits {
+                memory_bytes: 512 * 1024 * 1024,
+                cpu_percent: 50,
+                tasks: 128,
+            },
+        ),
         code_mode_limits: Some(TurnCodeModeLimits {
             max_heap_size_bytes: 32 * 1024 * 1024,
             max_yield_time_ms: 1000,
@@ -1752,7 +1759,7 @@ async fn code_mode_limits_require_the_complete_bounded_host_selection() {
         }),
         ..Default::default()
     };
-    for mutation in 0..6 {
+    for mutation in 0..if cfg!(target_os = "linux") { 10 } else { 6 } {
         let mut invalid = valid.clone();
         match mutation {
             0 => {
@@ -1766,7 +1773,11 @@ async fn code_mode_limits_require_the_complete_bounded_host_selection() {
             2 => invalid.command_environment_policy = None,
             3 => invalid.permission_ceiling = None,
             4 => invalid.tool_ceiling = None,
-            _ => invalid.inference_allowance = None,
+            5 => invalid.inference_allowance = None,
+            6 => invalid.process_limits.as_mut().unwrap().memory_bytes = 0,
+            7 => invalid.process_limits.as_mut().unwrap().cpu_percent = 101,
+            8 => invalid.process_limits.as_mut().unwrap().tasks = 129,
+            _ => invalid.code_mode_limits = None,
         }
         assert!(
             PreparedTurnInputSettings::prepare(

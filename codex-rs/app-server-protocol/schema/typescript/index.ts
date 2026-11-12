@@ -90,6 +90,7 @@ export type { ToolExposureSurface } from "./ToolExposureSurface";
 export type { ToolName } from "./ToolName";
 export type { TurnCodeModeLimits } from "./TurnCodeModeLimits";
 export type { TurnInferenceAllowance } from "./TurnInferenceAllowance";
+export type { TurnProcessLimits } from "./TurnProcessLimits";
 export type { Verbosity } from "./Verbosity";
 export type { WebSearchAction } from "./WebSearchAction";
 export type { WebSearchContextSize } from "./WebSearchContextSize";

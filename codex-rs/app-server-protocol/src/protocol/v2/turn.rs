@@ -344,6 +344,9 @@ pub struct TurnStartBoundedIfIdleParams {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(export_to = "v2/")]
 pub struct BoundedTurnHostRestrictions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub process_limits: Option<codex_protocol::turn_input::TurnProcessLimits>,
     pub permissions: String,
     pub tools: Vec<codex_protocol::ToolName>,
     /// Explicit environment only: the server disables inheritance and profiles.

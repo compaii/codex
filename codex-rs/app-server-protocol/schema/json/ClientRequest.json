@@ -237,6 +237,16 @@
         "permissions": {
           "type": "string"
         },
+        "processLimits": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TurnProcessLimits"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "tools": {
           "items": {
             "$ref": "#/definitions/ToolName"
@@ -6110,6 +6120,33 @@
           "type": "string"
         }
       ]
+    },
+    "TurnProcessLimits": {
+      "additionalProperties": false,
+      "description": "Aggregate host-selected Linux limits for one physical execution, never a grant.",
+      "properties": {
+        "cpuPercent": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "memoryBytes": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "tasks": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "cpuPercent",
+        "memoryBytes",
+        "tasks"
+      ],
+      "type": "object"
     },
     "TurnStartBoundedIfIdleParams": {
       "additionalProperties": false,

@@ -807,6 +807,9 @@ impl TurnRequestProcessor {
         let request = TurnInputRequest::new(input)
             .with_thread_settings(thread_settings)
             .on_start(TurnStartOptions {
+                process_limits: host_restrictions
+                    .as_ref()
+                    .and_then(|value| value.process_limits.clone()),
                 code_mode_limits: host_restrictions
                     .as_ref()
                     .map(|value| value.code_mode_limits.clone()),

@@ -4234,7 +4234,25 @@ impl Session {
         let session_telemetry = settings.telemetry(&turn_context.session_telemetry);
         let environments = turn_context
             .restrict_environments(environments.or_cancel(cancellation_token).await?)?;
-        let inherited_environments = inherited_environments.unwrap_or_else(|| environments.clone());
+        let owns_processes = turn_context
+            .extension_data
+            .get::<crate::turn_process::ProcessResources>()
+            .is_some();
+        let environments = if owns_processes {
+            Box::pin(crate::turn_process::environments(
+                &turn_context,
+                environments,
+                cancellation_token,
+            ))
+            .await?
+        } else {
+            environments
+        };
+        let inherited_environments = if owns_processes {
+            environments.clone()
+        } else {
+            inherited_environments.unwrap_or_else(|| environments.clone())
+        };
         // Keep both preparation futures off caller stacks while they are live together.
         let load_agents_md = Box::pin(async {
             let (loaded_agents_md, warnings) = self

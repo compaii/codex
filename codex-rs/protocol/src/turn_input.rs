@@ -234,6 +234,15 @@ pub struct TurnCodeModeLimits {
     pub max_yield_time_ms: u64,
 }
 
+/// Aggregate host-selected Linux limits for one physical execution, never a grant.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TurnProcessLimits {
+    pub memory_bytes: u64,
+    pub cpu_percent: u32,
+    pub tasks: u32,
+}
+
 /// Options for the new-turn branch of a submission.
 ///
 /// Core only records these options when input starts a turn. When input steers,
@@ -242,6 +251,8 @@ pub struct TurnCodeModeLimits {
 /// child input, Core also compares root lineage to detect ambiguity.
 #[derive(Clone, Debug, Default)]
 pub struct TurnStartOptions {
+    /// Optional aggregate process owner; requires the complete bounded host selection.
+    pub process_limits: Option<TurnProcessLimits>,
     /// Transient host selection; never replaces inherited thread extension data.
     pub code_mode_limits: Option<TurnCodeModeLimits>,
     /// Host-only explicit shell policy for this bounded execution, not thread state.
