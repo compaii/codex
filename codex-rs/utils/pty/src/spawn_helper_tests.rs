@@ -117,7 +117,7 @@ fn initialize_spawn_helper() {
 }
 
 /// Pin a process identity so exit observation and cleanup cannot follow PID reuse.
-fn open_pidfd(pid: libc::pid_t) -> io::Result<OwnedFd> {
+pub(crate) fn open_pidfd(pid: libc::pid_t) -> io::Result<OwnedFd> {
     // SAFETY: pidfd_open takes a PID and flags, and returns a new owned descriptor.
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
     if fd == -1 {

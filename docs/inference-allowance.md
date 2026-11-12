@@ -567,3 +567,29 @@ must share the execution's resource group, with denial of target access to the
 delegated cgroup or manager, aggregate enforcement and exact close/deadline
 cleanup. A successful helper attach is not escape qualification or production
 selection. No existing session, account, provider, goal or heartbeat is changed.
+
+`codex_utils_pty::linux_resources::LinuxProcessResourceGroup` owns the existing
+systemd user-manager route directly. Its caller supplies memory, CPU, task and
+lifetime bounds under the own-work operator maxima; no budget or defaults are
+inferred. One fresh delegated transient service holds a private stdin pipe. A
+fixed readiness echo precedes current invocation and kernel-limit readback.
+`spawn(command)` assigns only the helper owned by that launch, rechecks the
+invocation/kernel limits and membership, and then opens the execution gate.
+Multiple commands share that same group. Manager commands use the local user's
+bus with a clean management environment, never target environment values.
+
+Explicit `close()` confirms holder exit and removal of the group; dropping the
+owner closes its stdin without controlling any other unit. Kernel RuntimeMaxSec
+bounds the service's active lifetime if its caller cannot clean up. All manager
+operations have finite timeouts; an uncertain start/attach/close is an error,
+never an automatic retry or another unit. Caller cancellation still owns the
+whole execution deadline and must drop the group then. The standalone group
+does not replace that deadline or protect itself from an unsandboxed target.
+
+The opt-in `linux_resources` tests qualify this implementation against the real
+user manager: two admitted workloads plus descendants share the same limits,
+explicit close kills all of them, owner drop ends live work, and kernel expiry
+ends work and refuses a later launch. These require explicit local resource
+qualification and make no provider call. Ordinary CI remains independent of a
+user session bus. Wiring all funded executors/Code Mode hosts to the same owner
+and denying sandbox escape remain required before full-profile selection.
