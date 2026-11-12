@@ -540,3 +540,30 @@ bounds, trusted startup, all allowed tool/provider routes, prices or monetary
 authority. The owner still reserves and retains the exact original allocation
 and uncertain effects through the existing accounting path. No default budget,
 provider, receiving configuration, lane or model execution is selected here.
+
+### Linux owned-process admission before execution
+
+`codex_utils_pty::Command::spawn_with_admission` reuses the registered fresh-image
+spawn helper. Its trusted parent-side async callback receives the owned, unreaped
+helper PID before target environment transfer or exec. The command must select a
+new session and explicit descriptors. Admission refusal, cancellation, missing
+helper support or failed bootstrap ends that launch without an ungated fallback.
+Ordinary `spawn` and pipe/PTY compatibility behavior are unchanged.
+
+This is a launch seam, not a resource allocator or a turn admission grant. The
+caller must bound its callback, preserve cancellation/unknown-effect ownership,
+and retain the exact resource group and lifetime. A verified local composition
+uses the existing systemd user manager to attach the helper to one fresh finite
+delegated own-work service before opening the gate. Its actual child and further
+child report the same cgroup while the parent stays outside. The externally owned
+fixture supplies memory/CPU/tasks/deadline and group cleanup; the launcher itself
+does not select those values or create a service. The opt-in
+`admitted_helper_joins_owned_resource_group` test requires that owned service via
+`CODEX_TEST_RESOURCE_UNIT`; ordinary CI tests cover success, refusal, cancellation
+and bootstrap failure with real helpers and target-side effect markers.
+
+Full funded-turn binding remains separate work: all owned raw/Code Mode processes
+must share the execution's resource group, with denial of target access to the
+delegated cgroup or manager, aggregate enforcement and exact close/deadline
+cleanup. A successful helper attach is not escape qualification or production
+selection. No existing session, account, provider, goal or heartbeat is changed.

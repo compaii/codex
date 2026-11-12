@@ -135,7 +135,7 @@ jobs:
           cargo build --locked --profile dev-small -j 2 -p codex-code-mode-host --bin codex-code-mode-host
           RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-core --lib -- bounded_ start_only_code_mode_limits_do_not_change_thread_extension_data agent_message_wake_reservation_preserves_existing_boundaries delegated_mailbox_selection_rechecks_lineage_without_consuming_new_input turn_inference::tests::refuses
           RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all bounded_host_restrictions_narrow_tools_and_preserve_ordinary_followup -- --nocapture
-          cargo test --locked --profile dev-small -j 2 -p codex-utils-pty --lib linux_fds
+          cargo test --locked --profile dev-small -j 2 -p codex-utils-pty --lib -- linux_fds admitted_helper
           RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-guardian-v2 --lib -- bounded_attention_invalidates_cached_scores_without_classification contributor_accounts_for_parent_checkpoint
       - name: Shared inference allowance and no-replay transport regressions
         run: |
