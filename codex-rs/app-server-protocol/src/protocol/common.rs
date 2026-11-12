@@ -2468,6 +2468,36 @@ mod tests {
     }
 
     #[test]
+    fn bounded_host_restrictions_require_complete_closed_selection() {
+        let mut params = serde_json::json!({
+            "turn":{"threadId":"selected-thread","input":[]},
+            "allowance":{"maxProviderAttempts":1,"maxRequestBytes":4096,"deadlineUnixMs":42},
+            "hostRestrictions":{
+                "permissions":":read-only",
+                "tools":[{"name":"exec_command","namespace":"functions"}],
+                "environment":{"PATH":"/usr/bin:/bin"},
+                "codeModeLimits":{"maxHeapSizeBytes":33554432,"maxYieldTimeMs":1000}
+            }
+        });
+        let current: v2::TurnStartBoundedIfIdleParams =
+            serde_json::from_value(params.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(current).unwrap()["hostRestrictions"],
+            params["hostRestrictions"]
+        );
+        for field in ["permissions", "tools", "environment", "codeModeLimits"] {
+            let mut missing = params.clone();
+            missing["hostRestrictions"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(serde_json::from_value::<v2::TurnStartBoundedIfIdleParams>(missing).is_err());
+        }
+        params["hostRestrictions"]["inherit"] = "all".into();
+        assert!(serde_json::from_value::<v2::TurnStartBoundedIfIdleParams>(params).is_err());
+    }
+
+    #[test]
     fn client_request_serialization_scope_covers_keyed_families() {
         let thread_id = "thread-1".to_string();
         let thread_resume = ClientRequest::ThreadResume {

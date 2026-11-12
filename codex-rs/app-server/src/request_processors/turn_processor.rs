@@ -186,6 +186,7 @@ impl TurnRequestProcessor {
             None,
             false,
             None,
+            None,
         )
         .await
         .map(|response| {
@@ -238,6 +239,7 @@ impl TurnRequestProcessor {
             params.provider_reservation_cycle_id,
             params.provider_usage_observations.unwrap_or(false),
             params.provider_max_output_tokens,
+            params.host_restrictions,
         )
         .await
         .map(|response| Some(ClientResponsePayload::TurnStartBoundedIfIdle(response)))
@@ -614,6 +616,7 @@ impl TurnRequestProcessor {
         provider_reservation_cycle_id: Option<String>,
         provider_usage_observations: bool,
         provider_max_output_tokens: Option<u32>,
+        host_restrictions: Option<codex_app_server_protocol::BoundedTurnHostRestrictions>,
     ) -> Result<TurnStartResponse, JSONRPCErrorError> {
         let (thread_id, thread) =
             self.load_thread(&params.thread_id)
@@ -736,6 +739,32 @@ impl TurnRequestProcessor {
                 environment_requests,
             )
             .await;
+        let permission_ceiling = if let Some(restrictions) = &host_restrictions {
+            let thread_config = thread.config().await;
+            let cwd = match environment_override.environment_requests.as_ref() {
+                Some(environments) => environments.legacy_fallback_cwd.clone(),
+                None => thread.config_snapshot().await.cwd().clone(),
+            };
+            let config = self
+                .config_manager
+                .load_permission_config_for_thread(
+                    &thread_config,
+                    cwd,
+                    restrictions.permissions.clone(),
+                )
+                .await
+                .map_err(|error| config_load_error(&error))?;
+            if let Some(warning) = config.startup_warnings.iter().find(|warning| {
+                warning.contains("Configured value for `permission_profile` is disallowed")
+            }) {
+                return Err(invalid_request(format!(
+                    "invalid host restriction: {warning}"
+                )));
+            }
+            Some(config.permissions.permission_profile().clone())
+        } else {
+            None
+        };
         let thread_settings = self
             .build_thread_settings_overrides(
                 thread.as_ref(),
@@ -778,9 +807,18 @@ impl TurnRequestProcessor {
         let request = TurnInputRequest::new(input)
             .with_thread_settings(thread_settings)
             .on_start(TurnStartOptions {
-                command_environment_policy: None,
-                permission_ceiling: None,
-                tool_ceiling: None,
+                code_mode_limits: host_restrictions
+                    .as_ref()
+                    .map(|value| value.code_mode_limits.clone()),
+                command_environment_policy: host_restrictions.as_ref().map(|value| {
+                    codex_protocol::config_types::ShellEnvironmentPolicy {
+                        inherit: codex_protocol::config_types::ShellEnvironmentPolicyInherit::None,
+                        r#set: value.environment.clone(),
+                        ..Default::default()
+                    }
+                }),
+                permission_ceiling,
+                tool_ceiling: host_restrictions.map(|value| value.tools),
                 inference_allowance,
                 provider_attempt_gate: reservation
                     .map(codex_protocol::provider_attempt::ProviderAttemptGateSelection),

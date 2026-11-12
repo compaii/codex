@@ -377,6 +377,7 @@ impl std::fmt::Debug for TurnEnvironment {
 /// Request options for one turn, separate from persistent thread settings.
 #[derive(Default)]
 pub(crate) struct NewTurnContextOptions {
+    pub(crate) code_mode_limits: Option<codex_protocol::turn_input::TurnCodeModeLimits>,
     pub(crate) command_environment_policy: Option<ShellEnvironmentPolicy>,
     pub(crate) permission_ceiling: Option<PermissionProfile>,
     pub(crate) tool_ceiling: Option<Vec<codex_protocol::ToolName>>,
@@ -1541,6 +1542,27 @@ impl Session {
                     require_unified_exec: true,
                     expose_additional_permissions: false,
                 }));
+        }
+        if let Some(limits) = options.code_mode_limits {
+            turn_context
+                .extension_data
+                .insert(crate::BoundedCodeModeOptions(
+                    codex_code_mode::CodeModeSessionOptions {
+                        cell_execution_limits:
+                            codex_code_mode::CodeModeSessionCellExecutionLimits {
+                                max_heap_size_bytes: Some(
+                                    usize::try_from(limits.max_heap_size_bytes).map_err(|_| {
+                                        CodexErr::InvalidRequest(
+                                            "Code Mode heap limit exceeds platform range".into(),
+                                        )
+                                    })?,
+                                ),
+                                max_yield_time_ms: Some(limits.max_yield_time_ms),
+                            },
+                        output_truncation: codex_code_mode::CodeModeOutputTruncation::Server,
+                    },
+                ));
+            crate::tools::code_mode::bounded_session::capture_options(&turn_context.extension_data);
         }
         turn_context.final_output_json_schema = options.final_output_json_schema;
         turn_context.cyber_access_program =

@@ -1040,15 +1040,20 @@ async fn wait_for_dynamic_tool_completed(
 #[tokio::test]
 async fn idle_only_turn_refuses_busy_without_recording_then_starts_internal_context() -> Result<()>
 {
-    exercise_idle_only_turn(false).await
+    exercise_idle_only_turn(false, false).await
 }
 
 #[tokio::test]
 async fn bounded_idle_turn_refuses_busy_then_starts_with_required_allocation() -> Result<()> {
-    exercise_idle_only_turn(true).await
+    exercise_idle_only_turn(true, false).await
 }
 
-async fn exercise_idle_only_turn(bounded: bool) -> Result<()> {
+#[tokio::test]
+async fn bounded_host_restrictions_narrow_tools_and_preserve_ordinary_followup() -> Result<()> {
+    exercise_idle_only_turn(true, true).await
+}
+
+async fn exercise_idle_only_turn(bounded: bool, host_restrictions: bool) -> Result<()> {
     // Valid PNG with substantial trailing bytes: ordinary requests retain the
     // exact source; a bounded historical projection must fit its existing cap.
     // Real textured-image preview quality has separate Core/retained-history tests.
@@ -1111,7 +1116,7 @@ async fn exercise_idle_only_turn(bounded: bool) -> Result<()> {
         },
         ..Default::default()
     };
-    let (method, payload) = if bounded {
+    let (method, mut payload) = if bounded {
         (
             "turn/startBoundedIfIdle",
             json!({
@@ -1126,6 +1131,14 @@ async fn exercise_idle_only_turn(bounded: bool) -> Result<()> {
     } else {
         ("turn/startIfIdle", serde_json::to_value(&heartbeat)?)
     };
+    if host_restrictions {
+        payload["hostRestrictions"] = json!({
+            "permissions": ":read-only",
+            "tools": [{"name":"demo_tool", "namespace":null}],
+            "environment": {"PATH":"/usr/bin:/bin"},
+            "codeModeLimits": {"maxHeapSizeBytes":32*1024*1024, "maxYieldTimeMs":1000}
+        });
+    }
     let busy = mcp.send_request(method, Some(payload.clone())).await?;
     let error = timeout(
         DEFAULT_READ_TIMEOUT,
@@ -1169,6 +1182,27 @@ async fn exercise_idle_only_turn(bounded: bool) -> Result<()> {
         !serde_json::to_string(&before)?.contains(marker),
         "Refused input must not be queued or enter human context"
     );
+    if host_restrictions {
+        for mutation in 0..3 {
+            let mut invalid = payload.clone();
+            match mutation {
+                0 => invalid["hostRestrictions"]["permissions"] = "missing-host-profile".into(),
+                1 => invalid["hostRestrictions"]["permissions"] = ":danger-full-access".into(),
+                _ => invalid["hostRestrictions"]["codeModeLimits"]["maxHeapSizeBytes"] = 0.into(),
+            }
+            let refused = mcp.send_request(method, Some(invalid)).await?;
+            timeout(
+                DEFAULT_READ_TIMEOUT,
+                mcp.read_stream_until_error_message(RequestId::Integer(refused)),
+            )
+            .await??;
+        }
+        assert_eq!(
+            responses_bodies(&server).await?.len(),
+            2,
+            "invalid host profiles must never fall back to an unrestricted provider request"
+        );
+    }
     let idle = mcp.send_request(method, Some(payload)).await?;
     let TurnStartResponse { turn } =
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_response(idle)).await??;
@@ -1217,6 +1251,14 @@ async fn exercise_idle_only_turn(bounded: bool) -> Result<()> {
     }
     let bodies = responses_bodies(&server).await?;
     assert_eq!(bodies.len(), 3);
+    if host_restrictions {
+        let tools = bodies[2]["tools"]
+            .as_array()
+            .context("bounded tools missing")?;
+        assert_eq!(tools.len(), 1, "host ceiling applies before sampling");
+        assert_eq!(tools[0]["name"], "demo_tool");
+        assert!(bodies[0]["tools"].as_array().unwrap().len() > tools.len());
+    }
     if bounded {
         assert!(
             serde_json::to_vec(&bodies[2])?.len() <= 1024 * 1024,
@@ -1262,6 +1304,12 @@ async fn exercise_idle_only_turn(bounded: bool) -> Result<()> {
         .await??;
         let ordinary_bodies = responses_bodies(&server).await?;
         assert_eq!(ordinary_bodies.len(), 4);
+        if host_restrictions {
+            assert_eq!(
+                ordinary_bodies[3]["tools"], ordinary_bodies[0]["tools"],
+                "host restriction must not change the next independent human turn"
+            );
+        }
         assert!(
             serde_json::to_vec(&ordinary_bodies[3])?.len() > 1024 * 1024,
             "Ordinary request must retain the original history rather than the reduced bounded projection"

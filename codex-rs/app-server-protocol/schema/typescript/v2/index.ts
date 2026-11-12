@@ -54,6 +54,7 @@ export type { AttestationGenerateResponse } from "./AttestationGenerateResponse"
 export type { AuthRecoveryNotification } from "./AuthRecoveryNotification";
 export type { AutoReviewDecisionSource } from "./AutoReviewDecisionSource";
 export type { AutoReviewRequirements } from "./AutoReviewRequirements";
+export type { BoundedTurnHostRestrictions } from "./BoundedTurnHostRestrictions";
 export type { BrowserUseAccessApprovalLifetime } from "./BrowserUseAccessApprovalLifetime";
 export type { BrowserUseConfig } from "./BrowserUseConfig";
 export type { BrowserUseExtensionRequirements } from "./BrowserUseExtensionRequirements";

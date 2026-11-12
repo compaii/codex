@@ -312,6 +312,11 @@ pub struct TurnStartParams {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(export_to = "v2/")]
 pub struct TurnStartBoundedIfIdleParams {
+    /// Additional execution-local ceilings, resolved by the host. Requires no
+    /// persistent thread configuration change and never grants permissions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub host_restrictions: Option<BoundedTurnHostRestrictions>,
     #[experimental(nested)]
     pub turn: TurnStartParams,
     pub allowance: codex_protocol::turn_input::TurnInferenceAllowance,
@@ -331,6 +336,19 @@ pub struct TurnStartBoundedIfIdleParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub provider_max_output_tokens: Option<u32>,
+}
+
+/// A complete narrowing selection for one bounded idle start. Existing named
+/// permissions are resolved by the server; raw permission profiles are not input.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct BoundedTurnHostRestrictions {
+    pub permissions: String,
+    pub tools: Vec<codex_protocol::ToolName>,
+    /// Explicit environment only: the server disables inheritance and profiles.
+    pub environment: HashMap<String, String>,
+    pub code_mode_limits: codex_protocol::turn_input::TurnCodeModeLimits,
 }
 
 /// Host accounting request, never a model tool or human approval ceremony.

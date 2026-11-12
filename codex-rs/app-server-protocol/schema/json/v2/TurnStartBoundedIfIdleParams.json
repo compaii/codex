@@ -93,6 +93,38 @@
         }
       ]
     },
+    "BoundedTurnHostRestrictions": {
+      "additionalProperties": false,
+      "description": "A complete narrowing selection for one bounded idle start. Existing named permissions are resolved by the server; raw permission profiles are not input.",
+      "properties": {
+        "codeModeLimits": {
+          "$ref": "#/definitions/TurnCodeModeLimits"
+        },
+        "environment": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Explicit environment only: the server disables inheritance and profiles.",
+          "type": "object"
+        },
+        "permissions": {
+          "type": "string"
+        },
+        "tools": {
+          "items": {
+            "$ref": "#/definitions/ToolName"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "codeModeLimits",
+        "environment",
+        "permissions",
+        "tools"
+      ],
+      "type": "object"
+    },
     "ByteRange": {
       "properties": {
         "end": {
@@ -500,6 +532,45 @@
       },
       "required": [
         "byteRange"
+      ],
+      "type": "object"
+    },
+    "ToolName": {
+      "description": "Identifies a callable tool, preserving the namespace split when the model provides one.",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "namespace": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "TurnCodeModeLimits": {
+      "additionalProperties": false,
+      "description": "Explicit per-execution Code Mode limits, captured without changing thread data.",
+      "properties": {
+        "maxHeapSizeBytes": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "maxYieldTimeMs": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "maxHeapSizeBytes",
+        "maxYieldTimeMs"
       ],
       "type": "object"
     },
@@ -972,6 +1043,17 @@
   "properties": {
     "allowance": {
       "$ref": "#/definitions/TurnInferenceAllowance"
+    },
+    "hostRestrictions": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/BoundedTurnHostRestrictions"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Additional execution-local ceilings, resolved by the host. Requires no persistent thread configuration change and never grants permissions."
     },
     "providerMaxOutputTokens": {
       "description": "Owner-selected output ceiling, applied at HTTP/WS request construction. Requires the same reservation cycle; older closed readers reject it.",
