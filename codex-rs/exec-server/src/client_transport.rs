@@ -413,14 +413,20 @@ impl ExecServerClient {
             ExecServerTransportParams::StdioCommand {
                 command,
                 initialize_timeout,
+                process_launcher,
             } => {
-                return Self::connect_stdio_command(StdioExecServerConnectArgs {
+                let args = StdioExecServerConnectArgs {
                     command,
                     client_name: ENVIRONMENT_CLIENT_NAME.to_string(),
                     initialize_timeout,
                     resume_session_id: None,
-                })
-                .await;
+                };
+                return match process_launcher {
+                    Some(launcher) => {
+                        Self::connect_stdio_command_with_launcher(args, Some(launcher)).await
+                    }
+                    None => Self::connect_stdio_command(args).await,
+                };
             }
         };
         let (websocket_url, connect_timeout, initialize_timeout, http_headers) = websocket;
@@ -811,12 +817,49 @@ impl ExecServerClient {
     pub(crate) async fn connect_stdio_command(
         args: StdioExecServerConnectArgs,
     ) -> Result<Self, ExecServerError> {
-        let mut child = stdio_command_process(&args.command)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(ExecServerError::Spawn)?;
+        Self::connect_stdio_command_with_launcher(args, None).await
+    }
+
+    async fn connect_stdio_command_with_launcher(
+        args: StdioExecServerConnectArgs,
+        process_launcher: Option<Arc<dyn codex_utils_pty::ProcessLauncher>>,
+    ) -> Result<Self, ExecServerError> {
+        let mut child: codex_utils_pty::Child = if let Some(launcher) = process_launcher {
+            if !cfg!(target_os = "linux")
+                || args.resume_session_id.is_some()
+                || !std::path::Path::new(&args.command.program).is_absolute()
+                || !args
+                    .command
+                    .cwd
+                    .as_ref()
+                    .is_some_and(|cwd| cwd.is_absolute())
+            {
+                return Err(ExecServerError::Protocol("owned stdio executor requires explicit local Linux command/cwd and no session resume".into()));
+            }
+            let cwd =
+                args.command.cwd.as_ref().ok_or_else(|| {
+                    ExecServerError::Protocol("missing owned executor cwd".into())
+                })?;
+            let mut command = codex_utils_pty::Command::new(&args.command.program);
+            command
+                .args(&args.command.args)
+                .envs(&args.command.env)
+                .current_dir(cwd)
+                .process_mode(codex_utils_pty::ProcessMode::NewSession)
+                .descriptor_policy(codex_utils_pty::DescriptorPolicy::Explicit);
+            launcher
+                .spawn(command)
+                .await
+                .map_err(ExecServerError::Spawn)?
+        } else {
+            stdio_command_process(&args.command)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(ExecServerError::Spawn)?
+                .into()
+        };
 
         let stdin = child.stdin.take().ok_or_else(|| {
             ExecServerError::Protocol("spawned exec-server command has no stdin".to_string())

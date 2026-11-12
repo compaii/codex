@@ -10,13 +10,13 @@ use axum::extract::ws::Message as AxumWebSocketMessage;
 use axum::extract::ws::WebSocket as AxumWebSocket;
 use codex_exec_server_protocol::JSONRPCMessage;
 use codex_exec_server_protocol::JSONRPCRequest;
+use codex_utils_pty::Child;
 use futures::Sink;
 use futures::SinkExt;
 use futures::Stream;
 use futures::StreamExt;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
-use tokio::process::Child;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio::time::timeout;
@@ -644,8 +644,8 @@ impl JsonRpcConnection {
         }
     }
 
-    pub(crate) fn with_child_process(mut self, child_process: Child) -> Self {
-        self.transport = JsonRpcTransport::from_child_process(child_process);
+    pub(crate) fn with_child_process(mut self, child_process: impl Into<Child>) -> Self {
+        self.transport = JsonRpcTransport::from_child_process(child_process.into());
         self
     }
 }

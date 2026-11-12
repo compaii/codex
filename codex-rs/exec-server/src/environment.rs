@@ -807,6 +807,37 @@ impl Environment {
         }
     }
 
+    /// A private command-backed environment under an existing execution owner.
+    /// This Rust-only selection is lazy, never reuses a configured human/remote
+    /// backend and grants no resource authority. The trusted caller must select
+    /// and qualify the actual local executor (an SSH front is not a remote fence).
+    pub fn owned_stdio(
+        command: crate::StdioExecServerCommand,
+        process_launcher: Arc<dyn codex_utils_pty::ProcessLauncher>,
+        local_runtime_paths: ExecServerRuntimeOptions,
+        http_client_factory: HttpClientFactory,
+    ) -> Result<Self, ExecServerError> {
+        if !cfg!(target_os = "linux")
+            || !std::path::Path::new(&command.program).is_absolute()
+            || !command.cwd.as_ref().is_some_and(|cwd| cwd.is_absolute())
+        {
+            return Err(ExecServerError::Protocol(
+                "owned stdio requires qualified Linux and explicit absolute command/cwd".into(),
+            ));
+        }
+        Ok(Self::remote_with_transport(
+            ExecServerTransportParams::StdioCommand {
+                command,
+                initialize_timeout:
+                    crate::client_api::DEFAULT_REMOTE_EXEC_SERVER_INITIALIZE_TIMEOUT,
+                process_launcher: Some(process_launcher),
+            },
+            Some(local_runtime_paths),
+            http_client_factory,
+            ScopedSkillsConfig::default(),
+        ))
+    }
+
     pub(crate) fn remote_with_transport(
         remote_transport: ExecServerTransportParams,
         local_runtime_paths: Option<ExecServerRuntimeOptions>,
@@ -1712,6 +1743,7 @@ mod tests {
     async fn environment_status_keeps_stdio_environment_pending() {
         let environment = Environment::remote_with_transport(
             ExecServerTransportParams::StdioCommand {
+                process_launcher: None,
                 command: StdioExecServerCommand {
                     program: "codex-missing-exec-server-for-test".to_string(),
                     args: Vec::new(),
@@ -1735,6 +1767,7 @@ mod tests {
     #[tokio::test]
     async fn environment_manager_leaves_stdio_environment_lazy() {
         let transport = ExecServerTransportParams::StdioCommand {
+            process_launcher: None,
             command: StdioExecServerCommand {
                 program: "codex-missing-exec-server-for-test".to_string(),
                 args: Vec::new(),
@@ -1770,6 +1803,7 @@ mod tests {
         use codex_protocol::capabilities::SelectedCapabilityRoot;
 
         let transport = ExecServerTransportParams::StdioCommand {
+            process_launcher: None,
             command: StdioExecServerCommand {
                 program: "codex-missing-exec-server-for-test".to_string(),
                 args: Vec::new(),

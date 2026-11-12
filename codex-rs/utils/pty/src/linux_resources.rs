@@ -107,6 +107,7 @@ impl LinuxProcessResourceGroup {
                 "--quiet",
                 "--pipe",
                 "--wait",
+                "--collect",
                 "--service-type=exec",
             ])
             .arg(format!("--unit={unit}"))
@@ -319,10 +320,14 @@ impl LinuxProcessResourceGroup {
                 })?
         };
         holder.stdin.take();
-        let exit = tokio::time::timeout(MANAGER_TIMEOUT, holder.wait())
+        tokio::time::timeout(MANAGER_TIMEOUT, holder.wait())
             .await
             .map_err(io::Error::other)??;
-        if !exit.success() || self.cgroup.exists() {
+        // systemd-run exits nonzero when TimeoutStopSec escalates a descendant
+        // from TERM to KILL. That is a completed aggregate stop, not surviving
+        // work. Require the actual owned cgroup to be gone; an inaccessible or
+        // still-present group remains unconfirmed regardless of relay status.
+        if self.cgroup.try_exists()? {
             return Err(io::Error::other("resource group close not confirmed"));
         }
         Ok(())
