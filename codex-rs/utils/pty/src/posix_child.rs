@@ -362,8 +362,8 @@ impl NativeChild {
         }
     }
 
-    /// Sends SIGKILL if still owned, then waits for the child to be reaped.
-    pub(crate) async fn kill(&mut self) -> io::Result<()> {
+    /// Sends SIGKILL while retaining the unreaped child identity.
+    pub(crate) fn start_kill(&mut self) -> io::Result<()> {
         if let Some(pid) = self.pid {
             // SAFETY: An unreaped child retains its PID, even after it exits.
             let result = unsafe { libc::kill(pid, libc::SIGKILL) };
@@ -371,6 +371,12 @@ impl NativeChild {
                 return Err(io::Error::last_os_error());
             }
         }
+        Ok(())
+    }
+
+    /// Sends SIGKILL if still owned, then waits for the child to be reaped.
+    pub(crate) async fn kill(&mut self) -> io::Result<()> {
+        self.start_kill()?;
         self.wait().await.map(|_| ())
     }
 }

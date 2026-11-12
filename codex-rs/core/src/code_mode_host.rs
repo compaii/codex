@@ -31,13 +31,13 @@ use codex_code_mode::GrpcCodeModeSessionProvider;
 use codex_code_mode::ProcessOwnedCodeModeSessionProvider;
 use codex_protocol::shell_environment::scrub_non_inheritable_env_vars;
 use codex_utils_process::background_command;
+use codex_utils_pty::Child;
 use hyper_util::rt::TokioIo;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::io::BufReader;
 use tokio::io::ReadBuf;
-use tokio::process::Child;
 use tokio::process::ChildStdin;
 use tokio::process::ChildStdout;
 use tokio::process::Command;
@@ -431,24 +431,9 @@ fn sandboxed_host_command(
     Ok((command, request.arg0))
 }
 
-enum HostChild {
-    Ordinary(Child),
-    Owned(codex_utils_pty::Child),
-}
-
-#[cfg(test)]
-impl HostChild {
-    async fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
-        match self {
-            Self::Ordinary(child) => child.wait().await,
-            Self::Owned(child) => child.wait().await,
-        }
-    }
-}
-
 struct HostConnection {
     io: tokio::io::Join<ChildStdout, ChildStdin>,
-    child: Option<HostChild>,
+    child: Option<Child>,
     alive: Arc<AtomicBool>,
 }
 
@@ -493,7 +478,7 @@ impl HostConnection {
             .stderr(Stdio::piped())
             .kill_on_drop(/*kill_on_drop*/ true);
         scrub_non_inheritable_env_vars(command.as_std_mut());
-        let (stdin, stdout, stderr, child) = if let Some(launcher) = process_launcher {
+        let mut child: Child = if let Some(launcher) = process_launcher {
             let settings = command.as_std();
             let mut owned = codex_utils_pty::Command::new(settings.get_program());
             owned
@@ -512,22 +497,13 @@ impl HostConnection {
             if let Some(arg0) = arg0 {
                 owned.arg0(arg0);
             }
-            let mut child = launcher.spawn(owned).await?;
-            (
-                child.stdin.take(),
-                child.stdout.take(),
-                child.stderr.take(),
-                HostChild::Owned(child),
-            )
+            launcher.spawn(owned).await?
         } else {
-            let mut child = command.spawn()?;
-            (
-                child.stdin.take(),
-                child.stdout.take(),
-                child.stderr.take(),
-                HostChild::Ordinary(child),
-            )
+            command.spawn()?.into()
         };
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
         let stdin = stdin.ok_or_else(|| io::Error::other("code-mode host has no stdin"))?;
         let stdout = stdout.ok_or_else(|| io::Error::other("code-mode host has no stdout"))?;
         if let Some(stderr) = stderr {
@@ -577,18 +553,12 @@ impl AsyncWrite for HostConnection {
 impl Drop for HostConnection {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::Release);
-        if let Some(child) = self.child.take() {
-            match child {
-                HostChild::Ordinary(mut child) => {
-                    let _ = child.start_kill();
-                    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                        runtime.spawn(async move {
-                            let _ = child.wait().await;
-                        });
-                    }
-                }
-                // The shared child owns immediate kill and cancellation-safe reaping.
-                HostChild::Owned(child) => drop(child),
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    let _ = child.wait().await;
+                });
             }
         }
     }

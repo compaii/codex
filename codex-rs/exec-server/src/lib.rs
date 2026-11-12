@@ -83,6 +83,7 @@ pub use client_api::NoiseRendezvousConnectArgs;
 pub use client_api::NoiseRendezvousConnectBundle;
 pub use client_api::NoiseRendezvousConnectProvider;
 pub use client_api::RemoteExecServerConnectArgs;
+pub use client_api::StdioExecServerCommand;
 pub use codex_exec_server_protocol::ExecutorCapabilityDiscoverySnapshot;
 pub use codex_exec_server_protocol::ProcessId;
 pub use codex_file_system::CopyOptions;

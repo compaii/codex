@@ -2355,6 +2355,7 @@ mod tests {
     async fn connect_for_transport_initializes_stdio_command() {
         let client = ExecServerClient::connect_for_transport(
             ExecServerTransportParams::StdioCommand {
+                process_launcher: None,
                 command: StdioExecServerCommand {
                     program: "sh".to_string(),
                     args: vec![
@@ -3353,6 +3354,7 @@ mod tests {
     async fn terminal_stdio_startup_failure_is_remembered() {
         let client = LazyRemoteExecServerClient::new(
             ExecServerTransportParams::StdioCommand {
+                process_launcher: None,
                 command: StdioExecServerCommand {
                     program: "codex-missing-exec-server-for-test".to_string(),
                     args: Vec::new(),

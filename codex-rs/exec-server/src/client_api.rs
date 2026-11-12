@@ -85,12 +85,22 @@ pub(crate) struct StdioExecServerConnectArgs {
 }
 
 /// Structured process command used to start an exec-server over stdio.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StdioExecServerCommand {
+#[derive(Clone, PartialEq, Eq)]
+pub struct StdioExecServerCommand {
     pub program: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
     pub cwd: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for StdioExecServerCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StdioExecServerCommand")
+            .field("argument_count", &self.args.len())
+            .field("environment_count", &self.env.len())
+            .field("cwd_selected", &self.cwd.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 pub(crate) type DeferredEnvironmentReadiness = watch::Receiver<Option<Result<(), String>>>;
@@ -119,6 +129,8 @@ pub(crate) enum ExecServerTransportParams {
     StdioCommand {
         command: StdioExecServerCommand,
         initialize_timeout: Duration,
+        /// Trusted Rust-only execution owner; not selected by environment TOML.
+        process_launcher: Option<Arc<dyn codex_utils_pty::ProcessLauncher>>,
     },
 }
 
@@ -147,10 +159,12 @@ impl std::fmt::Debug for ExecServerTransportParams {
             Self::StdioCommand {
                 command,
                 initialize_timeout,
+                process_launcher,
             } => f
                 .debug_struct("StdioCommand")
                 .field("command", command)
                 .field("initialize_timeout", initialize_timeout)
+                .field("process_launcher_selected", &process_launcher.is_some())
                 .finish(),
         }
     }

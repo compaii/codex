@@ -51,6 +51,32 @@ The CLI entrypoint supports:
 - `--remote URL --environment-id ID [--name NAME]`
 - `forward --connect ws://HOST:PORT --remote URL --environment-id ID`
 
+## Execution-owned local stdio
+
+Trusted Rust hosts can use `Environment::owned_stdio` with an existing
+`ProcessLauncher`. This lazy, private environment reuses the stdio protocol,
+process supervisor and remote filesystem/process clients. It does not select a
+configured human environment or expose a launcher through JSON, TOML or RPC.
+The command and working directory must be absolute, the target receives only
+the explicitly supplied environment, and admitted launch closes non-selected
+descriptors before exec. Initialization or connection loss never reconnects this
+private environment or falls back to an unowned executor.
+
+On qualified Linux hosts, `LinuxProcessResourceGroup` can supply the launcher
+for both this actual local executor and a private Code Mode host. Its kernel
+limits cover their descendants together. Finished transient units are collected
+also after forced stop or expiry. A local SSH front does not establish
+remote containment. The caller still owns the turn's deadline, cancellation,
+sandbox permissions, resource authorization and cleanup; this constructor does
+not bind an ordinary turn or grant access to account credentials.
+
+The opted-in `owned_stdio` integration test uses a separately built standalone
+executor and the local user manager. Set `CODEX_TEST_EXEC_SERVER_BIN` to that
+exact binary and run `cargo test -p codex-exec-server --test owned_stdio --
+--ignored`. It checks the actual executor and tool child's group membership,
+sandbox and descriptor separation, useful execution, group closure and refusal
+to restart/repeat effects. It makes no model or provider calls.
+
 ## Authentication
 
 Direct WebSocket listeners support app-server's opt-in auth flags, including `--ws-auth capability-token --ws-token-sha256 HEX`, token files, and signed bearer tokens; clients send `Authorization: Bearer TOKEN` on each connection.
