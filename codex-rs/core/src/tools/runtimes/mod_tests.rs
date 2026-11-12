@@ -120,6 +120,7 @@ async fn explicit_escalation_prepares_exec_without_managed_network() -> anyhow::
     let permissions = PermissionProfile::Disabled;
     let manager = SandboxManager::new();
     let attempt = SandboxAttempt {
+        permission_ceiling: None,
         sandbox_override: SandboxOverride::NoOverride,
         sandbox: SandboxType::None,
         sandbox_requested: false,
@@ -1917,4 +1918,54 @@ fn brokered_credential_exports_stop_when_startup_makes_credential_readonly() {
         output.stdout.is_empty(),
         "protected command unexpectedly ran"
     );
+}
+
+#[tokio::test]
+async fn offline_host_ceiling_withholds_broker_before_process_preparation() -> anyhow::Result<()> {
+    let proxy = test_credential_broker_network_proxy().await?;
+    let directory = tempdir()?;
+    let cwd = PathUri::from_abs_path(&AbsolutePathBuf::from_absolute_path(directory.path())?);
+    let permissions = PermissionProfile::Disabled;
+    let offline = PermissionProfile::read_only();
+    let manager = SandboxManager::new();
+    let mut attempt = SandboxAttempt {
+        permission_ceiling: Some(&offline),
+        sandbox_override: SandboxOverride::NoOverride,
+        sandbox: SandboxType::None,
+        sandbox_requested: true,
+        permissions: &permissions,
+        exec_server_permissions: &permissions,
+        enforce_managed_network: true,
+        manager: &manager,
+        sandbox_cwd: &cwd,
+        workspace_roots: std::slice::from_ref(&cwd),
+        sandbox_exe: None,
+        use_legacy_landlock: false,
+        windows_sandbox_type: SandboxType::None,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+        network_denial_cancellation_token: None,
+        network_proxy: Some(&proxy),
+    };
+    assert!(
+        attempt.network_proxy(Some(&proxy)).is_none(),
+        "offline host ceiling must hide even an execution-owned broker"
+    );
+    attempt.network_proxy = None;
+    assert!(
+        attempt.network_proxy(Some(&proxy)).is_none(),
+        "thread fallback must not revive the broker"
+    );
+    attempt.permission_ceiling = Some(&permissions);
+    assert!(
+        attempt.network_proxy(Some(&proxy)).is_some(),
+        "network-enabled host policy retains the proxy"
+    );
+    attempt.permission_ceiling = None;
+    assert!(
+        attempt.network_proxy(Some(&proxy)).is_some(),
+        "ordinary human behavior is unchanged"
+    );
+    attempt.enforce_managed_network = false;
+    assert!(attempt.network_proxy(Some(&proxy)).is_none());
+    Ok(())
 }

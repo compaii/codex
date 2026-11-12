@@ -4,13 +4,16 @@ use crate::common::ResponseStream;
 use crate::common::SafetyBuffering;
 use crate::common::SafetyBufferingTreatment;
 use crate::error::ApiError;
-use crate::error::parse_flex_unavailable;
+use crate::error::parse_terminal_provider_error;
+use crate::guardian_assessment::parse_guardian_assessment;
+use crate::inference_allowance::AttemptObserver;
 use crate::rate_limits::parse_all_rate_limits;
 use crate::safety_buffering::treatment_from_headers;
 use crate::telemetry::SseTelemetry;
 use codex_client::ByteStream;
 use codex_client::StreamResponse;
 use codex_protocol::ResponseUsageMetadata;
+use codex_protocol::error::ResponseIncompleteError;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::ModelVerification;
 use codex_protocol::protocol::TokenUsage;
@@ -34,11 +37,22 @@ const OPENAI_MODEL_HEADER: &str = "openai-model";
 const REQUEST_ID_HEADER: &str = "x-request-id";
 const TRUSTED_ACCESS_FOR_CYBER_VERIFICATION: &str = "trusted_access_for_cyber";
 
-pub fn spawn_response_stream(
+#[cfg(test)]
+pub(super) fn spawn_response_stream(
     stream_response: StreamResponse,
     idle_timeout: Duration,
     telemetry: Option<Arc<dyn SseTelemetry>>,
     turn_state: Option<Arc<OnceLock<String>>>,
+) -> ResponseStream {
+    spawn_response_stream_with_attempt(stream_response, idle_timeout, telemetry, turn_state, None)
+}
+
+pub(crate) fn spawn_response_stream_with_attempt(
+    stream_response: StreamResponse,
+    idle_timeout: Duration,
+    telemetry: Option<Arc<dyn SseTelemetry>>,
+    turn_state: Option<Arc<OnceLock<String>>>,
+    mut observer: Option<AttemptObserver>,
 ) -> ResponseStream {
     let rate_limit_snapshots = parse_all_rate_limits(&stream_response.headers);
     let models_etag = stream_response
@@ -70,6 +84,9 @@ pub fn spawn_response_stream(
     {
         let _ = turn_state.set(header_value.to_string());
     }
+    if let Some(observer) = observer.as_mut() {
+        observer.initial_model = server_model.clone();
+    }
     let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent, ApiError>>(1600);
     tokio::spawn(async move {
         if let Some(model) = server_model {
@@ -92,11 +109,13 @@ pub fn spawn_response_stream(
             idle_timeout,
             telemetry,
             safety_buffering_treatment,
+            observer,
         )
         .await;
     });
 
     ResponseStream {
+        routing_affinity: None,
         rx_event,
         upstream_request_id,
         interrupt: None,
@@ -162,6 +181,7 @@ pub struct ResponsesStreamEvent {
     pub(crate) headers: Option<Value>,
     metadata: Option<Value>,
     response: Option<Value>,
+    response_id: Option<Value>,
     error: Option<Value>,
     item: Option<Value>,
     item_id: Option<String>,
@@ -184,6 +204,22 @@ where
 impl ResponsesStreamEvent {
     pub fn kind(&self) -> &str {
         &self.kind
+    }
+
+    /// Preserve upstream terminal accounting evidence before error conversion.
+    /// Neither an amount string nor token counters establish billing authority.
+    pub(crate) fn incomplete_usage_metadata(&self) -> Option<ResponseUsageMetadata> {
+        if self.kind != "response.incomplete" {
+            return None;
+        }
+        let response = self.response.as_ref()?;
+        let mut metadata: Option<ResponseUsageMetadata> = response
+            .get("usage_metadata")
+            .and_then(|value| serde_json::from_value(value.clone()).ok());
+        if let Some(usage) = response.get("usage").filter(|value| !value.is_null()) {
+            metadata.get_or_insert_default().metadata = Some(usage.clone());
+        }
+        metadata
     }
 
     /// Returns the effective model reported by the server, if present.
@@ -215,6 +251,33 @@ impl ResponsesStreamEvent {
         self.headers
             .as_ref()
             .and_then(header_turn_state_value_from_json)
+    }
+
+    /// Collects independent typed notifications in delivery order. The transport
+    /// supplies safety buffering after applying its response-header treatment.
+    pub(crate) fn metadata_events(
+        &self,
+        safety_buffering: Option<SafetyBuffering>,
+    ) -> Vec<ResponseEvent> {
+        let guardian = if self.kind() == "response.metadata" {
+            parse_guardian_assessment(
+                self.response_id.as_ref().and_then(Value::as_str),
+                self.metadata.as_ref(),
+            )
+        } else {
+            None
+        };
+        [
+            self.model_verifications()
+                .map(ResponseEvent::ModelVerifications),
+            self.turn_moderation_metadata()
+                .map(ResponseEvent::TurnModerationMetadata),
+            safety_buffering.map(ResponseEvent::SafetyBuffering),
+            guardian.map(ResponseEvent::GuardianAssessment),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     pub(crate) fn model_verifications(&self) -> Option<Vec<ModelVerification>> {
@@ -346,7 +409,9 @@ pub fn process_responses_event(
 ) -> std::result::Result<Option<ResponseEvent>, ResponsesEventError> {
     match event.kind.as_str() {
         "error" => {
-            if let Some(error) = event.error.as_ref().and_then(parse_flex_unavailable) {
+            if let Some(error) =
+                parse_terminal_provider_error(event.error.as_ref(), /*status*/ None)
+            {
                 return Err(ResponsesEventError::Api(error));
             }
         }
@@ -429,8 +494,33 @@ pub fn process_responses_event(
                     return Err(ResponsesEventError::Api(ApiError::ContentFilter));
                 }
                 if reason != "interrupted" {
-                    let message = format!("Incomplete response returned, reason: {reason}");
-                    return Err(ResponsesEventError::Api(ApiError::Stream(message)));
+                    let response = event.response.as_ref();
+                    let response_id = response
+                        .and_then(|response| response.get("id"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let token_usage = response
+                        .and_then(|response| response.get("usage"))
+                        .and_then(|usage| {
+                            serde_json::from_value::<ResponseCompletedUsage>(usage.clone()).ok()
+                        })
+                        .map(Into::into);
+                    return Err(ResponsesEventError::Api(ApiError::ResponseIncomplete(
+                        Box::new(ResponseIncompleteError {
+                            partial_output: response
+                                .and_then(|r| r.get("output")?.as_array())
+                                .into_iter()
+                                .flatten()
+                                .filter(|item| {
+                                    item.get("status").and_then(Value::as_str) == Some("incomplete")
+                                })
+                                .cloned()
+                                .collect(),
+                            reason: reason.to_string(),
+                            response_id,
+                            token_usage,
+                        }),
+                    )));
                 }
             }
             if let Some(resp_val) = event.response {
@@ -517,6 +607,7 @@ pub async fn process_sse(
         idle_timeout,
         telemetry,
         SafetyBufferingTreatment::default(),
+        None,
     )
     .await;
 }
@@ -527,6 +618,7 @@ async fn process_sse_with_treatment(
     idle_timeout: Duration,
     telemetry: Option<Arc<dyn SseTelemetry>>,
     safety_buffering_treatment: SafetyBufferingTreatment,
+    observer: Option<AttemptObserver>,
 ) {
     let mut stream = stream.eventsource();
     let mut response_error: Option<ApiError> = None;
@@ -585,11 +677,31 @@ async fn process_sse_with_treatment(
                 continue;
             }
         };
-        let model_verifications = event.model_verifications();
-        let turn_moderation_metadata = event.turn_moderation_metadata();
         let safety_buffering = event.safety_buffering(&safety_buffering_treatment);
+        let metadata_events = event.metadata_events(safety_buffering);
 
-        if let Some(model) = event.response_model()
+        let model = event.response_model();
+        let incomplete_metadata = event.incomplete_usage_metadata();
+        let processed = process_responses_event(event);
+        if let Ok(Some(ref event)) = processed
+            && let Some(observer) = &observer
+        {
+            tokio::select! {
+                biased;
+                _=tx_event.closed()=>return,
+                _=observer.observe(event, model.clone().or_else(|| last_server_model.clone()))=>{},
+            }
+        }
+        if let Err(ResponsesEventError::Api(ApiError::ResponseIncomplete(error))) = &processed
+            && let Some(observer) = &observer
+        {
+            tokio::select! {
+                biased;
+                _=tx_event.closed()=>return,
+                _=observer.observe_incomplete(error, model.clone().or_else(|| last_server_model.clone()), incomplete_metadata)=>{},
+            }
+        }
+        if let Some(model) = model
             && last_server_model.as_deref() != Some(model.as_str())
         {
             if tx_event
@@ -601,32 +713,13 @@ async fn process_sse_with_treatment(
             }
             last_server_model = Some(model);
         }
-        if let Some(verifications) = model_verifications
-            && tx_event
-                .send(Ok(ResponseEvent::ModelVerifications(verifications)))
-                .await
-                .is_err()
-        {
-            return;
-        }
-        if let Some(metadata) = turn_moderation_metadata
-            && tx_event
-                .send(Ok(ResponseEvent::TurnModerationMetadata(metadata)))
-                .await
-                .is_err()
-        {
-            return;
-        }
-        if let Some(buffering) = safety_buffering
-            && tx_event
-                .send(Ok(ResponseEvent::SafetyBuffering(buffering)))
-                .await
-                .is_err()
-        {
-            return;
+        for metadata_event in metadata_events {
+            if tx_event.send(Ok(metadata_event)).await.is_err() {
+                return;
+            }
         }
 
-        match process_responses_event(event) {
+        match processed {
             Ok(Some(event)) => {
                 let is_completed = matches!(event, ResponseEvent::Completed { .. });
                 if tx_event.send(Ok(event)).await.is_err() {
@@ -639,7 +732,10 @@ async fn process_sse_with_treatment(
             Ok(None) => {}
             Err(error) => {
                 let error = error.into_api_error();
-                if matches!(error, ApiError::FlexUnavailable) {
+                if matches!(
+                    error,
+                    ApiError::FlexUnavailable | ApiError::ResponseIncomplete(_)
+                ) {
                     let _ = tx_event.send(Err(error)).await;
                     return;
                 }
@@ -1373,6 +1469,25 @@ mod tests {
                 other => panic!("unexpected event for {code}: {other:?}"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn incomplete_response_retains_partial_output_on_the_error() {
+        let call = json!({
+            "type": "function_call", "status": "incomplete", "id": "fc_attempt",
+            "call_id": "attempt", "name": "unknown", "arguments": "{}",
+        });
+        let terminal = json!({
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp_1", "incomplete_details": {"reason": "invalid_recipient"},
+                "output": [{"type": "message", "status": "completed"}, call],
+            }
+        });
+        let sse = format!("event: response.incomplete\ndata: {terminal}\n\n");
+        let events = collect_events(&[sse.as_bytes()]).await;
+        assert_matches!(events.as_slice(), [Err(ApiError::ResponseIncomplete(error))]
+            if error.reason == "invalid_recipient" && error.partial_output == [call]);
     }
 
     #[tokio::test]

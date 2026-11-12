@@ -62,7 +62,7 @@ impl ThreadGoalRequestProcessor {
         request_id: ConnectionRequestId,
         params: ThreadGoalSetParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.thread_goal_set_inner(request_id, params)
+        self.thread_goal_set_inner(request_id, params, None, None)
             .await
             .map(|()| None)
     }
@@ -81,9 +81,96 @@ impl ThreadGoalRequestProcessor {
         request_id: ConnectionRequestId,
         params: ThreadGoalClearParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        self.thread_goal_clear_inner(request_id, params)
+        self.thread_goal_clear_inner(request_id, params, None)
             .await
             .map(|()| None)
+    }
+
+    pub(crate) async fn thread_goal_snapshot(
+        &self,
+        params: ThreadGoalSnapshotParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        if !self.config.features.enabled(Feature::Goals) {
+            return Err(invalid_request("goals feature is disabled"));
+        }
+        let thread_id = parse_thread_id_for_request(&params.thread_id)?;
+        let state_db = self
+            .state_db_for_materialized_thread(thread_id, GoalAccess::Read)
+            .await?;
+        let (goal, revision) = self
+            .goal_service
+            .snapshot_thread_goal(&state_db, thread_id)
+            .await
+            .map_err(goal_service_error)?;
+        Ok(Some(
+            ThreadGoalSnapshotResponse {
+                goal: goal.map(ThreadGoal::from),
+                revision,
+            }
+            .into(),
+        ))
+    }
+
+    pub(crate) async fn thread_goal_conditional_activate(
+        &self,
+        request_id: ConnectionRequestId,
+        params: ThreadGoalConditionalActivateParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let revision = params.expected_revision;
+        self.thread_goal_set_inner(
+            request_id,
+            ThreadGoalSetParams {
+                thread_id: params.thread_id,
+                origin: params.origin,
+                objective: params.objective,
+                status: Some(ThreadGoalStatus::Active),
+                token_budget: params.token_budget,
+            },
+            Some(&revision),
+            Some(params.additional_context),
+        )
+        .await
+        .map(|()| None)
+    }
+
+    pub(crate) async fn thread_goal_conditional_set(
+        &self,
+        request_id: ConnectionRequestId,
+        params: ThreadGoalConditionalSetParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let revision = params.expected_revision;
+        self.thread_goal_set_inner(
+            request_id,
+            ThreadGoalSetParams {
+                thread_id: params.thread_id,
+                origin: params.origin,
+                objective: params.objective,
+                status: params.status,
+                token_budget: params.token_budget,
+            },
+            Some(&revision),
+            None,
+        )
+        .await
+        .map(|()| None)
+    }
+
+    pub(crate) async fn thread_goal_conditional_clear(
+        &self,
+        request_id: ConnectionRequestId,
+        params: ThreadGoalConditionalClearParams,
+    ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
+        let revision = params.expected_revision;
+        self.thread_goal_clear_inner(
+            request_id,
+            ThreadGoalClearParams {
+                thread_id: params.thread_id,
+                origin: params.origin,
+            },
+            Some(&revision),
+        )
+        .await
+        .map(|()| None)
     }
 
     pub(crate) async fn emit_resume_goal_snapshot(&self, thread_id: ThreadId) {
@@ -134,12 +221,37 @@ impl ThreadGoalRequestProcessor {
         &self,
         request_id: ConnectionRequestId,
         params: ThreadGoalSetParams,
+        expected_revision: Option<&str>,
+        activation_context: Option<HashMap<String, AdditionalContextEntry>>,
     ) -> Result<(), JSONRPCErrorError> {
         if !self.config.features.enabled(Feature::Goals) {
             return Err(invalid_request("goals feature is disabled"));
         }
 
         let thread_id = parse_thread_id_for_request(params.thread_id.as_str())?;
+        if let Some(context) = &activation_context {
+            if context.is_empty()
+                || context.len() > 8
+                || context
+                    .keys()
+                    .any(|k| k.is_empty() || k.len() > 128 || k.chars().any(char::is_control))
+                || serde_json::to_vec(context)
+                    .map_err(|_| invalid_request("Invalid activation context"))?
+                    .len()
+                    > 32768
+            {
+                return Err(invalid_request(
+                    "Activation context must be nonempty and bounded",
+                ));
+            }
+            if !self.goal_service.activation_runtime_available(thread_id)
+                || self.thread_manager.get_thread(thread_id).await.is_err()
+            {
+                return Err(invalid_request(
+                    "Conditional activation requires the selected loaded goal runtime",
+                ));
+            }
+        }
         let _goal_resume_guard = self.thread_state_manager.lock_goal_resume(thread_id).await;
         let state_db = self
             .state_db_for_materialized_thread(thread_id, GoalAccess::Mutate)
@@ -162,7 +274,7 @@ impl ThreadGoalRequestProcessor {
             && let Ok(thread) = self.thread_manager.get_thread(thread_id).await
         {
             self.config_manager
-                .check_thread_model_provider(thread.config().await.as_ref())
+                .check_thread_model_provider_for_input(thread.config().await.as_ref())
                 .await
                 .map_err(|error| config_load_error(&error))?;
         }
@@ -179,40 +291,58 @@ impl ThreadGoalRequestProcessor {
         let status = params.status.map(ThreadGoalStatus::to_core);
         let objective = params.objective.as_deref().map(str::trim);
 
-        let outcome = self
-            .goal_service
-            .set_thread_goal(
-                &state_db,
-                GoalSetRequest {
+        let request = GoalSetRequest {
+            thread_id,
+            objective: objective
+                .map(GoalObjectiveUpdate::Set)
+                .unwrap_or(GoalObjectiveUpdate::Keep),
+            status,
+            token_budget: match params.token_budget {
+                Some(budget) => GoalTokenBudgetUpdate::Set(budget),
+                None => GoalTokenBudgetUpdate::Keep,
+            },
+            max_goal_token_budget,
+        };
+        let record = Box::pin(async {
+            if params.origin == Some(ThreadGoalMutationOrigin::User)
+                && (objective.is_some() || status.is_some())
+            {
+                self.record_user_goal_update(
                     thread_id,
-                    objective: objective
-                        .map(GoalObjectiveUpdate::Set)
-                        .unwrap_or(GoalObjectiveUpdate::Keep),
-                    status,
-                    token_budget: match params.token_budget {
-                        Some(token_budget) => GoalTokenBudgetUpdate::Set(token_budget),
-                        None => GoalTokenBudgetUpdate::Keep,
+                    UserGoalUpdate::Set {
+                        objective: objective.map(str::to_owned),
+                        status,
                     },
-                    max_goal_token_budget,
-                },
-                Box::pin(async {
-                    if params.origin == Some(ThreadGoalMutationOrigin::User)
-                        && (objective.is_some() || status.is_some())
-                    {
-                        self.record_user_goal_update(
-                            thread_id,
-                            UserGoalUpdate::Set {
-                                objective: objective.map(str::to_owned),
-                                status,
-                            },
-                        )
-                        .await?;
-                    }
-                    Ok(())
-                }),
-            )
-            .await
-            .map_err(goal_service_error)?;
+                )
+                .await?;
+            }
+            Ok(())
+        });
+        let activating = activation_context.is_some();
+        let outcome = match (expected_revision, activation_context) {
+            (Some(revision), Some(context)) => {
+                self.goal_service
+                    .activate_thread_goal_conditionally(
+                        &state_db,
+                        request,
+                        revision,
+                        super::turn_processor::map_additional_context(Some(context)),
+                        record,
+                    )
+                    .await
+            }
+            (Some(revision), None) => {
+                self.goal_service
+                    .set_thread_goal_conditionally(&state_db, request, revision, record)
+                    .await
+            }
+            (None, _) => {
+                self.goal_service
+                    .set_thread_goal(&state_db, request, record)
+                    .await
+            }
+        }
+        .map_err(goal_service_error)?;
         let goal = ThreadGoal::from(outcome.goal.clone());
 
         let persist_result = match self.thread_manager.get_thread(thread_id).await {
@@ -239,12 +369,58 @@ impl ThreadGoalRequestProcessor {
             warn!("failed to persist goal update for live thread {thread_id}: {err}");
         }
 
-        self.outgoing
-            .send_response(
-                request_id.clone(),
-                ThreadGoalSetResponse { goal: goal.clone() },
-            )
-            .await;
+        if activating {
+            // Metadata has committed. Activation failure accompanies its receipt;
+            // it cannot be disguised as an unsent or rejected goal mutation.
+            // Publish the committed definition before useful work can complete and
+            // publish a newer state. The outcome still owns the mutation permit.
+            self.emit_thread_goal_updated_ordered(thread_id, goal.clone(), listener_command_tx)
+                .await;
+            let activation = match outcome.activate_with_context(&self.goal_service).await {
+                Ok(codex_goal_extension::GoalActivationDisposition::Started { turn_id }) => {
+                    ThreadGoalActivationDisposition::Started { turn_id }
+                }
+                Ok(codex_goal_extension::GoalActivationDisposition::Steered { turn_id }) => {
+                    ThreadGoalActivationDisposition::Steered { turn_id }
+                }
+                Ok(codex_goal_extension::GoalActivationDisposition::NotStarted { reason }) => {
+                    ThreadGoalActivationDisposition::NotStarted { reason }
+                }
+                Ok(codex_goal_extension::GoalActivationDisposition::Uncertain { reason })
+                | Err(reason) => ThreadGoalActivationDisposition::Uncertain { reason },
+            };
+            self.outgoing
+                .send_response(
+                    request_id.clone(),
+                    ThreadGoalConditionalActivateResponse {
+                        goal: goal.clone(),
+                        revision: outcome.revision.clone().ok_or_else(|| {
+                            internal_error("Conditional activation revision missing")
+                        })?,
+                        activation,
+                    },
+                )
+                .await;
+            return Ok(());
+        }
+        if let Some(revision) = &outcome.revision {
+            self.outgoing
+                .send_response(
+                    request_id.clone(),
+                    ThreadGoalConditionalSetResponse {
+                        goal: goal.clone(),
+                        revision: revision.clone(),
+                    },
+                )
+                .await;
+        } else {
+            self.outgoing
+                .send_response(
+                    request_id.clone(),
+                    ThreadGoalSetResponse { goal: goal.clone() },
+                )
+                .await;
+        }
         self.emit_thread_goal_updated_ordered(thread_id, goal, listener_command_tx)
             .await;
         outcome.apply_runtime_effects(&self.goal_service).await;
@@ -276,6 +452,7 @@ impl ThreadGoalRequestProcessor {
         &self,
         request_id: ConnectionRequestId,
         params: ThreadGoalClearParams,
+        expected_revision: Option<&str>,
     ) -> Result<(), JSONRPCErrorError> {
         if !self.config.features.enabled(Feature::Goals) {
             return Err(invalid_request("goals feature is disabled"));
@@ -294,25 +471,37 @@ impl ThreadGoalRequestProcessor {
             let thread_state = thread_state.lock().await;
             thread_state.listener_command_tx()
         };
-        let cleared = self
-            .goal_service
-            .clear_thread_goal(
-                &state_db,
-                thread_id,
-                Box::pin(async {
-                    if params.origin == Some(ThreadGoalMutationOrigin::User) {
-                        self.record_user_goal_update(thread_id, UserGoalUpdate::Clear)
-                            .await?;
-                    }
-                    Ok(())
-                }),
-            )
-            .await
-            .map_err(goal_service_error)?;
-
-        self.outgoing
-            .send_response(request_id, ThreadGoalClearResponse { cleared })
-            .await;
+        let record = Box::pin(async {
+            if params.origin == Some(ThreadGoalMutationOrigin::User) {
+                self.record_user_goal_update(thread_id, UserGoalUpdate::Clear)
+                    .await?;
+            }
+            Ok(())
+        });
+        let cleared = if let Some(revision) = expected_revision {
+            let (cleared, revision) = self
+                .goal_service
+                .clear_thread_goal_conditionally(&state_db, thread_id, revision, record)
+                .await
+                .map_err(goal_service_error)?;
+            self.outgoing
+                .send_response(
+                    request_id,
+                    ThreadGoalConditionalClearResponse { cleared, revision },
+                )
+                .await;
+            cleared
+        } else {
+            let cleared = self
+                .goal_service
+                .clear_thread_goal(&state_db, thread_id, record)
+                .await
+                .map_err(goal_service_error)?;
+            self.outgoing
+                .send_response(request_id, ThreadGoalClearResponse { cleared })
+                .await;
+            cleared
+        };
         if cleared {
             self.emit_thread_goal_cleared_ordered(thread_id, listener_command_tx)
                 .await;

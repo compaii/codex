@@ -1,4 +1,5 @@
 use super::ActivePermissionProfile;
+use super::AdditionalContextEntry;
 use super::ApprovalsReviewer;
 use super::AskForApproval;
 use super::SandboxMode;
@@ -547,11 +548,17 @@ pub struct ThreadForkParams {
     /// Start from the loaded parent's effective config, tools, environments, and
     /// persisted history to maximize prompt-cache reuse. Requires a loaded,
     /// persisted parent and `ephemeral: true`. Enables `features.reasoning_effort_override`
-    /// on the fork. Cannot be combined with configuration overrides, `path`, `lastTurnId`,
-    /// or `beforeTurnId`.
+    /// on the fork. Only `config.thread_unload_delay_secs` may override the inherited
+    /// config. Cannot be combined with `path`, `lastTurnId`, or `beforeTurnId`.
     #[experimental("thread/fork.experimentalPredictionMode")]
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub experimental_prediction_mode: bool,
+
+    /// Disable MCP servers in prediction mode when the inherited window uses incremental tools on Responses Lite.
+    /// Requires `experimentalPredictionMode: true`.
+    #[experimental("thread/fork.experimentalDisablePredictionMcp")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub experimental_disable_prediction_mcp: bool,
 
     /// Optional last turn id to fork through, inclusive.
     ///
@@ -617,6 +624,12 @@ pub struct ThreadForkParams {
     pub developer_instructions: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ephemeral: bool,
+    /// Persist the fork as an attached thread of its resolved source, hidden from ordinary
+    /// lists. The source cannot be deleted while attached threads exist. Requires a paginated source and local storage;
+    /// incompatible with ephemeral and deferGoalContinuation. Omitted or false creates an ordinary fork.
+    #[experimental("thread/fork.attachToSource")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub attach_to_source: bool,
     /// Optional client-supplied analytics source classification for this forked thread.
     #[ts(optional = nullable)]
     pub thread_source: Option<ThreadSource>,
@@ -920,6 +933,114 @@ pub struct ThreadGoalClearResponse {
     pub cleared: bool,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadGoalSnapshotParams {
+    pub thread_id: String,
+}
+
+/// A consistent goal/definition snapshot. Revision survives clear/recreate and
+/// excludes ordinary usage accounting; it is not an authorization credential.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadGoalSnapshotResponse {
+    pub goal: Option<ThreadGoal>,
+    pub revision: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadGoalConditionalActivateParams {
+    pub thread_id: String,
+    pub expected_revision: String,
+    #[ts(optional = nullable)]
+    pub origin: Option<ThreadGoalMutationOrigin>,
+    #[ts(optional = nullable)]
+    pub objective: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::protocol::serde_helpers::deserialize_double_option",
+        serialize_with = "crate::protocol::serde_helpers::serialize_double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional = nullable, type = "number | null")]
+    pub token_budget: Option<Option<i64>>,
+    pub additional_context: HashMap<String, AdditionalContextEntry>,
+}
+
+/// Admission is not evidence of incorporation, goal completion or hearing.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+#[ts(export_to = "v2/")]
+pub enum ThreadGoalActivationDisposition {
+    Uncertain { reason: String },
+    Started { turn_id: String },
+    Steered { turn_id: String },
+    NotStarted { reason: String },
+}
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadGoalConditionalActivateResponse {
+    pub goal: ThreadGoal,
+    pub revision: String,
+    pub activation: ThreadGoalActivationDisposition,
+}
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadGoalConditionalSetParams {
+    pub thread_id: String,
+    pub expected_revision: String,
+    #[ts(optional = nullable)]
+    pub origin: Option<ThreadGoalMutationOrigin>,
+    #[ts(optional = nullable)]
+    pub objective: Option<String>,
+    #[ts(optional = nullable)]
+    pub status: Option<ThreadGoalStatus>,
+    #[serde(
+        default,
+        deserialize_with = "crate::protocol::serde_helpers::deserialize_double_option",
+        serialize_with = "crate::protocol::serde_helpers::serialize_double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[ts(optional = nullable, type = "number | null")]
+    pub token_budget: Option<Option<i64>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadGoalConditionalSetResponse {
+    pub goal: ThreadGoal,
+    pub revision: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadGoalConditionalClearParams {
+    pub thread_id: String,
+    pub expected_revision: String,
+    #[ts(optional = nullable)]
+    pub origin: Option<ThreadGoalMutationOrigin>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadGoalConditionalClearResponse {
+    pub cleared: bool,
+    pub revision: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -1117,6 +1238,20 @@ pub struct ThreadSectionMoveParams {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadSectionMoveResponse {}
+
+/// Broadcast after a successful move into, within, or out of a section.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadSectionChangedNotification {
+    pub thread_id: String,
+    /// Destination section, or `null` when the thread was removed from its section.
+    #[schemars(
+        required,
+        schema_with = "crate::protocol::serde_helpers::nullable_string_schema"
+    )]
+    pub section_id: Option<String>,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "lowercase")]
@@ -1477,6 +1612,12 @@ pub struct ThreadListParams {
     #[experimental("thread/list.ancestorThreadId")]
     #[ts(optional = nullable)]
     pub ancestor_thread_id: Option<String>,
+    /// Return only persistent threads attached to this thread, including empty threads.
+    /// Mutually exclusive with parentThreadId and ancestorThreadId.
+    /// Omitting this filter keeps attached threads hidden from ordinary listings.
+    #[experimental("thread/list.attachedToThreadId")]
+    #[ts(optional = nullable)]
+    pub attached_to_thread_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -1722,6 +1863,35 @@ pub struct ThreadReadResponse {
     pub read_state: Option<ThreadReadState>,
 }
 
+/// Calling `thread/guardianReview` subscribes the connection to the thread.
+/// The subscription remains after the review completes, keeping the thread loaded
+/// until the client calls `thread/unsubscribe` or disconnects.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadGuardianReviewParams {
+    pub thread_id: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadGuardianReviewResponse {
+    pub call_id: String,
+    /// Null when exec policy skips approval.
+    pub assessment: Option<ThreadGuardianAssessment>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct ThreadGuardianAssessment {
+    pub outcome: codex_protocol::protocol::GuardianAssessmentOutcome,
+    pub risk_level: super::GuardianRiskLevel,
+    pub user_authorization: super::GuardianUserAuthorization,
+    pub rationale: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -1825,6 +1995,16 @@ pub struct ThreadItemEntry {
     /// Unix timestamp (milliseconds) when the item completed, if recorded by the producer.
     #[ts(type = "number | null")]
     pub completed_at_ms: Option<i64>,
+}
+
+impl From<ThreadItemEntry> for ThreadItem {
+    fn from(entry: ThreadItemEntry) -> Self {
+        Self {
+            started_at_ms: entry.item.started_at_ms.or(entry.started_at_ms),
+            completed_at_ms: entry.item.completed_at_ms.or(entry.completed_at_ms),
+            ..entry.item
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]

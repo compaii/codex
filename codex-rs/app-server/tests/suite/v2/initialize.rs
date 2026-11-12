@@ -59,12 +59,14 @@ async fn initialize_uses_client_info_name_as_originator() -> Result<()> {
         codex_home: response_codex_home,
         platform_family,
         platform_os,
+        bounded_idle_turn,
     } = to_response::<InitializeResponse>(response)?;
 
     assert!(user_agent.starts_with("codex_vscode/"));
     assert_eq!(response_codex_home, expected_codex_home);
     assert_eq!(platform_family, std::env::consts::FAMILY);
     assert_eq!(platform_os, std::env::consts::OS);
+    assert!(bounded_idle_turn);
     Ok(())
 }
 
@@ -171,12 +173,14 @@ async fn initialize_respects_originator_override_env_var() -> Result<()> {
         codex_home: response_codex_home,
         platform_family,
         platform_os,
+        bounded_idle_turn,
     } = to_response::<InitializeResponse>(response)?;
 
     assert!(user_agent.starts_with("codex_originator_via_env_var/"));
     assert_eq!(response_codex_home, expected_codex_home);
     assert_eq!(platform_family, std::env::consts::FAMILY);
     assert_eq!(platform_os, std::env::consts::OS);
+    assert!(bounded_idle_turn);
     Ok(())
 }
 
@@ -240,6 +244,7 @@ async fn initialize_opt_out_notification_methods_filters_notifications() -> Resu
                 version: "0.1.0".to_string(),
             },
             Some(InitializeCapabilities {
+                required_human_approval: false,
                 explicit_gateway_oauth: false,
                 experimental_api: true,
                 request_attestation: false,

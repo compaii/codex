@@ -19,12 +19,8 @@ use ts_rs::TS;
 /// Result of stopping an unfinished root turn so another worker can recover it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SuspendTurnOutcome {
-    Suspended {
-        turn_id: String,
-    },
+    Suspended { turn_id: String },
     NotActive,
-    /// A currently loaded descendant would remain running after root handoff.
-    HasLiveDescendants,
     UnsupportedTask,
 }
 
@@ -63,16 +59,31 @@ pub struct ResponseItemAnnotations {
 #[derive(Clone, Debug)]
 pub struct TurnInputRequest {
     pub input: TurnInput,
+    /// Optional host-assigned UUID for the Responses message created from [`TurnInput::UserInput`].
+    /// Ignored for all other inputs, including raw user-role Responses items.
+    pub user_item_uuid: Option<uuid::Uuid>,
     pub thread_settings: ThreadSettingsOverrides,
     pub start: TurnStartOptions,
     pub additional_context: BTreeMap<String, AdditionalContextEntry>,
-    pub responsesapi_client_metadata: Option<HashMap<String, String>>,
+    pub responsesapi_client_metadata: ResponsesApiClientMetadataUpdate,
     pub trace: Option<W3cTraceContext>,
+}
+
+/// An optional replacement followed by a patch to the turn's client metadata.
+#[derive(Clone, Debug, Default)]
+pub struct ResponsesApiClientMetadataUpdate {
+    /// Replaces the existing map, including when empty.
+    pub replacement: Option<HashMap<String, String>>,
+    /// Adds or overwrites keys without removing other entries.
+    pub patch: Option<HashMap<String, String>>,
 }
 
 /// Attribution retained across recovery, sleep, and model-context compaction.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct TurnAttribution {
+    /// Retained only to prevent recovery from reconstructing a spent allocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference_allowance: Option<Box<TurnInferenceAllowance>>,
     pub turn_id: String,
     pub turn_trigger: Option<String>,
     pub parent_turn_id: Option<String>,
@@ -84,6 +95,7 @@ impl TurnAttribution {
     /// Restores provenance without changing the thread's execution settings.
     pub fn start_options(&self) -> TurnStartOptions {
         TurnStartOptions {
+            inference_allowance: self.inference_allowance.as_deref().cloned(),
             turn_trigger: self.turn_trigger.clone(),
             parent_turn_id: self.parent_turn_id.clone(),
             initiating_agent_path: self.initiating_agent_path.clone(),
@@ -111,10 +123,11 @@ impl TurnInputRequest {
     pub fn new(input: TurnInput) -> Self {
         Self {
             input,
+            user_item_uuid: None,
             thread_settings: ThreadSettingsOverrides::default(),
             start: TurnStartOptions::default(),
             additional_context: BTreeMap::new(),
-            responsesapi_client_metadata: None,
+            responsesapi_client_metadata: ResponsesApiClientMetadataUpdate::default(),
             trace: None,
         }
     }
@@ -153,12 +166,21 @@ impl TurnInputRequest {
         self
     }
 
-    /// Responses metadata attached whether this request starts or steers.
+    /// Replaces Responses client metadata whether this request starts or steers.
     pub fn with_responses_metadata(
         mut self,
         responsesapi_client_metadata: Option<HashMap<String, String>>,
     ) -> Self {
-        self.responsesapi_client_metadata = responsesapi_client_metadata;
+        self.responsesapi_client_metadata.replacement = responsesapi_client_metadata;
+        self
+    }
+
+    /// Adds or overwrites Responses client metadata entries after any replacement.
+    pub fn with_responses_metadata_patch(
+        mut self,
+        responsesapi_client_metadata_patch: Option<HashMap<String, String>>,
+    ) -> Self {
+        self.responsesapi_client_metadata.patch = responsesapi_client_metadata_patch;
         self
     }
 
@@ -176,6 +198,9 @@ pub enum TurnInputMode {
     StartOrSteer,
     /// Start only when the thread is idle.
     StartIfIdle,
+    /// Start a fresh internal automatic turn only after this exact idle checkpoint.
+    /// Unlike recovery, it inherits no execution allowance or continuation chain.
+    StartIfIdleAfter { expected_previous_turn_id: String },
     /// Start an internal continuation when idle.
     /// Reject if another task has started since the expected previous turn.
     ContinueIfIdle { expected_previous_turn_id: String },
@@ -194,6 +219,33 @@ pub enum CyberAccessProgram {
     DaybreakRed,
 }
 
+/// A durably reserved allocation for one physical execution. This is not an
+/// account grant. Never reconstruct it to recover accepted or uncertain work.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TurnInferenceAllowance {
+    pub max_provider_attempts: u32,
+    pub max_request_bytes: u32,
+    pub deadline_unix_ms: i64,
+}
+
+/// Explicit per-execution Code Mode limits, captured without changing thread data.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TurnCodeModeLimits {
+    pub max_heap_size_bytes: u64,
+    pub max_yield_time_ms: u64,
+}
+
+/// Aggregate host-selected Linux limits for one physical execution, never a grant.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TurnProcessLimits {
+    pub memory_bytes: u64,
+    pub cpu_percent: u32,
+    pub tasks: u32,
+}
+
 /// Options for the new-turn branch of a submission.
 ///
 /// Core only records these options when input starts a turn. When input steers,
@@ -202,6 +254,24 @@ pub enum CyberAccessProgram {
 /// child input, Core also compares root lineage to detect ambiguity.
 #[derive(Clone, Debug, Default)]
 pub struct TurnStartOptions {
+    /// Optional aggregate process owner; requires the complete bounded host selection.
+    pub process_limits: Option<TurnProcessLimits>,
+    /// Transient host selection; never replaces inherited thread extension data.
+    pub code_mode_limits: Option<TurnCodeModeLimits>,
+    /// Host-only explicit shell policy for this bounded execution, not thread state.
+    /// Requires a permission ceiling; parent inheritance and login profiles are disabled.
+    pub command_environment_policy: Option<crate::config_types::ShellEnvironmentPolicy>,
+    /// Resolved host-only permission ceiling for one bounded turn. Requires an
+    /// explicit tool ceiling; this never changes persistent thread permissions.
+    pub permission_ceiling: Option<crate::models::PermissionProfile>,
+    /// Host-only, turn-local tool ceiling. None preserves the session policy;
+    /// an empty vector permits no tools. Requires an already reserved allowance.
+    /// This is not an execution sandbox or credential-isolation claim.
+    pub tool_ceiling: Option<Vec<crate::ToolName>>,
+    /// Host-only reservation for this physical turn; never a sticky thread setting.
+    pub provider_attempt_gate: Option<crate::provider_attempt::ProviderAttemptGateSelection>,
+    /// Finite already-reserved inference limits for this physical execution only.
+    pub inference_allowance: Option<TurnInferenceAllowance>,
     /// Source classification for this request. Recorded on new turns and captured
     /// as input provenance when steering, without changing the active turn's trigger.
     pub turn_trigger: Option<String>,

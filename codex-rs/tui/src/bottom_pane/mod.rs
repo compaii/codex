@@ -47,6 +47,7 @@ use crate::render::renderable::FlexRenderable;
 use crate::render::renderable::Renderable;
 use crate::render::renderable::RenderableItem;
 use crate::terminal_palette::effective_stdout_color_level;
+use crate::terminal_program_status::ProgramStatusKind;
 use crate::tui::FrameRequester;
 pub(crate) use bottom_pane_view::BottomPaneView;
 pub(crate) use bottom_pane_view::ViewCompletion;
@@ -89,6 +90,7 @@ pub(crate) use multi_select_picker::MultiSelectPicker;
 mod question_tests;
 mod questions;
 mod request_user_input;
+pub(crate) mod status_line_content;
 mod status_line_setup;
 mod status_line_style;
 mod status_surface_preview;
@@ -115,9 +117,11 @@ pub(crate) use approval_overlay::format_requested_permissions_rule;
 pub(crate) use async_questions::AsyncQuestions;
 pub(crate) use async_questions::QuestionState;
 pub(crate) use async_questions::QuestionSubmission;
+pub(crate) use footer::footer_content;
 pub(crate) use mcp_server_elicitation::McpServerElicitationFormRequest;
 pub(crate) use mcp_server_elicitation::McpServerElicitationOverlay;
 pub(crate) use request_user_input::RequestUserInputOverlay;
+pub(crate) use status_line_style::STATUS_LINE_SEPARATOR;
 pub(crate) use status_line_style::status_line_from_segments;
 pub(crate) use voice_strip::VoiceStripPhase;
 pub(crate) use voice_strip::VoiceStripState;
@@ -153,13 +157,17 @@ mod file_search_popup;
 mod footer;
 mod list_selection_view;
 mod memories_settings_view;
+mod mention_usage;
+pub(crate) use mention_usage::MentionUsage;
 mod mentions_v2;
 mod picker_presets;
 mod picker_rows;
 mod picker_style;
+mod shortcut_hud;
 mod shortcut_overlay;
 pub(crate) use picker_style::active_tab_style;
 pub(crate) use picker_style::selection_style;
+pub(crate) use shortcut_hud::ShortcutHud;
 pub(crate) mod prompt_args;
 mod selection_picker_layout;
 mod skill_popup;
@@ -177,6 +185,7 @@ pub(crate) use list_selection_view::SearchMode;
 pub(crate) use list_selection_view::SelectionDescriptionLayout;
 pub(crate) use list_selection_view::SelectionRowDisplay;
 pub(crate) use list_selection_view::SelectionToggle;
+pub(crate) use list_selection_view::SelectionToggleState;
 pub(crate) use list_selection_view::SelectionViewParams;
 pub(crate) use list_selection_view::SideContentWidth;
 pub(crate) use list_selection_view::popup_content_width;
@@ -257,12 +266,13 @@ pub(crate) enum CancellationEvent {
 use crate::bottom_pane::prompt_args::parse_slash_name;
 pub(crate) use chat_composer::ChatComposer;
 pub(crate) use chat_composer::ChatComposerConfig;
+pub(crate) use chat_composer::ClipboardPasteTarget;
 pub(crate) use chat_composer::ComposerDraftSnapshot;
 pub(crate) use chat_composer::InputResult;
+pub(crate) use chat_composer::KillBufferSnapshot;
 pub(crate) use chat_composer::QueuedInputAction;
 pub(crate) use chat_composer::RestrictedInputMode;
 pub(crate) use chat_composer_history::HistoryEntry;
-pub(crate) use textarea::KillBufferSnapshot;
 
 use crate::status_indicator_widget::StatusDetailsCapitalization;
 use crate::status_indicator_widget::StatusIndicatorWidget;
@@ -347,6 +357,18 @@ pub(crate) struct BottomPaneParams {
 }
 
 impl BottomPane {
+    pub(crate) fn set_mention_usage_home(
+        &mut self,
+        codex_home: &std::path::Path,
+        persistence: codex_config::types::HistoryPersistence,
+    ) {
+        self.composer.mention_usage = MentionUsage::load(codex_home, persistence);
+    }
+
+    pub(crate) fn mention_usage_mut(&mut self) -> &mut MentionUsage {
+        &mut self.composer.mention_usage
+    }
+
     pub fn new(params: BottomPaneParams) -> Self {
         Self::new_with_composer_config(params, ChatComposerConfig::default())
     }
@@ -425,6 +447,15 @@ impl BottomPane {
         self.request_redraw();
     }
 
+    pub(crate) fn set_motion_preferences(&mut self, tui: &codex_config::types::Tui) {
+        self.animations_enabled = tui.animations;
+        self.effects = tui.effects;
+        if let Some(status) = self.status.as_mut() {
+            status.set_motion_preferences(tui);
+        }
+        self.request_redraw();
+    }
+
     /// Mirrors the effective reasoning effort into the composer so its next
     /// visible frame can play a one-shot Max/Ultra effect.
     pub(crate) fn set_active_reasoning_effort(&mut self, effort: Option<&ReasoningEffort>) {
@@ -458,9 +489,8 @@ impl BottomPane {
         self.request_redraw();
     }
 
-    pub(crate) fn set_agents_navigation_enabled(&mut self, enabled: bool) {
-        self.composer.set_agents_navigation_enabled(enabled);
-        self.request_redraw();
+    pub(crate) fn enable_agents_navigation(&mut self) {
+        self.composer.command_center_enabled = true;
     }
 
     pub(crate) fn agents_navigation_key_available(&self) -> bool {
@@ -720,6 +750,13 @@ impl BottomPane {
 
     fn active_view(&self) -> Option<&dyn BottomPaneView> {
         self.view_stack.last().map(std::convert::AsRef::as_ref)
+    }
+
+    pub(crate) fn current_patch_approval(&self) -> Option<&ApplyPatchApprovalRequest> {
+        self.view_stack
+            .iter()
+            .rev()
+            .find_map(|view| view.current_patch_approval())
     }
 
     fn push_view(&mut self, view: Box<dyn BottomPaneView>) {
@@ -1197,6 +1234,7 @@ impl BottomPane {
         self.composer.current_text()
     }
 
+    #[cfg(test)]
     pub(crate) fn composer_cursor(&self) -> usize {
         self.composer.current_cursor()
     }
@@ -1206,7 +1244,7 @@ impl BottomPane {
         self.composer.text_elements()
     }
 
-    pub(crate) fn composer_local_images(&self) -> Vec<LocalImageAttachment> {
+    pub(crate) fn composer_local_images(&self) -> &[LocalImageAttachment] {
         self.composer.local_images()
     }
 
@@ -1217,6 +1255,11 @@ impl BottomPane {
 
     pub(crate) fn composer_text_with_pending(&self) -> String {
         self.composer.current_text_with_pending()
+    }
+
+    /// Include buffered typing before a shortcut takes ownership of composer input.
+    pub(crate) fn flush_pending_composer_input(&mut self) {
+        self.composer.flush_pending_input();
     }
 
     /// Returns whether the composer currently accepts interactive draft edits.
@@ -1336,8 +1379,8 @@ impl BottomPane {
     }
 
     #[cfg(test)]
-    pub(crate) fn status_line_text(&self) -> Option<String> {
-        self.composer.status_line_text()
+    pub(crate) fn status_line_content(&self) -> Option<&footer_content::FooterContent> {
+        self.composer.status_line_content()
     }
 
     pub(crate) fn show_esc_backtrack_hint(&mut self) {
@@ -1615,6 +1658,30 @@ impl BottomPane {
             .and_then(|view| view.selected_index())
     }
 
+    pub(crate) fn selection_toggle_states_for_active_view(
+        &self,
+        view_id: &'static str,
+    ) -> Option<Vec<Option<SelectionToggleState>>> {
+        self.view_stack
+            .last()
+            .filter(|view| view.view_id() == Some(view_id))
+            .map(|view| view.selection_toggle_states())
+    }
+
+    pub(crate) fn complete_selection_toggle_for_active_view(
+        &mut self,
+        view_id: &'static str,
+        index: usize,
+    ) {
+        if let Some(view) = self
+            .view_stack
+            .last_mut()
+            .filter(|view| view.view_id() == Some(view_id))
+        {
+            view.complete_selection_toggle(index);
+        }
+    }
+
     pub(crate) fn selected_index_for_present_view(&self, view_id: &'static str) -> Option<usize> {
         self.view_stack
             .iter()
@@ -1787,6 +1854,29 @@ impl BottomPane {
                 .is_some_and(bottom_pane_view::BottomPaneView::terminal_title_requires_action)
     }
 
+    /// Include requests behind a picker or delayed while the user is typing.
+    /// Async questions only block once the agent is no longer running.
+    pub(crate) fn program_status_blocked_kind(&self) -> Option<ProgramStatusKind> {
+        self.view_stack
+            .iter()
+            .rev()
+            .filter(|view| !view.is_complete())
+            .find_map(|view| view.program_status_blocked_kind())
+            .or_else(|| {
+                self.delayed_approval_requests
+                    .front()
+                    .map(|delayed| delayed.request.program_status_blocked_kind())
+            })
+            .or_else(|| {
+                (!self.is_task_running()
+                    && self
+                        .questions
+                        .as_ref()
+                        .is_some_and(|questions| questions.unanswered_count() > 0))
+                .then_some(ProgramStatusKind::Question)
+            })
+    }
+
     pub(crate) fn has_centered_view(&self) -> bool {
         self.active_view()
             .is_some_and(|view| view.presentation() == ViewPresentation::Centered)
@@ -1855,6 +1945,10 @@ impl BottomPane {
         self.composer.end_mouse_drag();
     }
 
+    pub(crate) fn cancel_composer_primary(&mut self) {
+        self.composer.cancel_primary();
+    }
+
     pub(crate) fn finish_composer_copy(
         &mut self,
         completion: &(u64, crate::clipboard_copy::worker::CopyResult),
@@ -1875,8 +1969,33 @@ impl BottomPane {
         self.composer.copy_selection(event, copy)
     }
 
-    pub(crate) fn can_paste_on_right_click(&self) -> bool {
-        self.no_modal_or_popup_active() && self.composer.can_paste_on_right_click()
+    pub(crate) fn copy_composer_selection_on_release(
+        &mut self,
+        event: crossterm::event::MouseEvent,
+        selection_copy: crate::tui::SelectionCopy,
+        copy: impl FnOnce(
+            &str,
+            crate::tui::SelectionCopy,
+        ) -> (
+            crate::clipboard_copy::worker::CopyResult,
+            Option<std::sync::Arc<()>>,
+        ),
+    ) -> Option<(usize, Option<crate::clipboard_copy::worker::CopyResult>)> {
+        if self.has_active_view() || self.questions.as_ref().is_some_and(|q| q.expanded) {
+            return None;
+        }
+        self.composer
+            .copy_selection_on_release(event, selection_copy, copy)
+    }
+
+    pub(crate) fn clipboard_paste_target(
+        &self,
+        shortcut: Option<KeyCode>,
+    ) -> Option<ClipboardPasteTarget> {
+        if self.has_active_view() || (shortcut.is_none() && !self.no_modal_or_popup_active()) {
+            return None;
+        }
+        self.composer.clipboard_paste_target(shortcut)
     }
 
     pub(crate) fn prepare_composer_mouse(&mut self, event: crossterm::event::MouseEvent) -> bool {
@@ -2192,6 +2311,11 @@ impl BottomPane {
         flushed
     }
 
+    /// Commit accepted typing before snapshotting the target of an asynchronous paste.
+    pub(crate) fn prepare_composer_clipboard_paste(&mut self) {
+        self.composer.flush_pending_paste_burst();
+    }
+
     pub(crate) fn is_in_paste_burst(&self) -> bool {
         self.view_stack
             .last()
@@ -2228,6 +2352,10 @@ impl BottomPane {
         if updated {
             self.request_redraw();
         }
+    }
+
+    pub(crate) fn record_local_user_message_history(&mut self, entry: HistoryEntry) {
+        self.composer.record_local_user_message_history(entry);
     }
 
     pub(crate) fn record_replayed_user_message_history(&mut self, entry: HistoryEntry) {
@@ -2434,6 +2562,7 @@ impl BottomPane {
             let composer: RenderableItem<'_> = if let Some(questions) = question_editor {
                 RenderableItem::Borrowed(questions.as_ref())
             } else if options.max_height.is_none()
+                && options.image_previews.is_none()
                 && options.textarea_right_reserve == 0
                 && options.warning_count == 0
                 && options.footer.is_none()
@@ -2462,7 +2591,7 @@ impl BottomPane {
         self.request_redraw();
     }
 
-    pub(crate) fn set_status_line(&mut self, status_line: Option<Line<'static>>) {
+    pub(crate) fn set_status_line(&mut self, status_line: Option<footer_content::FooterContent>) {
         if self.composer.set_status_line(status_line) {
             self.request_redraw();
         }
@@ -2470,12 +2599,6 @@ impl BottomPane {
 
     pub(crate) fn set_luna_reserve_active(&mut self, active: bool) {
         if self.composer.set_luna_reserve_active(active) {
-            self.request_redraw();
-        }
-    }
-
-    pub(crate) fn set_status_line_hyperlink(&mut self, url: Option<String>) {
-        if self.composer.set_status_line_hyperlink(url) {
             self.request_redraw();
         }
     }
@@ -2953,7 +3076,12 @@ mod tests {
             skills: Some(Vec::new()),
         });
         pane.push_approval_request(exec_request(), &features);
+        assert_eq!(
+            pane.program_status_blocked_kind(),
+            Some(ProgramStatusKind::Permission)
+        );
         assert_eq!(CancellationEvent::Handled, pane.on_ctrl_c());
+        assert_eq!(pane.program_status_blocked_kind(), None);
         assert!(!pane.quit_shortcut_hint_visible());
         assert_eq!(CancellationEvent::NotHandled, pane.on_ctrl_c());
     }
@@ -3052,14 +3180,26 @@ mod tests {
         ] {
             let mut pane = test_pane(tx.clone());
             match source {
-                "warning open" => pane.show_warnings(Vec::new(), Default::default()),
+                "warning open" => pane.show_warnings(
+                    Vec::new(),
+                    Default::default(),
+                    /*daemon_restart_hint_at*/ None,
+                ),
                 "warning navigation" => {
-                    pane.show_warnings(Vec::new(), Default::default());
+                    pane.show_warnings(
+                        Vec::new(),
+                        Default::default(),
+                        /*daemon_restart_hint_at*/ None,
+                    );
                     pane.last_composer_activity_at = None;
                     pane.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
                 }
                 "warning paste" => {
-                    pane.show_warnings(Vec::new(), Default::default());
+                    pane.show_warnings(
+                        Vec::new(),
+                        Default::default(),
+                        /*daemon_restart_hint_at*/ None,
+                    );
                     pane.last_composer_activity_at = None;
                     pane.handle_paste("query".into());
                 }
@@ -3184,6 +3324,10 @@ mod tests {
         let request = exec_request();
         let thread_id = request.thread_id();
         pane.push_approval_request(request, &features);
+        assert_eq!(
+            pane.program_status_blocked_kind(),
+            Some(ProgramStatusKind::Permission)
+        );
 
         assert!(
             pane.dismiss_app_server_request(&ResolvedAppServerRequest::ExecApproval {
@@ -3192,6 +3336,7 @@ mod tests {
             })
         );
         assert!(pane.delayed_approval_requests.is_empty());
+        assert_eq!(pane.program_status_blocked_kind(), None);
 
         pane.pre_draw_tick_at(now + APPROVAL_PROMPT_TYPING_IDLE_DELAY);
         assert!(pane.view_stack.is_empty());

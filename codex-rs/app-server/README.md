@@ -1,3 +1,28 @@
+# Managed human command checkpoints (experimental)
+
+A matching managed `requirements.toml` prefix rule with `decision = "prompt-user"`
+requires a fresh human decision, including when the thread uses automatic review.
+Prefix matching, exact-path precedence, and executable mappings stay unchanged. Clients
+supporting this workflow must initialize with `experimentalApi: true` and
+`requiredHumanApproval: true`.
+
+The server sends `item/commandExecution/requestApproval` with `kind: "humanCommand"`,
+a unique `approvalId`, and the command to display. Only `accept`, `decline`, and
+`cancel` are valid responses. Session and persistent approvals cannot satisfy the
+checkpoint. Only capable clients receive or answer these requests. Pending prompts
+use the normal approval replay flow when a capable client reconnects. With no capable
+connection when approval is requested, the command is rejected. The prompt itself
+does not start an execution item; normal command execution events report execution
+after approval.
+
+# Thread memory summary (experimental)
+
+`thread/memory/read` takes `{threadId}` for a loaded thread and returns
+`{summary}`. Start or resume the thread first. The summary uses that thread's
+resolved memory version, including thread-specific configuration overrides.
+It is `null` when memory use is disabled or the selected summary is missing,
+unreadable, or blank. It never falls back to the other memory version.
+
 # Thread list exclusions
 
 `thread/list` accepts `excludedThreadIds`, an optional array of up to 100
@@ -18,6 +43,13 @@ Listing also returns `-32603` if the store repeats a cursor while filling a page
 These errors are not evidence that history is exhausted; callers can retry.
 A successful response with `nextCursor: null` still indicates exhaustion.
 Default scan-and-repair requests retain their filesystem fallback.
+
+# Thread section moves
+
+After a successful `thread/section/move`, the app-server broadcasts
+`thread/section/changed` to its connected clients. The notification carries
+`threadId` and the destination `sectionId`, which is null for a removal.
+Moves within a section also emit this event so clients can refresh its order.
 
 # Shutdown admission errors
 
@@ -171,6 +203,14 @@ discovery finds no project-root marker, Git checkout, or project-local `.codex`
 directory. Starting a task there does not preapprove project configuration added
 later. Existing trust decisions and permission checks for projects are unchanged.
 
+# Review delivery
+
+`review/start` runs the review on the supplied thread and returns that same
+`reviewThreadId`. Clients can omit `delivery`, send `null`, or specify `"inline"`.
+Clients that used `"detached"` should call `thread/start` and pass the new thread id
+to `review/start`. To keep the original conversation history with custom review
+instructions, use `thread/fork` followed by `turn/start`.
+
 # Thread removal
 
 `thread/archive` and `thread/delete` reject attempts to remove a live internal
@@ -279,7 +319,7 @@ any files were compressed; failures are reported through existing logs and metri
 There are no progress notifications or cancellation API. Clients sharing this
 Codex home must support compressed rollout files, including shared histories.
 
-## Managed model provider requirements
+## Model provider admission
 
 `configRequirements/read` reports `supportsIndependentSpeedModes: true` when
 `features.fast_mode` and `features.ultrafast_mode` independently control Fast and
@@ -291,8 +331,54 @@ Existing threads retain their provider configuration. Input RPCs reject requests
 `model_provider` or `model_providers` requirements no longer match that configuration, or cannot
 be loaded. This covers turn start/steer, review, compaction, manual queue start, and active goal
 updates. Realtime connections use separate routing configuration and are not checked here.
-Interrupt, realtime stop, and goal pause/clear remain available. User and project
-configuration changes alone do not invalidate existing threads.
+Interrupt, realtime stop, and goal pause/clear remain available.
+
+Resume and input RPCs also reject a thread whose saved provider differs from the current
+configured provider, including profile and app-server launch overrides. The JSON-RPC error's
+`data` contains `ModelProviderError`: `modelProviderMismatch` has `modelProvider` and
+`currentModelProvider`, `modelProviderNotConfigured` identifies a missing provider, and
+`modelProviderPolicyConflict` identifies a mandatory-policy conflict. Clients can still use
+`thread/read` to display history and disable the composer with the error's explanation.
+Changing the resume request's provider does not bypass validation of the saved provider.
+This fork additionally preserves an explicitly reasserted saved per-thread provider when its
+exact definition remains in current owner configuration. This allows an existing selected
+profile to coexist with the server default without selecting a new provider. Missing/changed
+routes and managed restrictions still refuse; a retained or request-injected definition alone
+does not qualify. Threads without an explicit session selection retain the default mismatch
+check; switch the configured provider back to continue those chats. Input is also rejected when the
+current provider configuration cannot be loaded. Older clients retain their normal error
+fallback for unrecognized structured error variants.
+
+## Managed network requirements
+
+In `requirements.toml`, put shared network constraints directly in `[permissions.network]`,
+alongside `[permissions.filesystem]`:
+
+```toml
+[permissions.network]
+enabled = true
+```
+
+`[network_proxy]` and its compatibility alias `[experimental_network]` still work.
+Do not mix either with `[permissions.network]`, even across requirements layers. A single
+layer cannot use both top-level names; across layers the top-level names merge with normal
+precedence. `configRequirements/read` returns the result in `requirements.network`.
+
+In `config.toml`, `[features.network_proxy]` configures the proxy, while
+`[permissions.<profile>.network]` configures a profile's network settings. Managed requirements
+remain separate and override conflicting profile settings. They can start the proxy without
+enabling the feature; feature settings apply only when the feature is enabled.
+
+In `requirements.toml`, `network` is reserved, like `filesystem`. Rename any managed profile
+named `network` and update its references before upgrading. An empty `[permissions.network]`
+is rejected because it is indistinguishable from an old empty profile. Omit the table when
+there are no shared network settings. A profile named `network` is still allowed in `config.toml`.
+
+Policy publishers must continue using `[experimental_network]` until every client and policy
+validation layer supports the chosen new spelling. Older clients or intermediaries may ignore or
+strip constraints in `[network_proxy]` or `[permissions.network]`; intermediaries may also skip
+host-local validation. This reader change does not migrate or
+version-gate published policy bundles.
 
 # Amazon Bedrock authentication
 
@@ -603,6 +689,11 @@ execution and sandbox policies.
 
 # Item history anchors
 
+Live notifications and turn history return the same `ThreadItem`. Each item has
+`startedAtMs` and `completedAtMs` beside `type` and `id`. Each timestamp is in
+Unix milliseconds, or `null` when the producer has not recorded it. Clients
+reading older servers may also encounter items that omit these fields.
+
 `thread/items/list` accepts an optional nullable `cursor`: either an opaque string
 from a previous response or an item anchor such as
 `{"type":"item","itemId":"item-123"}`. An item anchor resumes exclusively after
@@ -616,3 +707,148 @@ and out-of-scope item IDs return invalid params (`-32602`) with
 Omitted or null cursors preserve normal first-page behavior. Continue anchored
 pages with the returned opaque string `nextCursor`; response fields and
 `backwardsCursor` semantics are unchanged.
+
+### Strict idle-only turn admission
+
+`turn/startIfIdle` accepts the same `TurnStartParams` and returns the same
+`TurnStartResponse` as `turn/start`, but uses Core's atomic start-if-idle path.
+It never steers or queues its input into an existing turn. Busy/pending-trigger
+refusal returns an invalid-request error without recording the submitted input
+or calling the model. Existing direct-input authority, model/provider admission,
+maintenance/drain, settings and automatic-input/Plan-mode rules still apply.
+The normal `turn/start` start-or-steer behavior is unchanged. Idle-only requests
+preserve the thread's existing client identity and MCP elicitation policy rather
+than applying the requesting connection's metadata before busy admission. The
+removed `permissionProfile` input is rejected consistently for both methods.
+Idle-admission refusal error data includes `submitted: false` with a stable `reason` such as
+`notIdle`, `pendingTriggerTurn` or `planMode`; lost acknowledgments remain uncertain.
+
+For internally attributed application context, supply `input: []` with the
+existing named `toolOutput`; do not fabricate a user utterance. For example:
+
+```json
+{"id":7,"method":"turn/startIfIdle","params":{"threadId":"selected-thread","input":[],"toolOutput":{"name":"application_attention","output":"Attributed source evidence","retain":true}}}
+```
+
+An accepted response identifies a newly started physical turn, allowing the
+application to retain its execution ownership separately from human publication.
+The application still owns generation, pause, budget and takeover controls; this
+method installs no scheduler and grants no automatic attention or extra funding.
+A caller requiring exclusivity must not fall back to `turn/start` after an
+unsupported-method response from an older server. Submission uncertainty keeps
+its original identity and must not be retried as another input.
+## Workspace switching (experimental)
+
+For a managed ChatGPT login, `accountSession/list` returns an opaque
+`sessionId` for that login and its selected workspace. Set
+`refreshWorkspaceMetadata` to fetch the user's memberships.
+
+Call `accountSession/switch` with that `sessionId` and the target workspace's
+`accountId`. Core checks the membership, stops loaded threads, exchanges the
+session token and validates the new workspace's routing. Clients receive
+`thread/closed` for unloaded threads and `account/updated` after a successful
+switch. Selecting the current workspace leaves its threads running.
+
+The server remembers the selected workspace on refresh. If routing validation
+fails, Core attempts to restore the previous workspace while the same credentials
+are still current.
+
+Clients that can open a browser may pass `allowBrowserLogin: true`. If the
+workspace requires SSO, the response contains `loginId` and `authUrl`. Open
+that URL and wait for `account/login/completed`. The browser can reuse an
+existing SSO session. Core accepts the callback only for the requesting login
+and target workspace. Cancel through `account/login/cancel` to keep the current
+workspace. Government workspaces require a separate sign-in.
+
+# GCP provider account
+
+The experimental `account/gcp/setup` method configures the built-in Vertex AI provider.
+
+- `projectId` (required) — Google Cloud project ID.
+- `location` (optional) — Defaults to `global`.
+- `credentialFile` (optional) — Absolute path to a credential file on the app-server
+  host. Omit it or pass `null` to clear the saved path in the active user
+  configuration and use Application Default Credentials (ADC), including
+  `GOOGLE_APPLICATION_CREDENTIALS`.
+
+If the active profile inherits `model_providers.gcp.credential_file` from the base
+`config.toml`, clearing the profile’s own setting would expose the base path again.
+Setup returns an error without saving changes. To use ADC, remove the inherited
+setting from the file named in the error and retry.
+
+Setup rejects a GCP `base_url` override or higher-priority settings that conflict
+with the request. It fetches an access token before saving the settings and
+selecting GCP, then returns `{}`. The next `model/list` reloads the catalog.
+`account/read` reports `{ "account": { "type": "gcp" }, "requiresOpenaiAuth": false }`.
+Use a model request to verify Vertex model access.
+
+Credential failures include `error.data.reason`.
+
+- `gcloudNotInstalled` — The app-server could not find `gcloud` on its PATH.
+- `credentialFileInvalid` — The path is invalid or the file is unreadable. For
+  default `gcloud` auth, setup also checks for a JSON object with a nonempty string `type`.
+- `authCommandFailed` — The token command failed, including when ADC is missing
+  or a token refresh fails.
+
+For personal sign-in, users can run `gcloud auth application-default login` on
+the app-server host and retry setup.
+
+## Managed OpenTelemetry configuration
+
+`configRequirements/read` exposes managed `otel` settings. `config/read` applies
+those settings to the effective configuration and omits ordinary origins for
+managed fields. Configuration writes that overlap managed settings are rejected.
+
+Exporter header values are redacted in effective config, source layers, managed
+requirements, and write-override metadata. Runtime exporters retain the original values.
+
+Managed span attributes and tracestate metadata are included in effective config
+and requirements reads. Unmanaged metadata remains writable.
+
+Tracestate requirements merge individual fields within each member. For example,
+requiring `otel.tracestate.vendor.tenant` preserves an ordinary `vendor.region`.
+Only required fields and edits to their ancestors are protected; sibling fields
+retain their origins and remain writable.
+
+### Bounded idle-turn support observation
+
+The read-only `initialize` response includes `boundedIdleTurn: true` when this
+server implements `turn/startBoundedIfIdle`. Omission means unsupported; it must
+not trigger a mutation probe, ordinary-turn fallback or model call. This is an
+advertisement of the actual serving implementation, not permission, funding,
+provider health, idle capacity or proof of execution. A client reporting current
+operational readiness must separately inspect its selected thread/profile,
+finite resources, exact generation fences and live source observation. The
+existing bounded admission still revalidates the request atomically.
+
+### Host-selected bounded process resources
+
+`turn/startBoundedIfIdle.hostRestrictions.processLimits` optionally selects
+`memoryBytes`, `cpuPercent` and `tasks` for one aggregate on qualified Linux.
+The complete host restriction selection, reserved finite inference allowance and
+idle-only admission are required; this is neither a model tool nor a new resource
+grant. Values must be positive within the existing own-work maxima of 1 GiB,
+100% of one CPU and 128 tasks. Omission preserves earlier bounded/ordinary routes.
+
+The admitted turn captures one private local execution snapshot. Its actual
+stdio executor comes from `codex-exec-server` beside the trusted native executable;
+V8 uses the same process owner. Both receive an explicit environment, a private
+actor HOME and a separate executor CODEX_HOME beneath the protected native home;
+actor permissions further deny host cgroup/manager access
+and the native Codex home. A later tool environment resolution cannot substitute
+the ordinary executor. Start failure is retained for this turn without retrying
+allocation or falling back; completion, cancellation and the same deadline close
+the aggregate despite retained step/client references. Temporary-home cleanup and
+actual group closure have one retained local result.
+
+The receiving launcher must support bubblewrap's `--argv0`: helper re-entry uses
+its protected alias without exposing that path to actor writes. Older launchers
+whose fallback executes the hidden helper pathname are not qualified for this
+profile. Explicit logical runtime roots such as `/bin` and `/lib64` must remain
+readable through permission intersection; their shared read-only target preserves
+descendant denials in both views.
+
+Select this only after qualifying the complete package, launcher, local paths,
+allowed tools and receiving accounting. It does not establish a monetary ceiling, qualify a
+remote SSH front as a resource boundary or make configured state proof of live
+execution. Unsupported hosts/readers reject the selection rather than remove it.

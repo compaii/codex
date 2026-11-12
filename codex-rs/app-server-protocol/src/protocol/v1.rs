@@ -44,6 +44,10 @@ pub struct ClientInfo {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 pub struct InitializeCapabilities {
+    /// Present `humanCommand` approvals to a person and return only a one-time decision.
+    /// Requires `experimentalApi`. Pending requests can be replayed to compatible clients.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub required_human_approval: bool,
     /// Use explicit gateway OAuth login instead of automatic browser authorization.
     /// Applies to this app-server's gateway runtime; later connections cannot undo it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -73,6 +77,12 @@ pub struct InitializeCapabilities {
 #[serde(rename_all = "camelCase")]
 pub struct InitializeResponse {
     pub user_agent: String,
+    /// This server implements the finite, idle-only turn admission primitive.
+    /// This advertises support only, never permission, funding, availability of
+    /// a particular thread/provider or evidence that a turn was submitted.
+    /// Older servers omit it; clients must treat omission as unsupported.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bounded_idle_turn: bool,
     /// Absolute path to the server's $CODEX_HOME directory.
     pub codex_home: AbsolutePathBuf,
     /// Platform family for the running app-server target, for example
@@ -244,4 +254,28 @@ pub struct SandboxSettings {
 #[serde(rename_all = "camelCase")]
 pub struct InterruptConversationResponse {
     pub abort_reason: TurnAbortReason,
+}
+
+#[cfg(test)]
+mod bounded_idle_initialization_tests {
+    use super::InitializeResponse;
+    use serde_json::json;
+
+    #[test]
+    fn older_initialization_does_not_advertise_bounded_idle_support() {
+        let legacy = json!({"userAgent":"test", "codexHome":std::env::current_dir().unwrap(),
+            "platformFamily":"unix", "platformOs":"linux"});
+        let response: InitializeResponse = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(!response.bounded_idle_turn);
+        assert_eq!(serde_json::to_value(response).unwrap(), legacy);
+    }
+
+    #[test]
+    fn bounded_idle_support_is_explicit_without_admitting_a_turn() {
+        let value = json!({"userAgent":"test", "codexHome":std::env::current_dir().unwrap(),
+            "platformFamily":"unix", "platformOs":"linux", "boundedIdleTurn":true});
+        let response: InitializeResponse = serde_json::from_value(value.clone()).unwrap();
+        assert!(response.bounded_idle_turn);
+        assert_eq!(serde_json::to_value(response).unwrap(), value);
+    }
 }

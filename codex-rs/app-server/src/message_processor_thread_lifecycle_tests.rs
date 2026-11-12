@@ -1,4 +1,4 @@
-//! Exercises thread cleanup when startup or child creation outlives the client connection.
+//! Exercises client attachment, approval routing, and cleanup across thread creation.
 
 use codex_app_server_protocol::TurnStartResponse;
 use codex_features::Feature;
@@ -24,8 +24,11 @@ use anyhow::Result;
 use app_test_support::MockResponsesConfig;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
 use codex_app_server_protocol::InitializeResponse;
+use codex_app_server_protocol::JSONRPCError;
+use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
+use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::ThreadClosedNotification;
 use codex_app_server_protocol::ThreadLoadedListResponse;
 use codex_app_server_protocol::ThreadStartResponse;
@@ -510,6 +513,233 @@ async fn disconnected_v2_child_lifecycle(unload_delay_secs: u64, ephemeral: bool
     result
 }
 
+#[tokio::test]
+async fn child_human_approval_survives_attachment_and_rejects_unrelated_clients() -> Result<()> {
+    let (release_spawn_completion, spawn_completion_gate) = oneshot::channel();
+    let (server, _completions) = start_streaming_sse_server(vec![
+        vec![
+            StreamingSseChunk {
+                gate: None,
+                body: responses::sse(vec![
+                    responses::ev_response_created("spawn"),
+                    responses::ev_function_call_with_namespace(
+                        "spawn",
+                        "collaboration",
+                        "spawn_agent",
+                        &json!({"task_name": "child", "message": "Run echo", "fork_turns": "none"})
+                            .to_string(),
+                    ),
+                ]),
+            },
+            StreamingSseChunk {
+                gate: Some(spawn_completion_gate),
+                body: responses::sse(vec![responses::ev_completed("spawn")]),
+            },
+        ],
+        vec![StreamingSseChunk {
+            gate: None,
+            body: responses::sse(vec![
+                responses::ev_response_created("command"),
+                responses::ev_function_call(
+                    "child-command",
+                    "exec_command",
+                    &json!({"cmd": "echo human-approved"}).to_string(),
+                ),
+                responses::ev_completed("command"),
+            ]),
+        }],
+    ])
+    .await;
+    let home = TempDir::new()?;
+    std::fs::write(
+        home.path().join("requirements.toml"),
+        r#"
+[features]
+unified_exec = false
+shell_tool = true
+
+[[rules.prefix_rules]]
+pattern = [{ token = "echo" }]
+decision = "prompt-user"
+"#,
+    )?;
+    MockResponsesConfig::new(server.uri())
+        .with_approval_policy("on-request")
+        .with_sandbox_mode("workspace-write")
+        .with_root_config("approvals_reviewer = \"auto_review\"")
+        .enable_feature(Feature::Collab)
+        .enable_feature(Feature::MultiAgentV2)
+        .write(home.path())?;
+    let config = Arc::new(
+        ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await?,
+    );
+    let auth =
+        AuthManager::shared_from_config(config.as_ref(), /*enable_codex_api_key_env*/ false)
+            .await?;
+    let (processor, mut outgoing) = build_test_processor(config, auth).await;
+    let mut created = processor.thread_created_receiver();
+    let incompatible_id = ConnectionId(1);
+    let capable_id = ConnectionId(2);
+    let unrelated_id = ConnectionId(3);
+    let incompatible = Arc::new(ConnectionSessionState::new(ConnectionOrigin::WebSocket));
+    let capable = Arc::new(ConnectionSessionState::new(ConnectionOrigin::WebSocket));
+    let unrelated = Arc::new(ConnectionSessionState::new(ConnectionOrigin::WebSocket));
+    let result: Result<()> = async {
+        for (id, session, required_human_approval) in [
+            (incompatible_id, &incompatible, false),
+            (capable_id, &capable, true),
+        ] {
+            send_request(
+                &processor,
+                id,
+                session,
+                json!({"id": 1, "method": "initialize", "params": {
+                    "clientInfo": {"name": "attachment-test", "version": "1"},
+                    "capabilities": {
+                        "experimentalApi": true,
+                        "requiredHumanApproval": required_human_approval
+                    }
+                }}),
+            )
+            .await;
+            let _: InitializeResponse =
+                read_response_from(&mut outgoing, id, /*request_id*/ 1).await;
+            processor
+                .connection_initialized(id, session.request_attestation())
+                .await;
+        }
+        send_request(
+            &processor,
+            incompatible_id,
+            &incompatible,
+            json!({"id": 2, "method": "thread/start", "params": {}}),
+        )
+        .await;
+        let parent: ThreadStartResponse =
+            read_response_from(&mut outgoing, incompatible_id, /*request_id*/ 2).await;
+        send_request(
+            &processor,
+            incompatible_id,
+            &incompatible,
+            json!({"id": 3, "method": "turn/start", "params": {
+                "threadId": parent.thread.id,
+                "input": [{"type": "text", "text": "Spawn a child to run echo"}]
+            }}),
+        )
+        .await;
+        let _: TurnStartResponse =
+            read_response_from(&mut outgoing, incompatible_id, /*request_id*/ 3).await;
+        let child_id = timeout(Duration::from_secs(/*secs*/ 10), created.recv()).await??;
+
+        while outgoing.try_recv().is_ok() {}
+        // Attach the initial client set before draining the child's queued approval.
+        processor
+            .try_attach_thread_listener(child_id, vec![incompatible_id, capable_id])
+            .await;
+        let request = timeout(Duration::from_secs(/*secs*/ 10), async {
+            loop {
+                if let OutgoingEnvelope::ToConnection {
+                    connection_id,
+                    message: OutgoingMessage::Request(request),
+                    ..
+                } = outgoing.recv().await.context("outgoing channel closed")?
+                {
+                    assert_eq!(connection_id, capable_id);
+                    break anyhow::Ok(request);
+                }
+            }
+        })
+        .await
+        .context("capable client did not receive the child's approval during attachment")??;
+        let ServerRequest::CommandExecutionRequestApproval { request_id, params } = &request else {
+            anyhow::bail!("expected human approval, got {request:?}");
+        };
+        assert_eq!(
+            (&params.thread_id, params.kind),
+            (
+                &child_id.to_string(),
+                codex_app_server_protocol::CommandExecutionApprovalKind::HumanCommand,
+            ),
+        );
+
+        // Initialize a capable client after auto-attachment. Capability alone must not
+        // let it approve or reject this request before it subscribes and receives it.
+        send_request(
+            &processor,
+            unrelated_id,
+            &unrelated,
+            json!({"id": 1, "method": "initialize", "params": {
+                "clientInfo": {"name": "unrelated-client", "version": "1"},
+                "capabilities": {"experimentalApi": true, "requiredHumanApproval": true}
+            }}),
+        )
+        .await;
+        let _: InitializeResponse =
+            read_response_from(&mut outgoing, unrelated_id, /*request_id*/ 1).await;
+        processor
+            .connection_initialized(unrelated_id, unrelated.request_attestation())
+            .await;
+        for connection_id in [incompatible_id, unrelated_id] {
+            processor
+                .process_response(
+                    connection_id,
+                    JSONRPCResponse {
+                        id: request_id.clone(),
+                        result: json!({"decision": "accept"}),
+                    },
+                )
+                .await;
+            processor
+                .process_error(
+                    connection_id,
+                    JSONRPCError {
+                        id: request_id.clone(),
+                        error: crate::error_code::internal_error("unsupported request"),
+                    },
+                )
+                .await;
+            assert_eq!(
+                processor
+                    .outgoing
+                    .pending_requests_for_thread(child_id)
+                    .await,
+                vec![request.clone()],
+                "unrouted responses and errors must leave the request pending",
+            );
+        }
+
+        // Routing ends at the human decision. Command execution and replay have
+        // their own coverage; declining here needs no Linux sandbox executable.
+        processor
+            .process_response(
+                capable_id,
+                JSONRPCResponse {
+                    id: request_id.clone(),
+                    result: json!({"decision": "decline"}),
+                },
+            )
+            .await;
+        assert!(
+            processor
+                .outgoing
+                .pending_requests_for_thread(child_id)
+                .await
+                .is_empty()
+        );
+        Ok(())
+    }
+    .await;
+    drop(release_spawn_completion);
+    drop(outgoing);
+    processor.clear_runtime_references();
+    processor.shutdown_threads().await;
+    server.shutdown().await;
+    result
+}
+
 async fn send_request(
     processor: &Arc<MessageProcessor>,
     connection_id: ConnectionId,
@@ -526,4 +756,202 @@ async fn send_request(
             Arc::clone(session),
         )
         .await;
+}
+
+#[derive(Default)]
+struct ResumeConfigBarrier {
+    armed: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl codex_config::ThreadConfigLoader for ResumeConfigBarrier {
+    fn load(
+        &self,
+        _: codex_config::ThreadConfigContext,
+    ) -> codex_config::ThreadConfigLoaderFuture<'_, Vec<codex_config::ThreadConfigSource>> {
+        Box::pin(async move {
+            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(Vec::new())
+        })
+    }
+}
+
+// Actual processor/Core/rollout journey with a loopback model. No paid provider.
+#[test_case("legacy"; "legacy")]
+#[test_case("paginated"; "paginated")]
+fn resolved_resume_reuses_identical_idle_runtime_and_rebuilds_changes(
+    history_mode: &'static str,
+) -> Result<()> {
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter("codex_core::session::resume_equivalence=debug")
+        .with_test_writer()
+        .finish();
+    super::message_processor_tracing_tests::run_current_thread_test_with_stack_and_dispatch(
+        "resolved-resume",
+        async move { Box::pin(resolved_resume_journey(history_mode)).await },
+        Some(tracing::Dispatch::new(subscriber)),
+    )
+}
+
+async fn resolved_resume_journey(history_mode: &str) -> Result<()> {
+    let server = app_test_support::create_mock_responses_server_repeating_assistant("Done").await;
+    let home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri())
+        .with_root_config("thread_unload_delay_secs = 3600\nweb_search = \"disabled\"\nmodel_reasoning_effort = \"medium\"")
+        .write(home.path())?;
+    let config = Arc::new(
+        ConfigBuilder::default()
+            .codex_home(home.path().to_path_buf())
+            .build()
+            .await?,
+    );
+    // Match the bridge's explicit routing at start and resume. With SQLite,
+    // sparse resumes restore persisted effort into a new config layer and may
+    // conservatively rebuild despite having the same effective effort.
+    let model = config.model.clone().context("mock model is configured")?;
+    let model_provider = config.model_provider_id.clone();
+    let auth = AuthManager::shared_from_config(config.as_ref(), false).await?;
+    let state_db = codex_rollout::state_db::try_init(config.as_ref()).await?;
+    let barrier = Arc::new(ResumeConfigBarrier::default());
+    let (processor, mut outgoing) =
+        super::message_processor_tracing_tests::build_test_processor_with_thread_config_loader(
+            config,
+            auth,
+            barrier.clone(),
+            Some(state_db),
+        )
+        .await;
+    let first_id = ConnectionId(41);
+    let first = Arc::new(ConnectionSessionState::new(ConnectionOrigin::WebSocket));
+    let result: Result<()> = async {
+        send_request(&processor, first_id, &first, json!({"id":1,"method":"initialize","params":{
+            "clientInfo":{"name":"resolved-resume","version":"1"},"capabilities":{"experimentalApi":true}
+        }})).await;
+        let _: InitializeResponse = read_response_from(&mut outgoing, first_id, 1).await;
+        processor.connection_initialized(first_id, first.request_attestation()).await;
+        send_request(&processor, first_id, &first, json!({"id":2,"method":"thread/start","params":{
+            "model":model,"modelProvider":model_provider,
+            "config":{"web_search":"disabled","model_reasoning_effort":"medium"},"historyMode":history_mode
+        }})).await;
+        let started: ThreadStartResponse = read_response_from(&mut outgoing, first_id, 2).await;
+        assert_eq!(serde_json::to_value(started.thread.history_mode)?, json!(history_mode));
+        let id = codex_protocol::ThreadId::from_string(&started.thread.id)?;
+        send_request(&processor, first_id, &first, json!({"id":3,"method":"turn/start","params":{
+            "threadId":started.thread.id,"input":[{"type":"text","text":"materialize once","text_elements":[]}]
+        }})).await;
+        let _: TurnStartResponse = read_response_from(&mut outgoing, first_id, 3).await;
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let envelope = outgoing.recv().await.context("outgoing closed")?;
+                match envelope {
+                    OutgoingEnvelope::ToConnection { message: OutgoingMessage::AppServerNotification(notification), .. }
+                    | OutgoingEnvelope::Broadcast { message: OutgoingMessage::AppServerNotification(notification) } => {
+                        if matches!(notification.notification, ServerNotification::TurnCompleted(_)) { return anyhow::Ok(()); }
+                    }
+                    _ => {}
+                }
+            }
+        }).await.context("initial materialized turn did not complete")??;
+        let original = processor.thread_processor.thread_manager.get_thread(id).await?;
+        assert!(matches!(original.agent_status().await, AgentStatus::Completed(_)));
+        processor.connection_closed(first_id, &first).await;
+        let second_id = ConnectionId(42);
+        let second = Arc::new(ConnectionSessionState::new(ConnectionOrigin::WebSocket));
+        send_request(&processor, second_id, &second, json!({"id":4,"method":"initialize","params":{
+            "clientInfo":{"name":"resolved-resume","version":"1"},"capabilities":{"experimentalApi":true}
+        }})).await;
+        let _: InitializeResponse = read_response_from(&mut outgoing, second_id, 4).await;
+        processor.connection_initialized(second_id, second.request_attestation()).await;
+        send_request(&processor, second_id, &second, json!({"id":5,"method":"thread/resume","params":{
+            "threadId":started.thread.id,"excludeTurns":true,"model":model,"modelProvider":model_provider,
+            "config":{"web_search":"disabled","model_reasoning_effort":"medium"}
+        }})).await;
+        let _: codex_app_server_protocol::ThreadResumeResponse = read_response_from(&mut outgoing, second_id, 5).await;
+        let seeded = processor.thread_processor.thread_manager.get_thread(id).await?;
+        // Fresh startup inferred its roots; the first resume explicitly restores
+        // the saved selection. That provenance transition must still rebuild.
+        assert!(!original.config().await.workspace_roots_explicit);
+        assert!(seeded.config().await.workspace_roots_explicit);
+        assert!(!Arc::ptr_eq(&original, &seeded), "binding saved roots changes complete configuration");
+        processor.connection_closed(second_id, &second).await;
+        let original = seeded;
+        let warm_id = ConnectionId(46);
+        let warm = Arc::new(ConnectionSessionState::new(ConnectionOrigin::WebSocket));
+        send_request(&processor, warm_id, &warm, json!({"id":12,"method":"initialize","params":{
+            "clientInfo":{"name":"resolved-resume","version":"1"},"capabilities":{"experimentalApi":true}
+        }})).await;
+        let _: InitializeResponse = read_response_from(&mut outgoing, warm_id, 12).await;
+        processor.connection_initialized(warm_id, warm.request_attestation()).await;
+        send_request(&processor, warm_id, &warm, json!({"id":13,"method":"thread/resume","params":{
+            "threadId":started.thread.id,"excludeTurns":true,"model":model,"modelProvider":model_provider,
+            "config":{"web_search":"disabled","model_reasoning_effort":"medium"}
+        }})).await;
+        let _: codex_app_server_protocol::ThreadResumeResponse = read_response_from(&mut outgoing, warm_id, 13).await;
+        let reused = processor.thread_processor.thread_manager.get_thread(id).await?;
+        assert!(Arc::ptr_eq(&original, &reused), "identical resolved config should retain the loaded runtime");
+        processor.connection_closed(warm_id, &warm).await;
+        let third_id = ConnectionId(43);
+        let third = Arc::new(ConnectionSessionState::new(ConnectionOrigin::WebSocket));
+        send_request(&processor, third_id, &third, json!({"id":6,"method":"initialize","params":{
+            "clientInfo":{"name":"resolved-resume","version":"1"},"capabilities":{"experimentalApi":true}
+        }})).await;
+        let _: InitializeResponse = read_response_from(&mut outgoing, third_id, 6).await;
+        processor.connection_initialized(third_id, third.request_attestation()).await;
+        send_request(&processor, third_id, &third, json!({"id":7,"method":"thread/resume","params":{
+            "threadId":started.thread.id,"excludeTurns":false,"model":model,"modelProvider":model_provider,
+            "config":{"web_search":"live","model_reasoning_effort":"medium"}
+        }})).await;
+        let resumed: codex_app_server_protocol::ThreadResumeResponse = read_response_from(&mut outgoing, third_id, 7).await;
+        assert_eq!(serde_json::to_value(resumed.thread.history_mode)?, json!(history_mode));
+        let changed = processor.thread_processor.thread_manager.get_thread(id).await?;
+        assert!(!Arc::ptr_eq(&original, &changed));
+        assert_eq!(resumed.thread.turns.len(), 1, "rebuild retains the original materialized turn");
+        processor.connection_closed(third_id, &third).await;
+        let fourth_id = ConnectionId(44);
+        let fourth = Arc::new(ConnectionSessionState::new(ConnectionOrigin::WebSocket));
+        send_request(&processor, fourth_id, &fourth, json!({"id":8,"method":"initialize","params":{
+            "clientInfo":{"name":"resolved-resume","version":"1"},"capabilities":{"experimentalApi":true}
+        }})).await;
+        let _: InitializeResponse = read_response_from(&mut outgoing, fourth_id, 8).await;
+        processor.connection_initialized(fourth_id, fourth.request_attestation()).await;
+        barrier.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        send_request(&processor, fourth_id, &fourth, json!({"id":9,"method":"thread/resume","params":{
+            "threadId":started.thread.id,"excludeTurns":true,"model":model,"modelProvider":model_provider,
+            "config":{"web_search":"disabled","model_reasoning_effort":"medium"}
+        }})).await;
+        timeout(Duration::from_secs(10), barrier.entered.notified())
+            .await.context("resume did not reach the deferred configuration loader")?;
+        // Same-ID resume requests are deliberately serialized across clients.
+        // The supported path alias uses a separate request queue and resolves
+        // back to this thread, exercising the actual concurrent attach race.
+        // It must attach while host work has released the shared permit.
+        let alias_path = resumed.thread.path.as_ref().context("saved rollout path")?;
+        let fifth_id = ConnectionId(45);
+        let fifth = Arc::new(ConnectionSessionState::new(ConnectionOrigin::WebSocket));
+        send_request(&processor, fifth_id, &fifth, json!({"id":10,"method":"initialize","params":{
+            "clientInfo":{"name":"arriving-subscriber","version":"1"},"capabilities":{"experimentalApi":true}
+        }})).await;
+        let _: InitializeResponse = read_response_from(&mut outgoing, fifth_id, 10).await;
+        processor.connection_initialized(fifth_id, fifth.request_attestation()).await;
+        send_request(&processor, fifth_id, &fifth, json!({"id":11,"method":"thread/resume","params":{
+            "threadId":"","path":alias_path,"excludeTurns":true
+        }})).await;
+        let _: codex_app_server_protocol::ThreadResumeResponse = read_response_from(&mut outgoing, fifth_id, 11).await;
+        barrier.release.notify_one();
+        let _: codex_app_server_protocol::ThreadResumeResponse = read_response_from(&mut outgoing, fourth_id, 9).await;
+        let still_loaded = processor.thread_processor.thread_manager.get_thread(id).await?;
+        assert!(Arc::ptr_eq(&changed, &still_loaded), "an arriving subscriber retains ordinary rejoin semantics");
+        let requests = server.received_requests().await.context("mock requests unavailable")?;
+        assert_eq!(requests.iter().filter(|r|r.url.path().ends_with("/responses")).count(), 1);
+        Ok(())
+    }.await;
+    drop(outgoing);
+    processor.clear_runtime_references();
+    processor.shutdown_threads().await;
+    result
 }

@@ -43,8 +43,11 @@ pub use remote_control::take_remote_control_disabled_env;
 pub use stdio::start_stdio_connection;
 pub use unix_socket::AppServerStartupLock;
 pub use unix_socket::DaemonShutdownAccess;
+pub use unix_socket::DaemonSocketFileGuard;
 pub use unix_socket::acquire_app_server_startup_lock;
+pub use unix_socket::bind_private_daemon_socket;
 pub use unix_socket::start_control_socket_acceptor;
+pub use unix_socket::verified_local_daemon_socket;
 pub use websocket::start_websocket_acceptor;
 
 const INTERNAL_ERROR_CODE: i64 = -32603;
@@ -178,6 +181,12 @@ impl FromStr for AppServerTransport {
 pub enum TransportEvent {
     /// Accepted on the managed local control socket, outside JSON-RPC.
     DaemonShutdown,
+    /// Nonforcing, bounded maintenance on the managed local control socket.
+    DaemonMaintenance {
+        expires_at: tokio::time::Instant,
+        reply: tokio::sync::oneshot::Sender<&'static str>,
+        flushed: tokio::sync::oneshot::Receiver<()>,
+    },
     ConnectionOpened {
         connection_id: ConnectionId,
         origin: ConnectionOrigin,
@@ -379,6 +388,7 @@ mod tests {
             id: RequestId::Integer(7),
             result: Box::new(ClientResponsePayload::Initialize(
                 codex_app_server_protocol::InitializeResponse {
+                    bounded_idle_turn: false,
                     user_agent: "codex-test-agent".to_string(),
                     codex_home,
                     platform_family: "unix".to_string(),

@@ -178,11 +178,19 @@ impl NativeChild {
                 cvt(addchdir(&mut actions.0, cwd.as_ptr()))?;
             }
             for (target, source) in child_fds.iter().enumerate() {
-                cvt(libc::posix_spawn_file_actions_adddup2(
+                let result = libc::posix_spawn_file_actions_adddup2(
                     &mut actions.0,
                     source.as_raw_fd(),
                     target as i32,
-                ))?;
+                );
+                // Darwin rejects valid high descriptors in spawn file actions,
+                // even below RLIMIT_NOFILE. The compatibility backend's dup2
+                // can still wire these owned stdio descriptors after fork.
+                #[cfg(target_os = "macos")]
+                if result == libc::EBADF && request.fallback == crate::SpawnFallback::Compatible {
+                    return Ok(None);
+                }
+                cvt(result)?;
             }
             for target in &request.inherited_fds {
                 #[cfg(target_os = "macos")]
@@ -354,8 +362,8 @@ impl NativeChild {
         }
     }
 
-    /// Sends SIGKILL if still owned, then waits for the child to be reaped.
-    pub(crate) async fn kill(&mut self) -> io::Result<()> {
+    /// Sends SIGKILL while retaining the unreaped child identity.
+    pub(crate) fn start_kill(&mut self) -> io::Result<()> {
         if let Some(pid) = self.pid {
             // SAFETY: An unreaped child retains its PID, even after it exits.
             let result = unsafe { libc::kill(pid, libc::SIGKILL) };
@@ -363,6 +371,12 @@ impl NativeChild {
                 return Err(io::Error::last_os_error());
             }
         }
+        Ok(())
+    }
+
+    /// Sends SIGKILL if still owned, then waits for the child to be reaped.
+    pub(crate) async fn kill(&mut self) -> io::Result<()> {
+        self.start_kill()?;
         self.wait().await.map(|_| ())
     }
 }

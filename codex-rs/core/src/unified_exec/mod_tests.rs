@@ -4,11 +4,13 @@ use crate::codex_thread::BackgroundTerminalInfo;
 use crate::exec::ExecCapturePolicy;
 use crate::exec::ExecExpiration;
 use crate::sandboxing::ExecRequest;
+use crate::sandboxing::SandboxPermissions;
 use crate::session::session::Session;
 use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::ExecCommandToolOutput;
 use crate::unified_exec::WriteStdinRequest;
+use crate::unified_exec::output::CapturedStream;
 use codex_exec_server::ExecProcess;
 use codex_exec_server::ExecProcessEventReceiver;
 use codex_exec_server::ExecProcessFuture;
@@ -27,7 +29,6 @@ use core_test_support::skip_if_sandbox;
 use core_test_support::test_codex::test_env as remote_test_env;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -154,7 +155,8 @@ async fn exec_command_with_tty(
                 SandboxPermissions::UseDefault,
                 /*additional_permissions*/ None,
                 /*internal_permissions*/ None,
-            ),
+            )
+            .expect("capture launch permissions"),
             network_approval: None,
             session: Arc::downgrade(session),
             last_used: started_at,
@@ -179,8 +181,7 @@ async fn exec_command_with_tty(
         collected_output.total_bytes(),
     ))
     .unwrap_or(usize::MAX);
-    let output_omitted_bytes = NonZeroUsize::new(collected_output.omitted_bytes());
-    let collected = collected_output.to_bytes_with_omission_marker();
+    let collected = CapturedStream::from(&collected_output);
     let has_exited = process.has_exited();
     let exit_code = process.exit_code();
     let response_process_id = if process_started_alive && !has_exited {
@@ -212,8 +213,8 @@ async fn exec_command_with_tty(
         process_id: response_process_id,
         exit_code,
         original_token_count: Some(original_token_count),
-        output_omitted_bytes,
         hook_command: Some(cmd.to_string()),
+        tool_cwd: None,
     })
 }
 
@@ -315,9 +316,9 @@ async fn write_stdin(
     input: &str,
     yield_time_ms: u64,
 ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
-    session
-        .services
-        .unified_exec_manager
+    let manager = &session.services.unified_exec_manager;
+    let terminal = manager.resolve_terminal(process_id, turn).await?;
+    manager
         .write_stdin(
             &UnifiedExecContext::new(
                 Arc::clone(session),
@@ -326,7 +327,7 @@ async fn write_stdin(
                 "write".to_string(),
             ),
             WriteStdinRequest {
-                process_id,
+                terminal: &terminal,
                 input,
                 yield_time_ms,
                 max_output_tokens: None,
@@ -554,12 +555,17 @@ async fn reusing_completed_process_returns_unknown_process() -> anyhow::Result<(
     .await?;
     let process_id = open_shell.process_id.expect("expected process id");
 
-    write_stdin(
-        &session, &turn, process_id, "exit\n", /*yield_time_ms*/ 2_500,
-    )
-    .await?;
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::timeout(Duration::from_secs(/*secs*/ 10), async {
+        let mut response = write_stdin(
+            &session, &turn, process_id, "exit\n", /*yield_time_ms*/ 2_500,
+        )
+        .await?;
+        while response.process_id.is_some() {
+            response = write_stdin(&session, &turn, process_id, "", /*yield_time_ms*/ 100).await?;
+        }
+        anyhow::Ok(())
+    })
+    .await??;
 
     let err = write_stdin(&session, &turn, process_id, "", /*yield_time_ms*/ 100)
         .await
@@ -622,7 +628,8 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
                 SandboxPermissions::UseDefault,
                 /*additional_permissions*/ None,
                 /*internal_permissions*/ None,
-            ),
+            )
+            .expect("capture launch permissions"),
             network_approval: None,
             session: Arc::downgrade(&session),
             last_used: Instant::now(),
@@ -671,8 +678,12 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
     Ok(())
 }
 
+#[test_case::test_case(false; "terminal removed")]
+#[test_case::test_case(true; "session id reused")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Result<()> {
+async fn terminating_during_stdin_poll_returns_exited_response(
+    reuse_id: bool,
+) -> anyhow::Result<()> {
     let (session, turn) = test_session_and_turn().await;
     let manager = &session.services.unified_exec_manager;
     let process_id = manager.allocate_process_id().await;
@@ -708,7 +719,8 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
                 SandboxPermissions::UseDefault,
                 /*additional_permissions*/ None,
                 /*internal_permissions*/ None,
-            ),
+            )
+            .expect("capture launch permissions"),
             network_approval: None,
             session: Arc::downgrade(&session),
             last_used,
@@ -743,7 +755,20 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
     .await
     .expect("poll should clone process handles");
 
-    manager.release_process_id(process_id).await;
+    if reuse_id {
+        let replacement = super::process_tests::remote_process(
+            WriteStatus::Accepted,
+            /*terminate_error*/ None,
+            SandboxType::None,
+        )
+        .await;
+        let mut store = manager.process_store.lock().await;
+        let entry = store.processes.get_mut(&process_id).unwrap();
+        entry.process = Arc::new(replacement);
+        entry.call_id = "replacement".into();
+    } else {
+        manager.release_process_id(process_id).await;
+    }
     allow_terminate.notify_one();
     process.terminate_confirmed().await?;
 
@@ -751,8 +776,19 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
         .await
         .expect("poll should finish")
         .expect("poll task should not panic")?;
-    assert_eq!(output.process_id, None);
-    assert!(manager.process_store.lock().await.processes.is_empty());
+    assert_eq!(
+        (output.process_id, output.event_call_id.as_str()),
+        (None, "call")
+    );
+    assert_eq!(
+        manager
+            .process_store
+            .lock()
+            .await
+            .processes
+            .contains_key(&process_id),
+        reuse_id
+    );
 
     Ok(())
 }
@@ -871,7 +907,7 @@ async fn stdin_approval_preserves_the_reviewed_terminal() -> anyhow::Result<()> 
     .await?;
     let process_id = opened.process_id.expect("running terminal");
     let cwd = PathUri::parse("file:///C:/workspace")?;
-    let original = {
+    {
         let mut store = manager.process_store.lock().await;
         let entry = store.processes.get_mut(&process_id).unwrap();
         entry.permissions = TerminalPermissions::for_launch(
@@ -883,11 +919,13 @@ async fn stdin_approval_preserves_the_reviewed_terminal() -> anyhow::Result<()> 
             SandboxPermissions::RequireEscalated,
             /*additional_permissions*/ None,
             /*internal_permissions*/ None,
-        );
+        )
+        .expect("capture launch permissions");
         entry.environment_id = "unselected-executor".to_string();
         entry.cwd = cwd.clone();
-        Arc::clone(&entry.process)
-    };
+    }
+    let original = manager.resolve_terminal(process_id, &turn).await?;
+    assert_eq!(original.environment_id, "unselected-executor");
     // Empty polling must complete without an approval response.
     // The test deadline must allow the minimum empty-poll wait.
     tokio::time::timeout(
@@ -943,7 +981,13 @@ async fn stdin_approval_preserves_the_reviewed_terminal() -> anyhow::Result<()> 
                     ),
                     ("call", Some("write"), cwd.clone().into())
                 );
-                assert!(original.interaction_lock().try_lock_owned().is_err());
+                assert!(
+                    original
+                        .process
+                        .interaction_lock()
+                        .try_lock_owned()
+                        .is_err()
+                );
                 if input == "replace\n" {
                     let replacement = super::process_tests::remote_process(
                         WriteStatus::Accepted,
@@ -979,9 +1023,32 @@ async fn stdin_approval_preserves_the_reviewed_terminal() -> anyhow::Result<()> 
                 matches!(result, Err(UnifiedExecError::UnknownProcessId { process_id: id }) if id == process_id)
             ),
         }
-        assert!(original.interaction_lock().try_lock_owned().is_ok());
+        assert!(original.process.interaction_lock().try_lock_owned().is_ok());
     }
-    original.terminate();
+    // Reusing the numeric ID must also reject a subsequent write to the original terminal.
+    let context = UnifiedExecContext::new(
+        Arc::clone(&session),
+        crate::session::step_context::StepContext::for_test(turn),
+        tokio_util::sync::CancellationToken::new(),
+        "stale".to_string(),
+    );
+    let stale = manager
+        .write_stdin(
+            &context,
+            WriteStdinRequest {
+                terminal: &original,
+                input: "",
+                yield_time_ms: 250,
+                max_output_tokens: None,
+                truncation_policy: TruncationPolicy::Tokens(10_000),
+                interaction_event: None,
+            },
+        )
+        .await;
+    assert!(
+        matches!(stale, Err(UnifiedExecError::UnknownProcessId { process_id: id }) if id == process_id)
+    );
+    original.process.terminate();
     assert!(session.terminate_background_terminal(process_id).await);
     Ok(())
 }
@@ -1010,27 +1077,18 @@ async fn stdin_approval_observes_strict_review_enabled_while_queued() -> anyhow:
     )
     .await?;
     let process_id = opened.process_id.expect("running terminal");
-    let process = Arc::clone(
-        &manager
-            .process_store
-            .lock()
-            .await
-            .processes
-            .get(&process_id)
-            .unwrap()
-            .process,
-    );
+    let terminal = manager.resolve_terminal(process_id, &turn).await?;
     let context = UnifiedExecContext::new(
         Arc::clone(&session),
         StepContext::for_test(turn),
         tokio_util::sync::CancellationToken::new(),
         "write".to_string(),
     );
-    let interaction = process.interaction_lock().lock_owned().await;
+    let interaction = terminal.process.interaction_lock().lock_owned().await;
     let mut queued = Box::pin(manager.write_stdin(
         &context,
         WriteStdinRequest {
-            process_id,
+            terminal: &terminal,
             // NUL input must be rejected when strict review becomes required.
             input: "\0",
             yield_time_ms: 250,
@@ -1054,4 +1112,266 @@ async fn stdin_approval_observes_strict_review_enabled_while_queued() -> anyhow:
     ));
     assert!(session.terminate_background_terminal(process_id).await);
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bounded_terminal_ownership_rejects_poll_write_and_interrupt_without_touching_human_work()
+-> anyhow::Result<()> {
+    use crate::session::step_context::StepContext;
+    use crate::session::tests::make_session_and_context_with_auth_and_config_and_rx;
+    use crate::session::turn_context::NewTurnContextOptions;
+    use crate::tools::sandboxing::ToolError;
+    use codex_features::Feature;
+
+    skip_if_sandbox!(Ok(()));
+    let (session, human, _events) = make_session_and_context_with_auth_and_config_and_rx(
+        codex_login::CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        |config| {
+            config
+                .features
+                .disable(Feature::WriteStdinApproval)
+                .unwrap();
+        },
+    )
+    .await;
+    let manager = &session.services.unified_exec_manager;
+    let command = r#"while IFS= read -r -t 20 line; do printf 'received:%s\n' "$line"; done"#;
+    let opened = exec_command_with_tty(&session, &human, command, 100, None, true).await?;
+    let human_pid = opened.process_id.expect("human terminal remains running");
+    let retained = manager.resolve_terminal(human_pid, &human).await?;
+    for with_tool_ceiling in [false, true] {
+        let bounded = session
+            .new_turn_with_default_settings(
+                format!("bounded-terminal-{with_tool_ceiling}"),
+                NewTurnContextOptions {
+                    tool_ceiling: with_tool_ceiling.then(|| {
+                        vec![
+                            codex_protocol::ToolName::plain("exec_command"),
+                            codex_protocol::ToolName::plain("write_stdin"),
+                        ]
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("build turn context");
+        bounded
+            .extension_data
+            .insert(crate::turn_inference::prepare(
+                &codex_protocol::turn_input::TurnInferenceAllowance {
+                    max_provider_attempts: 1,
+                    max_request_bytes: 4096,
+                    deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+                },
+            )?);
+        assert!(manager.resolve_terminal(human_pid, &bounded).await.is_err());
+        let context = UnifiedExecContext::new(
+            Arc::clone(&session),
+            StepContext::for_test(Arc::clone(&bounded)),
+            tokio_util::sync::CancellationToken::new(),
+            "restricted-stdin".into(),
+        );
+        // Even a retained handle and a busy terminal cannot bypass ownership or
+        // make the rejected call wait for an unrelated human interaction.
+        let interaction = retained.process.interaction_lock().lock_owned().await;
+        for input in ["", "\u{3}", "forbidden\n"] {
+            let result = tokio::time::timeout(
+                Duration::from_millis(250),
+                manager.write_stdin(
+                    &context,
+                    WriteStdinRequest {
+                        terminal: &retained,
+                        input,
+                        yield_time_ms: 100,
+                        max_output_tokens: None,
+                        truncation_policy: TruncationPolicy::Tokens(1000),
+                        interaction_event: None,
+                    },
+                ),
+            )
+            .await?;
+            assert!(
+                matches!(result, Err(UnifiedExecError::StdinApproval(ToolError::Rejected(reason))) if reason.contains("another turn"))
+            );
+        }
+        drop(interaction);
+        assert!(!retained.process.has_exited());
+        let current = manager.resolve_terminal(human_pid, &human).await?;
+        assert!(Arc::ptr_eq(&current.process, &retained.process));
+        let owned = exec_command_with_tty(&session, &bounded, command, 100, None, true).await?;
+        let owned_pid = owned.process_id.expect("owned terminal remains running");
+        let output = write_stdin(&session, &bounded, owned_pid, "owned\n", 100)
+            .await?
+            .truncated_output(1000);
+        assert!(output.contains("received:owned"), "{output}");
+        assert!(session.terminate_background_terminal(owned_pid).await);
+    }
+    let later_human = session
+        .new_turn_with_default_settings(
+            "later-human-terminal".into(),
+            NewTurnContextOptions::default(),
+        )
+        .await
+        .expect("build turn context");
+    let output = write_stdin(&session, &later_human, human_pid, "human\n", 100)
+        .await?
+        .truncated_output(1000);
+    assert!(output.contains("received:human"), "{output}");
+    assert!(
+        !output.contains("forbidden"),
+        "rejected input must never reach the process: {output}"
+    );
+    assert!(session.terminate_background_terminal(human_pid).await);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bounded_process_lifetime_ends_owned_process_on_close_or_deadline_and_preserves_human()
+-> anyhow::Result<()> {
+    core_test_support::test_codex::run_test_with_large_stack("bounded-process-lifetime", || async {
+        use crate::tools::handlers::unified_exec::preparation::ExecCommandLifetime;
+        use crate::tools::handlers::unified_exec::preparation::ParsedExecCommand;
+        skip_if_sandbox!(Ok(()));
+        async fn launch(
+            session: &Arc<Session>,
+            turn: &Arc<TurnContext>,
+            command: &str,
+        ) -> anyhow::Result<ExecCommandToolOutput> {
+            let context = UnifiedExecContext::new(
+                Arc::clone(session),
+                crate::session::step_context::StepContext::for_test(Arc::clone(turn)),
+                tokio_util::sync::CancellationToken::new(),
+                "bounded-lifetime-call".into(),
+            );
+            let arguments =
+                serde_json::json!({"cmd": command, "tty": true, "yield_time_ms": 100}).to_string();
+            let prepared = ParsedExecCommand::parse(
+                &arguments,
+                session,
+                &context.step_context,
+                turn.initial_environments.primary().expect("environment"),
+            )?
+            .prepare(ExecCommandLifetime::Interactive)?;
+            let manager = &session.services.unified_exec_manager;
+            Ok(Box::pin(manager.exec_command(
+                ExecCommandRequest {
+                    prepared,
+                    process_id: manager.allocate_process_id().await,
+                    network: None,
+                },
+                &context,
+            ))
+            .await?)
+        }
+        let (session, human, _events) = Box::pin(
+            crate::session::tests::make_session_and_context_with_auth_and_config_and_rx(
+                codex_login::CodexAuth::from_api_key("Test API Key"),
+                Vec::new(),
+                |config| {
+                    config
+                        .permissions
+                        .set_permission_profile(codex_protocol::models::PermissionProfile::Disabled)
+                        .expect("test permissions");
+                    config.permissions.approval_policy = codex_config::Constrained::allow_any(
+                        codex_protocol::protocol::AskForApproval::Never,
+                    );
+                    config
+                        .features
+                        .enable(codex_features::Feature::UnifiedExecTty)
+                        .expect("TTY fixture");
+                },
+            ),
+        )
+        .await;
+        let shell = r#"while IFS= read -r -t 20 line; do printf 'received:%s\n' "$line"; done"#;
+        let opened = launch(&session, &human, shell).await?;
+        let human_id = opened.process_id.expect("human terminal");
+        let manager = &session.services.unified_exec_manager;
+        let human_terminal = manager.resolve_terminal(human_id, &human).await?;
+        let directory = tempfile::tempdir()?;
+        for mode in ["close_after_yield", "deadline", "close_during_start"] {
+            let bounded = session
+                .new_turn_with_default_settings(
+                    format!("bounded-process-{mode}"),
+                    Default::default(),
+                )
+                .await
+                .expect("bounded context");
+            let allowance = Arc::new(codex_api::InferenceAllowance::new(
+                1,
+                4096,
+                Instant::now()
+                    + if mode != "deadline" {
+                        Duration::from_secs(30)
+                    } else {
+                        Duration::from_secs(2)
+                    },
+            )?);
+            allowance.claim_attempt()?; // Finishing tools require no second provider attempt.
+            bounded.extension_data.insert(Arc::clone(&allowance));
+            let pid_file = directory.path().join(format!("owned-{mode}.pid"));
+            let command = format!("printf '%s\\n' \"$$\" > '{}'; {shell}", pid_file.display());
+            let opened = if mode == "close_during_start" {
+                let (opened, closed) = tokio::join!(launch(&session, &bounded, &command), async {
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while !pid_file.exists() {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                    })
+                    .await?;
+                    let pid = std::fs::read_to_string(&pid_file)?.trim().parse::<u32>()?;
+                    assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+                    allowance.close();
+                    Ok::<(), anyhow::Error>(())
+                });
+                closed?;
+                opened?
+            } else {
+                launch(&session, &bounded, &command).await?
+            };
+            let terminal = match opened.process_id {
+                Some(process_id) => Some(manager.resolve_terminal(process_id, &bounded).await?),
+                None => None,
+            };
+            let native_pid = std::fs::read_to_string(&pid_file)?.trim().parse::<u32>()?;
+            let proc_path = std::path::PathBuf::from(format!("/proc/{native_pid}"));
+            if mode != "close_during_start" {
+                assert!(proc_path.exists(), "real process started and yielded");
+                assert!(terminal.is_some());
+            }
+            if mode == "close_after_yield" {
+                drop(crate::turn_inference::CloseOnExit(Arc::clone(&allowance)));
+            }
+            tokio::time::timeout(Duration::from_secs(4), async {
+                while proc_path.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await?;
+            if let Some(terminal) = terminal {
+                assert!(terminal.process.has_exited());
+                assert!(
+                    terminal
+                        .process
+                        .termination_requested
+                        .load(std::sync::atomic::Ordering::Acquire)
+                );
+            }
+            assert!(!human_terminal.process.has_exited());
+            assert_eq!(allowance.attempted()?, 1);
+            let rejected = launch(&session, &bounded, "echo must-not-run").await;
+            assert!(
+                rejected.is_err(),
+                "ended execution cannot launch another process"
+            );
+        }
+        let output = write_stdin(&session, &human, human_id, "human\n", 100)
+            .await?
+            .truncated_output(1000);
+        assert!(output.contains("received:human"), "{output}");
+        assert!(session.terminate_background_terminal(human_id).await);
+        Ok(())
+    })
 }

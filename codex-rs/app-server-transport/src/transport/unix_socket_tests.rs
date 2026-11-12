@@ -9,6 +9,7 @@ use super::start_control_socket_acceptor;
 use super::unix_socket::acquire_removable_app_server_startup_lock;
 #[cfg(unix)]
 use super::unix_socket::try_acquire_removable_app_server_startup_lock;
+use crate::websocket_compression::WebSocketCompression;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCNotification;
 use codex_core::config::find_codex_home;
@@ -79,6 +80,7 @@ async fn long_control_socket_paths_connect_to_distinct_daemons() {
             transport_event_tx,
             shutdown_token.clone(),
             DaemonShutdownAccess::Disabled,
+            WebSocketCompression::Plain,
         )
         .await
         .expect("control socket acceptor should start");
@@ -113,6 +115,7 @@ async fn control_socket_acceptor_upgrades_and_forwards_websocket_text_messages_a
         transport_event_tx,
         shutdown_token.clone(),
         DaemonShutdownAccess::Disabled,
+        WebSocketCompression::Plain,
     )
     .await
     .expect("control socket acceptor should start");
@@ -221,6 +224,7 @@ async fn shutdown_is_only_accepted_on_managed_local_socket_for_its_own_pid() {
         tx,
         shutdown.clone(),
         DaemonShutdownAccess::Disabled,
+        WebSocketCompression::Plain,
     )
     .await
     .expect("acceptor");
@@ -244,6 +248,7 @@ async fn shutdown_is_only_accepted_on_managed_local_socket_for_its_own_pid() {
         tx,
         shutdown.clone(),
         DaemonShutdownAccess::Managed,
+        WebSocketCompression::Plain,
     )
     .await
     .expect("managed acceptor");
@@ -365,6 +370,7 @@ async fn control_socket_rejects_writable_parent_without_changing_permissions() {
         tx,
         CancellationToken::new(),
         DaemonShutdownAccess::Disabled,
+        WebSocketCompression::Plain,
     )
     .await
     .unwrap_err();
@@ -398,6 +404,7 @@ async fn control_socket_file_is_private_after_bind() {
         transport_event_tx,
         shutdown_token.clone(),
         DaemonShutdownAccess::Disabled,
+        WebSocketCompression::Plain,
     )
     .await
     .expect("control socket acceptor should start");
@@ -411,6 +418,10 @@ async fn control_socket_file_is_private_after_bind() {
         0o755
     );
     let physical_path = std::fs::read_link(socket_path.as_path()).expect("rendezvous symlink");
+    assert_eq!(
+        super::verified_local_daemon_socket(socket_path.as_path()).unwrap(),
+        Some(AbsolutePathBuf::from_absolute_path(physical_path.clone()).unwrap())
+    );
     assert_eq!(
         physical_path.parent(),
         Some(
@@ -427,6 +438,15 @@ async fn control_socket_file_is_private_after_bind() {
     assert!(!physical_path.with_extension("lock").exists());
     assert!(std::fs::symlink_metadata(socket_path.as_path()).is_err());
 
+    // SSH/socat may bind directly at the same advertised path.
+    let forwarded = tokio::net::UnixListener::bind(socket_path.as_path()).unwrap();
+    assert_eq!(
+        super::verified_local_daemon_socket(socket_path.as_path()).unwrap(),
+        None
+    );
+    drop(forwarded);
+    std::fs::remove_file(socket_path.as_path()).unwrap();
+
     // Simulate a dangling rendezvous left by an interrupted cleanup.
     std::os::unix::fs::symlink(&physical_path, socket_path.as_path()).unwrap();
     let (sender, _receiver) = mpsc::channel::<TransportEvent>(CHANNEL_CAPACITY);
@@ -437,12 +457,14 @@ async fn control_socket_file_is_private_after_bind() {
             sender.clone(),
             shutdown.clone(),
             DaemonShutdownAccess::Disabled,
+            WebSocketCompression::Plain,
         ),
         start_control_socket_acceptor(
             socket_path.clone(),
             sender,
             shutdown.clone(),
             DaemonShutdownAccess::Disabled,
+            WebSocketCompression::Plain,
         ),
     );
     let (acceptor, error) = match (first, second) {
@@ -478,6 +500,7 @@ async fn control_socket_pins_directory_until_shutdown() {
         tx,
         shutdown.clone(),
         DaemonShutdownAccess::Disabled,
+        WebSocketCompression::Plain,
     )
     .await
     .expect("acceptor");
@@ -527,4 +550,70 @@ fn assert_socket_path_removed(socket_path: &Path) {
 fn assert_socket_path_removed(_socket_path: &Path) {
     // uds_windows uses a regular filesystem path as its rendezvous point,
     // but there is no Unix socket filesystem node to assert on.
+}
+
+#[tokio::test]
+async fn maintenance_control_requires_managed_receiver_and_returns_bounded_outcome() {
+    for access in [
+        DaemonShutdownAccess::Disabled,
+        DaemonShutdownAccess::MaintenanceOnly,
+        DaemonShutdownAccess::Managed,
+    ] {
+        let home = tempfile::TempDir::new().unwrap();
+        let socket = test_socket_path(home.path());
+        let (tx, mut rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let shutdown = CancellationToken::new();
+        let acceptor = start_control_socket_acceptor(socket.clone(), tx, shutdown.clone(), access)
+            .await
+            .unwrap();
+        if matches!(access, DaemonShutdownAccess::MaintenanceOnly) {
+            let stream = connect_to_socket(socket.as_path()).await.unwrap();
+            assert!(
+                client_async("ws://localhost/daemon/shutdown", stream)
+                    .await
+                    .is_err()
+            );
+            assert!(rx.try_recv().is_err());
+        }
+        let stream = connect_to_socket(socket.as_path()).await.unwrap();
+        let upgraded = client_async("ws://localhost/daemon/maintenance", stream).await;
+        if matches!(access, DaemonShutdownAccess::Disabled) {
+            assert!(upgraded.is_err());
+            assert!(rx.try_recv().is_err());
+        } else {
+            let (mut ws, response) = upgraded.unwrap();
+            let identity = format!("v1:{}", std::process::id());
+            assert_eq!(
+                response.headers()[crate::DAEMON_MAINTENANCE_CAPABILITY_HEADER]
+                    .to_str()
+                    .unwrap(),
+                identity
+            );
+            ws.send(WebSocketMessage::Text(
+                std::process::id().to_string().into(),
+            ))
+            .await
+            .unwrap();
+            let event = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let TransportEvent::DaemonMaintenance { reply, flushed, .. } = event else {
+                panic!("maintenance must never become stop")
+            };
+            reply.send("deferred").unwrap();
+            let frame = ws.next().await.unwrap().unwrap();
+            let WebSocketMessage::Text(frame) = frame else {
+                panic!("expected outcome")
+            };
+            let result: serde_json::Value = serde_json::from_str(&frame).unwrap();
+            assert_eq!(result["outcome"], "deferred");
+            timeout(Duration::from_secs(2), flushed)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        shutdown.cancel();
+        acceptor.await.unwrap();
+    }
 }

@@ -1,6 +1,7 @@
 //! Owns scheduled and manual installs, daemon restarts, and updater replacement.
 
 use std::collections::VecDeque;
+use std::io::Write;
 use std::path::Path;
 #[cfg(unix)]
 use std::process::Command as StdCommand;
@@ -79,13 +80,15 @@ pub(crate) async fn run(
     http_client_factory: HttpClientFactory,
     restore_release: Option<String>,
 ) -> Result<()> {
+    let daemon = Daemon::from_environment()?;
+    crate::backend::stderr_log::start(daemon.update_pid_file.with_extension("stderr.log"));
     let http = RouteAwareClientPool::new_without_request_logging(
         http_client_factory,
         ClientRouteClass::Other,
     );
     run_with_http(
         &http,
-        &Daemon::from_environment()?,
+        &daemon,
         &current_updater_identity().await?,
         restore_release,
     )
@@ -130,10 +133,17 @@ async fn run_with_http(
             .context("updater socket has no parent")?,
     )
     .await?;
-    if socket_path.exists() {
-        tokio::fs::remove_file(&socket_path).await?;
-    }
-    let mut listener = Some(codex_uds::UnixListener::bind(&socket_path).await?);
+    #[cfg(unix)]
+    let (listener, _socket_guard) =
+        codex_app_server_transport::bind_private_daemon_socket(&socket_path).await?;
+    #[cfg(windows)]
+    let listener = {
+        if socket_path.exists() {
+            tokio::fs::remove_file(&socket_path).await?;
+        }
+        codex_uds::UnixListener::bind(&socket_path).await?
+    };
+    let mut listener = Some(listener);
     #[cfg(windows)]
     updater.mark_ready().await?;
     let needs_managed_handoff =
@@ -148,7 +158,9 @@ async fn run_with_http(
         .map(|settings| settings.auto_update_enabled)
         .unwrap_or(true);
     let mut next_check = Instant::now()
-        + if restore_release.is_some() || needs_managed_handoff || !auto_update_enabled {
+        + if crate::thread_recovery::load_maintenance(daemon)?.is_some() {
+            Duration::from_secs(1)
+        } else if restore_release.is_some() || needs_managed_handoff || !auto_update_enabled {
             Duration::from_secs(15)
         } else {
             INITIAL_UPDATE_DELAY
@@ -200,6 +212,11 @@ async fn run_with_http(
                 // must stop instead of installing again without ownership.
                 #[cfg(windows)]
                 updater.wait_for_ownership().await?;
+                if crate::thread_recovery::load_maintenance(daemon)?.is_some() {
+                    // Finish an accepted handoff before updater re-exec or a
+                    // fresh installer pass, including after updater recovery.
+                    manual_handoff_pending = false;
+                }
                 if manual_handoff_pending {
                     if !daemon.is_stable_standalone_release()? {
                         if !daemon.has_latest_selection_marker() {
@@ -221,7 +238,7 @@ async fn run_with_http(
                             if listener.is_none() {
                                 return Err(err);
                             }
-                            eprintln!("warning: failed to refresh managed updater: {err:#}");
+                            let _ = crate::stderr_writer().write_all(format!("warning: failed to refresh managed updater: {err:#}\n").as_bytes());
                             next_check = Instant::now() + Duration::from_secs(30);
                         }
                     }
@@ -230,6 +247,10 @@ async fn run_with_http(
                 let started = std::time::Instant::now();
                 match update_once(http, daemon, running_updater_identity, &mut terminate, UpdateTrigger::Scheduled).await {
                     Ok((UpdateLoopControl::Continue, Some(_))) => {
+                        if crate::thread_recovery::load_maintenance(daemon)?.is_some() {
+                            next_check = Instant::now() + Duration::from_secs(1);
+                            continue;
+                        }
                         manual_handoff_pending = true;
                         next_check = Instant::now();
                         continue;
@@ -334,6 +355,11 @@ async fn update_once(
             .auto_update_enabled
     {
         return Ok((UpdateLoopControl::Stop, None));
+    }
+    if trigger == UpdateTrigger::Scheduled
+        && let Some(outcome) = daemon.continue_pending_maintenance().await?
+    {
+        return Ok((UpdateLoopControl::Continue, Some(outcome)));
     }
     if release_selection_unstable(daemon, trigger)? {
         // An installer can be between changing current and publishing its
@@ -446,9 +472,26 @@ async fn update_once(
             return Ok((UpdateLoopControl::Stop, None));
         }
         match daemon
-            .try_restart_if_running(restart_mode, &managed_codex_bin)
+            .try_restart_if_running(
+                restart_mode,
+                &managed_codex_bin,
+                &package_root,
+                trigger == UpdateTrigger::Scheduled,
+            )
             .await?
         {
+            RestartIfRunningOutcome::Deferred => {
+                return Ok((
+                    UpdateLoopControl::Continue,
+                    Some(RestartIfRunningOutcome::Deferred),
+                ));
+            }
+            RestartIfRunningOutcome::Busy if trigger == UpdateTrigger::Scheduled => {
+                return Ok((
+                    UpdateLoopControl::Continue,
+                    Some(RestartIfRunningOutcome::Deferred),
+                ));
+            }
             RestartIfRunningOutcome::Busy => {
                 if sleep_or_terminate(RESTART_RETRY_INTERVAL, terminate).await {
                     return Ok((UpdateLoopControl::Stop, None));

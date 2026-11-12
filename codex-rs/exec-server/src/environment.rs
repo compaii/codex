@@ -1,4 +1,7 @@
 mod connect_options;
+mod discovery_recovery;
+mod discovery_v2;
+pub use discovery_v2::supports_capability_discovery_v2;
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -69,6 +72,8 @@ pub const CODEX_EXEC_SERVER_NOISE_CHATGPT_ACCOUNT_ID_ENV_VAR: &str =
 pub enum EnvironmentConnectionState {
     /// An initialized exec-server connection is available.
     Connected,
+    /// An established session is unavailable while its transport is being recovered.
+    Recovering,
     /// No initialized exec-server connection is currently available.
     Disconnected,
 }
@@ -687,6 +692,7 @@ fn optional_environment_value(name: &str) -> Option<String> {
 /// paths used by filesystem helpers.
 #[derive(Clone)]
 pub struct Environment {
+    owned_local: bool,
     skills: ScopedSkillsConfig,
     remote_client: Option<LazyRemoteExecServerClient>,
     ready_info: Arc<ArcSwapOption<EnvironmentReadyInfo>>,
@@ -705,6 +711,7 @@ impl Environment {
     /// Builds a test-only local environment without configured sandbox helper paths.
     pub fn default_for_tests() -> Self {
         Self {
+            owned_local: false,
             remote_client: None,
             skills: ScopedSkillsConfig::default(),
             ready_info: Arc::new(ArcSwapOption::empty()),
@@ -786,6 +793,7 @@ impl Environment {
         http_client_factory: HttpClientFactory,
     ) -> Self {
         Self {
+            owned_local: false,
             remote_client: None,
             skills: ScopedSkillsConfig::default(),
             ready_info: Arc::new(ArcSwapOption::empty()),
@@ -800,6 +808,39 @@ impl Environment {
             http_client: Arc::new(RouteAwareHttpClient::new(http_client_factory)),
             local_runtime_paths: Some(local_runtime_paths),
         }
+    }
+
+    /// A private command-backed environment under an existing execution owner.
+    /// This Rust-only selection is lazy, never reuses a configured human/remote
+    /// backend and grants no resource authority. The trusted caller must select
+    /// and qualify the actual local executor (an SSH front is not a remote fence).
+    pub fn owned_stdio(
+        command: crate::StdioExecServerCommand,
+        process_launcher: Arc<dyn codex_utils_pty::ProcessLauncher>,
+        local_runtime_paths: ExecServerRuntimeOptions,
+        http_client_factory: HttpClientFactory,
+    ) -> Result<Self, ExecServerError> {
+        if !cfg!(target_os = "linux")
+            || !std::path::Path::new(&command.program).is_absolute()
+            || !command.cwd.as_ref().is_some_and(|cwd| cwd.is_absolute())
+        {
+            return Err(ExecServerError::Protocol(
+                "owned stdio requires qualified Linux and explicit absolute command/cwd".into(),
+            ));
+        }
+        let mut environment = Self::remote_with_transport(
+            ExecServerTransportParams::StdioCommand {
+                command,
+                initialize_timeout:
+                    crate::client_api::DEFAULT_REMOTE_EXEC_SERVER_INITIALIZE_TIMEOUT,
+                process_launcher: Some(process_launcher),
+            },
+            Some(local_runtime_paths),
+            http_client_factory,
+            ScopedSkillsConfig::default(),
+        );
+        environment.owned_local = true;
+        Ok(environment)
     }
 
     pub(crate) fn remote_with_transport(
@@ -822,6 +863,7 @@ impl Environment {
             Arc::new(RemoteFileSystem::new(client.clone()));
 
         Self {
+            owned_local: false,
             remote_client: Some(client.clone()),
             skills,
             ready_info: Arc::new(ArcSwapOption::empty()),
@@ -837,6 +879,11 @@ impl Environment {
     /// Skill names required whenever this registration is selected by a turn.
     pub fn required_skills(&self) -> &[String] {
         &self.skills.required
+    }
+
+    /// Trusted local owned process behind the existing stdio protocol.
+    pub fn is_owned_local(&self) -> bool {
+        self.owned_local
     }
 
     pub fn is_remote(&self) -> bool {
@@ -1063,9 +1110,18 @@ impl Environment {
     ) -> Result<CapabilityRootsDiscoverResponse, ExecServerError> {
         match &self.remote_client {
             Some(client) => {
-                let mut connection_state = client.subscribe_connection_state();
+                let connection_state = client.subscribe_connection_state();
                 let client = client.get().await?;
                 let discover = || async {
+                    if params.roots.iter().any(|root| {
+                        root.sandbox.as_ref().is_some_and(|sandbox| {
+                            sandbox.windows_sandbox_selection == crate::WindowsSandboxSelection::Mxc
+                        })
+                    }) {
+                        let info = client.environment_info().await?;
+                        crate::sandbox_selection::validate_remote_mxc(&info)
+                            .map_err(|error| ExecServerError::Protocol(error.to_string()))?;
+                    }
                     if params.roots.iter().any(|root| {
                         root.sandbox
                             .as_ref()
@@ -1083,37 +1139,8 @@ impl Environment {
                     }
                     client.discover_capability_roots(params.clone()).await
                 };
-                match discover().await {
-                    Err(error) if crate::client::is_retryable_recovery_error(&error) => {
-                        tracing::warn!(%error, "replaying capability discovery after executor recovery");
-                        let recovered =
-                            tokio::time::timeout(std::time::Duration::from_secs(8), async {
-                                loop {
-                                    match self.readiness_result() {
-                                        Some(Ok(())) => return Some(Ok(())),
-                                        Some(Err(error))
-                                            if !crate::client::is_retryable_recovery_error(
-                                                &error,
-                                            ) =>
-                                        {
-                                            return Some(Err(error));
-                                        }
-                                        Some(Err(_)) | None => {}
-                                    }
-                                    if connection_state.changed().await.is_err() {
-                                        return None;
-                                    }
-                                }
-                            })
-                            .await;
-                        match recovered {
-                            Ok(Some(Ok(()))) => discover().await,
-                            Ok(Some(Err(error))) => Err(error),
-                            Ok(None) | Err(_) => Err(error),
-                        }
-                    }
-                    response => response,
-                }
+                self.discover_with_recovery(connection_state, discover)
+                    .await
             }
             None => crate::discover_capability_roots(self.filesystem.as_ref(), params)
                 .await
@@ -1727,6 +1754,7 @@ mod tests {
     async fn environment_status_keeps_stdio_environment_pending() {
         let environment = Environment::remote_with_transport(
             ExecServerTransportParams::StdioCommand {
+                process_launcher: None,
                 command: StdioExecServerCommand {
                     program: "codex-missing-exec-server-for-test".to_string(),
                     args: Vec::new(),
@@ -1750,6 +1778,7 @@ mod tests {
     #[tokio::test]
     async fn environment_manager_leaves_stdio_environment_lazy() {
         let transport = ExecServerTransportParams::StdioCommand {
+            process_launcher: None,
             command: StdioExecServerCommand {
                 program: "codex-missing-exec-server-for-test".to_string(),
                 args: Vec::new(),
@@ -1785,6 +1814,7 @@ mod tests {
         use codex_protocol::capabilities::SelectedCapabilityRoot;
 
         let transport = ExecServerTransportParams::StdioCommand {
+            process_launcher: None,
             command: StdioExecServerCommand {
                 program: "codex-missing-exec-server-for-test".to_string(),
                 args: Vec::new(),

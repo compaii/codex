@@ -14,6 +14,7 @@ use crate::init_state_db;
 use crate::local_agent_graph_store_from_state_db;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
+use crate::session::tests::make_session_and_context_with_auth_config_home_and_rx;
 use crate::session::tests::update_selected_settings_for_test;
 use crate::session::tests::update_turn_settings_for_test;
 use crate::session::turn_context::TurnContext;
@@ -116,6 +117,8 @@ fn invocation(
         tool_name: codex_tools::ToolName::plain(tool_name),
         source: crate::tools::context::ToolCallSource::Direct,
         payload,
+        native_call: None,
+        environments: Default::default(),
     }
 }
 
@@ -571,6 +574,7 @@ async fn spawn_agent_service_tier_inheritance_uses_root_preference_and_child_mod
         session.services.models_manager = Arc::new(StaticModelsManager::new(
             /*auth_manager*/ None,
             service_tier_test_catalog(),
+            codex_models_manager::ModelOrigin::ExplicitConfig,
         ));
         session.thread_id = root.thread_id;
 
@@ -624,6 +628,7 @@ async fn spawn_agent_service_tier_inheritance_uses_root_preference_and_child_mod
         session.services.models_manager = Arc::new(StaticModelsManager::new(
             /*auth_manager*/ None,
             service_tier_test_catalog(),
+            codex_models_manager::ModelOrigin::ExplicitConfig,
         ));
         session.thread_id = root.thread_id;
 
@@ -3037,7 +3042,8 @@ async fn multi_agent_v2_wait_agent_accepts_timeout_only_argument() {
                 Vec::new(),
                 "hello from worker".to_string(),
                 /*trigger_turn*/ false,
-            ),
+            )
+            .into(),
             Default::default(),
         )
         .await;
@@ -3537,7 +3543,8 @@ async fn multi_agent_v2_wait_agent_returns_summary_for_mailbox_activity() {
                 Vec::new(),
                 "completed".to_string(),
                 /*trigger_turn*/ false,
-            ),
+            )
+            .into(),
             Default::default(),
         )
         .await;
@@ -3613,7 +3620,8 @@ async fn multi_agent_v2_wait_agent_returns_for_already_queued_mail() {
                 Vec::new(),
                 "already queued".to_string(),
                 /*trigger_turn*/ false,
-            ),
+            )
+            .into(),
             Default::default(),
         )
         .await;
@@ -3715,7 +3723,8 @@ async fn multi_agent_v2_wait_agent_wakes_on_any_mailbox_notification() {
                 Vec::new(),
                 "from worker b".to_string(),
                 /*trigger_turn*/ false,
-            ),
+            )
+            .into(),
             Default::default(),
         )
         .await;
@@ -3806,7 +3815,8 @@ async fn multi_agent_v2_wait_agent_does_not_return_completed_content() {
                 Vec::new(),
                 "sensitive child output".to_string(),
                 /*trigger_turn*/ false,
-            ),
+            )
+            .into(),
             Default::default(),
         )
         .await;
@@ -3938,7 +3948,16 @@ async fn multi_agent_v2_interrupt_agent_accepts_task_name_target() {
 
 #[tokio::test]
 async fn multi_agent_v2_interrupt_agent_accepts_unloaded_task_name_target() {
-    let (mut session, mut turn) = make_session_and_context().await;
+    let codex_home = tempfile::tempdir().expect("create codex home");
+    let (session, turn, _) = make_session_and_context_with_auth_config_home_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        codex_home.path(),
+        |_config| {},
+    )
+    .await;
+    let mut session = Arc::into_inner(session).expect("unshared test session");
+    let mut turn = Arc::into_inner(turn).expect("unshared test turn");
     let mut config = (*turn.config).clone();
     config.multi_agent_v2.max_concurrent_threads_per_session = 2;
     config
@@ -4273,7 +4292,14 @@ async fn close_agent_submits_shutdown_and_returns_previous_status() {
 
 #[tokio::test]
 async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtrees_closed() {
-    let (_session, turn) = make_session_and_context().await;
+    let codex_home = tempfile::tempdir().expect("create codex home");
+    let (_session, turn, _) = make_session_and_context_with_auth_config_home_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        codex_home.path(),
+        |_config| {},
+    )
+    .await;
     let mut config = turn.config.as_ref().clone();
     config.agent_max_depth = 3;
     config
@@ -4705,4 +4731,45 @@ async fn build_agent_resume_config_clears_base_instructions() {
         .set(AskForApproval::OnRequest)
         .expect("approval policy set");
     assert_eq!(config, expected);
+}
+
+#[test_case::test_case(false; "queue_only_can_wake")]
+#[test_case::test_case(true; "explicit_trigger")]
+#[tokio::test]
+async fn bounded_agent_message_refuses_before_recipient_resolution(trigger: bool) {
+    let (session, turn) = make_session_and_context().await;
+    let allowance =
+        crate::turn_inference::prepare(&codex_protocol::turn_input::TurnInferenceAllowance {
+            max_provider_attempts: 1,
+            max_request_bytes: 128,
+            deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+        })
+        .expect("valid bounded allowance");
+    turn.extension_data.insert(Arc::clone(&allowance));
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let call = invocation(
+        Arc::clone(&session),
+        turn,
+        if trigger {
+            "followup_task"
+        } else {
+            "send_message"
+        },
+        function_payload(json!({
+            "target": "/root/not_loaded",
+            "message": "must not cause unreserved recipient work"
+        })),
+    );
+    let result = if trigger {
+        FollowupTaskHandlerV2.handle(call).await
+    } else {
+        SendMessageHandlerV2.handle(call).await
+    };
+    let Err(FunctionCallError::RespondToModel(message)) = result else {
+        panic!("bounded message must refuse before resolving/loading a recipient");
+    };
+    assert!(message.contains("separately reserved agent admission"));
+    assert_eq!(allowance.attempted().expect("retained attempts"), 0);
+    assert!(session.active_turn.lock().await.is_none());
 }

@@ -292,11 +292,18 @@ pub(super) async fn page_item_rows(
         let mut query = QueryBuilder::<Sqlite>::new(
             r#"
 SELECT turn_id, item_id, rollout_ordinal, updated_at_ordinal, created_at_ms, started_at_ms, completed_at_ms, item_json
-FROM thread_items
-WHERE thread_id =
-            "#,
+FROM thread_items"#,
         );
-        query.push_bind(segment.rollout_id().to_string());
+        if params.item_ids.is_some() {
+            // Seek each requested ID instead of scanning the turn in rollout order.
+            query.push(" INDEXED BY sqlite_autoindex_thread_items_1");
+        } else if params.turn_id.is_some() && params.after_updated_at_ordinal.is_none() {
+            // A thread-wide index can scan earlier turns when a turn's final page is underfilled.
+            query.push(" INDEXED BY idx_thread_items_by_turn_page");
+        }
+        query
+            .push(" WHERE thread_id = ")
+            .push_bind(segment.rollout_id().to_string());
         push_segment_range(&mut query, segment)?;
         if let Some(after_updated_at_ordinal) = params.after_updated_at_ordinal {
             query

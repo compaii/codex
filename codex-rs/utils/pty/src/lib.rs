@@ -6,8 +6,21 @@ pub use child_command::Command;
 pub use child_command::DescriptorPolicy;
 pub use child_command::ProcessMode;
 pub use child_command::SpawnFallback;
+
+/// Trusted local launch policy. Implementations own admission and resource
+/// lifetime; this interface is never a model or wire instruction.
+pub trait ProcessLauncher: Send + Sync + std::fmt::Debug {
+    fn spawn<'a>(
+        &'a self,
+        command: Command,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<Child>> + Send + 'a>>;
+}
 #[cfg(target_os = "linux")]
 mod linux_fds;
+#[cfg(target_os = "linux")]
+pub mod linux_resources;
+#[cfg(target_os = "linux")]
+pub use linux_fds::require_explicit_descriptors;
 pub mod pipe;
 mod process;
 pub mod process_group;
@@ -65,6 +78,6 @@ mod spawn_helper;
 mod spawn_helper_main;
 #[cfg(target_os = "linux")]
 pub use spawn_helper::init_spawn_helper;
+
 #[cfg(all(test, target_os = "linux"))]
-#[path = "spawn_helper_tests.rs"]
-mod spawn_helper_tests;
+use tests::spawn_helper_tests;

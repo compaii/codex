@@ -21,9 +21,14 @@ use std::collections::HashMap;
 #[test]
 fn bash_permission_request_payload_omits_missing_description() {
     assert_eq!(
-        PermissionRequestPayload::bash("echo hi".to_string(), /*description*/ None),
+        PermissionRequestPayload::bash(
+            "echo hi".to_string(),
+            /*description*/ None,
+            PathUri::parse("file:///repo-B").unwrap()
+        ),
         PermissionRequestPayload {
             tool_name: HookToolName::bash(),
+            tool_cwd: Some(PathUri::parse("file:///repo-B").unwrap()),
             tool_input: json!({ "command": "echo hi" }),
         }
     );
@@ -35,9 +40,11 @@ fn bash_permission_request_payload_includes_description_when_present() {
         PermissionRequestPayload::bash(
             "echo hi".to_string(),
             Some("network-access example.com".to_string()),
+            PathUri::parse("file:///repo-B").unwrap(),
         ),
         PermissionRequestPayload {
             tool_name: HookToolName::bash(),
+            tool_cwd: Some(PathUri::parse("file:///repo-B").unwrap()),
             tool_input: json!({
                 "command": "echo hi",
                 "description": "network-access example.com",
@@ -293,6 +300,7 @@ async fn windows_sandbox_env_preserves_denied_reads_or_rejects_unsupported_backe
     let cwd_uri = PathUri::from_abs_path(&cwd);
     let manager = SandboxManager::new();
     let mut attempt = SandboxAttempt {
+        permission_ceiling: None,
         sandbox_override: SandboxOverride::NoOverride,
         sandbox: SandboxType::WindowsRestrictedToken,
         sandbox_requested: true,
@@ -367,6 +375,7 @@ async fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
         .materialize_project_roots_with_workspace_roots(std::slice::from_ref(&cwd));
     let manager = SandboxManager::new();
     let mut attempt = SandboxAttempt {
+        permission_ceiling: None,
         sandbox_override: SandboxOverride::NoOverride,
         sandbox: SandboxType::None,
         sandbox_requested: true,
@@ -468,4 +477,106 @@ async fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
     attempt.exec_server_permissions = &full_access;
     attempt.enforce_managed_network = false;
     assert!(!attempt.is_escalated(), "full access is not an escalation");
+}
+
+#[tokio::test]
+async fn host_permission_ceiling_caps_executor_grants_and_refuses_missing_enforcement()
+-> anyhow::Result<()> {
+    use codex_protocol::models::AdditionalPermissionProfile;
+    use codex_protocol::models::FileSystemPermissions;
+    use codex_protocol::models::NetworkPermissions;
+    use codex_protocol::models::PermissionProfile;
+    let directory = tempfile::tempdir()?;
+    let cwd = AbsolutePathBuf::from_absolute_path(directory.path())?;
+    let cwd_uri = PathUri::from_abs_path(&cwd);
+    let baseline = PermissionProfile::Disabled;
+    let ceiling = PermissionProfile::read_only();
+    let manager = SandboxManager::new();
+    let mut attempt = SandboxAttempt {
+        permission_ceiling: Some(&ceiling),
+        sandbox_override: SandboxOverride::NoOverride,
+        sandbox: SandboxType::None,
+        sandbox_requested: true,
+        permissions: &baseline,
+        exec_server_permissions: &baseline,
+        enforce_managed_network: false,
+        manager: &manager,
+        sandbox_cwd: &cwd_uri,
+        workspace_roots: std::slice::from_ref(&cwd_uri),
+        sandbox_exe: None,
+        use_legacy_landlock: false,
+        windows_sandbox_type: SandboxType::None,
+        windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
+        network_denial_cancellation_token: None,
+        network_proxy: None,
+    };
+    let command = || SandboxCommand {
+        program: "echo".into(),
+        args: vec!["not executed".into()],
+        cwd: cwd_uri.clone(),
+        env: HashMap::new(),
+        managed_network: Some(ManagedNetworkSandboxContext {
+            loopback_ports: vec![43123],
+            ..Default::default()
+        }),
+        additional_permissions: Some(AdditionalPermissionProfile {
+            network: Some(NetworkPermissions {
+                enabled: Some(true),
+            }),
+            file_system: Some(FileSystemPermissions {
+                entries: vec![FileSystemSandboxEntry::new(
+                    cwd.clone().into(),
+                    FileSystemAccessMode::Write,
+                )],
+                glob_scan_max_depth: None,
+            }),
+        }),
+    };
+    let options = || crate::sandboxing::ExecOptions {
+        expiration: crate::exec::ExecExpiration::DefaultTimeout,
+        capture_policy: crate::exec::ExecCapturePolicy::ShellTool,
+    };
+    let request = attempt.env_for_exec_server(command(), options()).await?;
+    assert!(
+        request.exec_server_managed_network.is_none(),
+        "the scoped offline profile must not inherit proxy exceptions"
+    );
+    let sandbox = request
+        .exec_server_sandbox
+        .expect("mandatory executor sandbox");
+    assert_eq!(
+        sandbox.permissions.network_sandbox_policy(),
+        NetworkSandboxPolicy::Restricted
+    );
+    assert!(
+        sandbox
+            .permissions
+            .file_system_sandbox_policy()
+            .get_writable_roots_with_cwd(&cwd)
+            .is_empty(),
+        "old grants must not restore writes"
+    );
+    assert!(
+        attempt
+            .env_for(command(), options(), None, None)
+            .await
+            .is_err(),
+        "native execution cannot silently omit its sandbox"
+    );
+    attempt.sandbox_requested = false;
+    assert!(
+        attempt
+            .env_for_exec_server(command(), options())
+            .await
+            .is_err()
+    );
+    attempt.sandbox_requested = true;
+    attempt.sandbox_override = SandboxOverride::BypassSandboxFirstAttempt;
+    assert!(
+        attempt
+            .env_for_exec_server(command(), options())
+            .await
+            .is_err()
+    );
+    Ok(())
 }

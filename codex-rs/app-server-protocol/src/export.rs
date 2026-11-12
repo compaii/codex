@@ -51,9 +51,11 @@ const EXPERIMENTAL_CLIENT_METHOD_DEPENDENCY_TYPES: &[&str] = &[
     "BedrockEnvironmentCredential",
     "EnvironmentShellInfo",
     "EnvironmentStatusKind",
+    "GuardianAssessmentOutcome",
     "RemoteControlClient",
     "RemoteControlClientsListOrder",
     "ThreadBackgroundTerminal",
+    "ThreadGuardianAssessment",
     "ThreadSearchOccurrence",
     "ThreadSearchTextRange",
     "TurnSettingsUpdateStatus",
@@ -133,6 +135,7 @@ pub fn generate_ts_with_options(
     export_client_responses(out_dir)?;
     ClientNotification::export_all_to(out_dir)?;
     crate::UserVerificationRpcError::export_all_to(out_dir)?;
+    crate::ModelProviderError::export_all_to(out_dir)?;
 
     ServerRequest::export_all_to(out_dir)?;
     export_server_responses(out_dir)?;
@@ -233,6 +236,10 @@ pub fn generate_json_with_experimental(out_dir: &Path, experimental_api: bool) -
     schemas.push(write_json_schema::<crate::UserVerificationRpcError>(
         out_dir,
         "v2::UserVerificationRpcError",
+    )?);
+    schemas.push(write_json_schema::<crate::ModelProviderError>(
+        out_dir,
+        "v2::ModelProviderError",
     )?);
     schemas.extend(export_client_param_schemas(out_dir)?);
     schemas.extend(export_client_response_schemas(out_dir)?);
@@ -1332,6 +1339,31 @@ fn insert_definition(
             return Ok(());
         }
 
+        // Schemars emits root-only title/$schema metadata when a request is
+        // exported itself, and omits it when the identical request is nested.
+        // Accept only that exact representational difference; real definitions
+        // (including constraints/descriptions and conflicting titles) still collide.
+        let mut existing_body = existing.clone();
+        let mut candidate_body = schema.clone();
+        if strip_matching_root_metadata(&mut existing_body, &name)
+            && strip_matching_root_metadata(&mut candidate_body, &name)
+            && existing_body == candidate_body
+        {
+            let mut canonical = existing.clone();
+            for key in ["title", "$schema"] {
+                if canonical.get(key).is_none()
+                    && let Some(value) = schema.get(key)
+                {
+                    canonical
+                        .as_object_mut()
+                        .context("canonical schema must be an object")?
+                        .insert(key.into(), value.clone());
+                }
+            }
+            definitions.insert(name, canonical);
+            return Ok(());
+        }
+
         let existing_title = existing
             .get("title")
             .and_then(Value::as_str)
@@ -1347,6 +1379,24 @@ fn insert_definition(
 
     definitions.insert(name, schema);
     Ok(())
+}
+
+fn strip_matching_root_metadata(value: &mut Value, name: &str) -> bool {
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+    if object
+        .get("title")
+        .is_some_and(|title| title.as_str() != Some(name))
+        || object
+            .get("$schema")
+            .is_some_and(|draft| draft.as_str() != Some("http://json-schema.org/draft-07/schema#"))
+    {
+        return false;
+    }
+    object.remove("title");
+    object.remove("$schema");
+    true
 }
 
 fn write_json_schema_with_return<T>(out_dir: &Path, name: &str) -> Result<GeneratedSchema>
@@ -2175,6 +2225,25 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
+    fn root_metadata_does_not_hide_real_definition_collisions() -> Result<()> {
+        let body = serde_json::json!({"type":"object","properties":{"input":{"type":"string"}}});
+        let mut root = body.clone();
+        root["title"] = "Request".into();
+        root["$schema"] = "http://json-schema.org/draft-07/schema#".into();
+        let mut definitions = Map::new();
+        insert_definition(&mut definitions, "Request".into(), root.clone(), "test")?;
+        insert_definition(&mut definitions, "Request".into(), body.clone(), "test")?;
+        assert_eq!(definitions["Request"], root);
+        let mut changed = body.clone();
+        changed["properties"]["input"]["maxLength"] = 3.into();
+        assert!(insert_definition(&mut definitions, "Request".into(), changed, "test").is_err());
+        let mut renamed = body;
+        renamed["title"] = "Other".into();
+        assert!(insert_definition(&mut definitions, "Request".into(), renamed, "test").is_err());
+        Ok(())
+    }
+
+    #[test]
     fn generated_ts_optional_nullable_fields_only_in_params() -> Result<()> {
         // Assert that "?: T | null" only appears in generated *Params types.
         let fixture_tree = read_schema_fixture_subtree(&schema_root()?, "typescript")?;
@@ -2262,14 +2331,14 @@ mod tests {
                 continue;
             }
 
-            // Only allow "?: T | null" in objects representing JSON-RPC requests,
-            // which we assume are called "*Params".
+            // Allow "?: T | null" in JSON-RPC request objects and nested request types.
             let allow_optional_nullable = path
                 .file_stem()
                 .and_then(|stem| stem.to_str())
                 .is_some_and(|stem| {
                     stem.ends_with("Params")
                         || stem == "InitializeCapabilities"
+                        || stem == "AdditionalContextEntry"
                         || matches!(
                             stem,
                             "CollabAgentRef"
@@ -2409,8 +2478,14 @@ mod tests {
                 let legacy_optional_nullable_field = (path
                     == Path::new("v2/GetAccountTokenUsageResponse.ts")
                     && field_prefix.trim() == "threadUsage?")
+                    || (path == Path::new("v2/ThreadUsage.ts")
+                        && field_prefix.trim() == "nativeUsageUsdMicros?")
+                    || (path == Path::new("v2/ThreadItem.ts")
+                        && matches!(field_prefix.trim(), "startedAtMs?" | "completedAtMs?"))
                     || (path == Path::new("v2/McpServerOauthLoginCompletedNotification.ts")
                         && field_prefix.trim() == "loginId?")
+                    || (path == Path::new("v2/ProcessExitedNotification.ts")
+                        && field_prefix.trim() == "outputDrainTimedOut?")
                     || (path == Path::new("v2/MisalignmentErrorDetails.ts")
                         && field_prefix.trim() == "reviewTarget?");
                 if field_prefix.chars().rev().find(|c| !c.is_whitespace()) == Some('?')
@@ -2491,32 +2566,6 @@ mod tests {
             true
         );
 
-        Ok(())
-    }
-
-    #[test]
-    fn stable_schema_filter_removes_mock_thread_start_field() -> Result<()> {
-        let output_dir = std::env::temp_dir().join(format!("codex_schema_{}", Uuid::now_v7()));
-        fs::create_dir(&output_dir)?;
-        let schema = write_json_schema_with_return::<v2::ThreadStartParams>(
-            &output_dir,
-            "ThreadStartParams",
-        )?;
-        let mut bundle = build_schema_bundle(vec![schema])?;
-        filter_experimental_schema(&mut bundle)?;
-
-        let definitions = bundle["definitions"]
-            .as_object()
-            .expect("schema bundle should include definitions");
-        let (_, def_schema) = definitions
-            .iter()
-            .find(|(name, _)| definition_matches_type(name, "ThreadStartParams"))
-            .expect("ThreadStartParams definition should exist");
-        let properties = def_schema["properties"]
-            .as_object()
-            .expect("ThreadStartParams should have properties");
-        assert_eq!(properties.contains_key("mockExperimentalField"), false);
-        let _cleanup = fs::remove_dir_all(&output_dir);
         Ok(())
     }
 
@@ -2929,25 +2978,17 @@ permissionProfile?: string | null};
     }
 
     #[test]
-    fn stable_schema_filter_removes_mock_experimental_method() -> Result<()> {
-        let output_dir = std::env::temp_dir().join(format!("codex_schema_{}", Uuid::now_v7()));
-        fs::create_dir(&output_dir)?;
-        let schema =
-            write_json_schema_with_return::<crate::ClientRequest>(&output_dir, "ClientRequest")?;
-        let mut bundle = build_schema_bundle(vec![schema])?;
-        filter_experimental_schema(&mut bundle)?;
-
-        let bundle_str = serde_json::to_string(&bundle)?;
-        assert_eq!(bundle_str.contains("mock/experimentalMethod"), false);
-        let _cleanup = fs::remove_dir_all(&output_dir);
-        Ok(())
-    }
-
-    #[test]
     fn generate_json_filters_experimental_fields_and_methods() -> Result<()> {
         let output_dir = std::env::temp_dir().join(format!("codex_schema_{}", Uuid::now_v7()));
         fs::create_dir(&output_dir)?;
         generate_json_with_experimental(&output_dir, /*experimental_api*/ false)?;
+
+        let ordinary = read_json_value(&output_dir.join("v2/TurnStartParams.json"))?;
+        let bounded = read_json_value(&output_dir.join("v2/TurnStartBoundedIfIdleParams.json"))?;
+        assert_eq!(
+            ordinary["properties"], bounded["definitions"]["TurnStartParams"]["properties"],
+            "nested admission must preserve stable experimental-field filtering"
+        );
 
         let thread_start_json =
             fs::read_to_string(output_dir.join("v2").join("ThreadStartParams.json"))?;

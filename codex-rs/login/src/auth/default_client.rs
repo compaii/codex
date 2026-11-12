@@ -223,7 +223,9 @@ pub fn create_client_with_chatgpt_cookies(http_client_factory: &HttpClientFactor
     let builder = default_http_client_builder()
         .with_chatgpt_cookies(http_client_factory)
         .without_request_logging();
-    if !http_client_factory.network_policy().is_managed() {
+    if !http_client_factory.network_policy().is_managed()
+        && !http_client_factory.protects_sensitive_headers()
+    {
         return build_default_client(builder);
     }
     let mut pool = RouteAwareClientPool::with_builder(
@@ -268,13 +270,30 @@ pub fn create_client_for_route(
     create_client_for_route_with_builder(http_client_factory, request_url, route_class, builder)
 }
 
+/// Build a metered inference transport using the same proxy, cookies and CA policy,
+/// with redirects and transparent protocol/TLS replay disabled.
+pub fn create_single_attempt_client_for_route(
+    http_client_factory: &HttpClientFactory,
+    request_url: &str,
+    route_class: ClientRouteClass,
+) -> Result<HttpClient, BuildRouteAwareHttpClientError> {
+    create_client_for_route_with_builder(
+        http_client_factory,
+        request_url,
+        route_class,
+        default_http_client_builder().without_replays(),
+    )
+}
+
 fn create_client_for_route_with_builder(
     http_client_factory: &HttpClientFactory,
     request_url: &str,
     route_class: ClientRouteClass,
     builder: HttpClientBuilder,
 ) -> Result<HttpClient, BuildRouteAwareHttpClientError> {
-    if http_client_factory.network_policy().is_managed() {
+    if http_client_factory.network_policy().is_managed()
+        || http_client_factory.protects_sensitive_headers()
+    {
         let mut pool = codex_http_client::RouteAwareClientPool::with_builder(
             http_client_factory.clone(),
             route_class,
@@ -392,6 +411,7 @@ pub async fn create_transport_for_routes_async(
             OutboundProxyPolicy::ReqwestDefault
         );
         if !http_client_factory.network_policy().is_managed()
+            && !http_client_factory.protects_sensitive_headers()
             && (transport_default_proxy || sandboxed)
         {
             return ReqwestTransport::from_http_client(create_client());

@@ -376,6 +376,7 @@ async fn inactive_profiles_keep_snapshots_but_active_brokers_require_sandbox() -
         /*prefer_executor_snapshots*/ false,
     );
     let mut config = EnvironmentConfig {
+        environment_hooks: Default::default(),
         allow_login_shell: false,
         workspace_roots: Vec::new(),
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
@@ -487,6 +488,7 @@ async fn inactive_profiles_keep_snapshots_but_active_brokers_require_sandbox() -
     let permissions = PermissionProfile::Disabled;
     let cancellation = CancellationToken::new();
     let mut attempt = SandboxAttempt {
+        permission_ceiling: None,
         sandbox_override: SandboxOverride::NoOverride,
         sandbox: SandboxType::None,
         sandbox_requested: false,

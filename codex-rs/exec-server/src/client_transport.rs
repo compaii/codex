@@ -45,6 +45,7 @@ use crate::client_api::RemoteExecServerConnectArgs;
 use crate::client_api::StdioExecServerCommand;
 use crate::client_api::StdioExecServerConnectArgs;
 use crate::connection::JsonRpcConnection;
+use crate::connection::JsonRpcConnectionEvent;
 use crate::noise_channel::NoiseChannelIdentity;
 use crate::noise_relay::NoiseHarnessConnectionArgs;
 use crate::noise_relay::noise_harness_connection_from_websocket_with_readiness;
@@ -178,7 +179,10 @@ pub(crate) struct ReconnectAttempt {
 }
 
 struct OpenNoiseRendezvousConnection {
+    environment_id: String,
     executor_registration_id: String,
+    stream_id: String,
+    handshake_started: Instant,
     connection: JsonRpcConnection,
     options: ExecServerClientConnectOptions,
     handshake_ready: tokio::sync::oneshot::Receiver<()>,
@@ -409,14 +413,20 @@ impl ExecServerClient {
             ExecServerTransportParams::StdioCommand {
                 command,
                 initialize_timeout,
+                process_launcher,
             } => {
-                return Self::connect_stdio_command(StdioExecServerConnectArgs {
+                let args = StdioExecServerConnectArgs {
                     command,
                     client_name: ENVIRONMENT_CLIENT_NAME.to_string(),
                     initialize_timeout,
                     resume_session_id: None,
-                })
-                .await;
+                };
+                return match process_launcher {
+                    Some(launcher) => {
+                        Self::connect_stdio_command_with_launcher(args, Some(launcher)).await
+                    }
+                    None => Self::connect_stdio_command(args).await,
+                };
             }
         };
         let (websocket_url, connect_timeout, initialize_timeout, http_headers) = websocket;
@@ -685,7 +695,7 @@ impl ExecServerClient {
             stream,
             NoiseHarnessConnectionArgs {
                 connection_label,
-                environment_id,
+                environment_id: environment_id.clone(),
                 executor_registration_id: executor_registration_id.clone(),
                 identity: harness_identity,
                 responder_public_key: executor_public_key,
@@ -693,7 +703,10 @@ impl ExecServerClient {
             },
         );
         Ok(OpenNoiseRendezvousConnection {
+            environment_id,
             executor_registration_id,
+            stream_id: connection.stream_id,
+            handshake_started: connection.handshake_started,
             connection: connection.connection,
             options: ExecServerClientConnectOptions {
                 client_name,
@@ -714,19 +727,36 @@ impl ExecServerClient {
         )
     )]
     async fn wait_for_noise_handshake(
-        handshake_ready: &mut tokio::sync::oneshot::Receiver<()>,
+        connection: &mut OpenNoiseRendezvousConnection,
         deadline: Instant,
         initialize_timeout: Duration,
         initialize_span: &tracing::Span,
     ) -> Result<(), ExecServerError> {
-        match timeout_at(deadline, handshake_ready).await {
+        match timeout_at(deadline, &mut connection.handshake_ready).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) => Err(ExecServerError::Disconnected(
                 "Noise harness handshake failed before connection became ready".to_string(),
             )),
-            Err(_) => Err(ExecServerError::InitializeTimedOut {
-                timeout: initialize_timeout,
-            }),
+            Err(_) => {
+                tracing::event!(
+                    name: "codex.exec_server.noise_handshake_failed",
+                    target: "codex_otel.trace_safe",
+                    tracing::Level::WARN,
+                    event.name = "codex.exec_server.noise_handshake_failed",
+                    noise_event = "handshake",
+                    noise_outcome = "failed",
+                    noise_side = "harness",
+                    noise_reason = "timeout",
+                    timeout_ms = initialize_timeout.as_millis() as u64,
+                    elapsed_ms = connection.handshake_started.elapsed().as_millis() as u64,
+                    environment_id = %connection.environment_id,
+                    executor_registration_id = %connection.executor_registration_id,
+                    stream_id = %connection.stream_id,
+                );
+                Err(ExecServerError::InitializeTimedOut {
+                    timeout: initialize_timeout,
+                })
+            }
         }
     }
 
@@ -737,7 +767,7 @@ impl ExecServerClient {
         // startup parent while making its two child operations visible.
         let initialize_timeout = connection.options.initialize_timeout;
         let noise_context = NoiseInitializeContext {
-            executor_registration_id: connection.executor_registration_id,
+            executor_registration_id: connection.executor_registration_id.clone(),
             span: tracing::info_span!(
                 "codex.exec_server.request",
                 otel.kind = "client",
@@ -748,13 +778,24 @@ impl ExecServerClient {
         };
         let deadline = Instant::now() + initialize_timeout;
         let readiness = Self::wait_for_noise_handshake(
-            &mut connection.handshake_ready,
+            &mut connection,
             deadline,
             initialize_timeout,
             &noise_context.span,
         )
         .await;
-        if let Err(error) = readiness {
+        if let Err(mut error) = readiness {
+            // Before readiness, the transport reports the reason through the
+            // connection event channel, but no RpcClient is reading it yet.
+            if matches!(error, ExecServerError::Disconnected(_))
+                && let Ok(JsonRpcConnectionEvent::Disconnected {
+                    reason: Some(reason),
+                }) = connection.connection.incoming_rx.try_recv()
+            {
+                error = ExecServerError::Disconnected(format!(
+                    "Noise harness handshake failed before connection became ready: {reason}"
+                ));
+            }
             // Unlike the normal connect path, the connection has not reached
             // RpcClient yet, so its Drop implementation cannot abort the
             // transport task for us.
@@ -776,12 +817,49 @@ impl ExecServerClient {
     pub(crate) async fn connect_stdio_command(
         args: StdioExecServerConnectArgs,
     ) -> Result<Self, ExecServerError> {
-        let mut child = stdio_command_process(&args.command)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(ExecServerError::Spawn)?;
+        Self::connect_stdio_command_with_launcher(args, None).await
+    }
+
+    async fn connect_stdio_command_with_launcher(
+        args: StdioExecServerConnectArgs,
+        process_launcher: Option<Arc<dyn codex_utils_pty::ProcessLauncher>>,
+    ) -> Result<Self, ExecServerError> {
+        let mut child: codex_utils_pty::Child = if let Some(launcher) = process_launcher {
+            if !cfg!(target_os = "linux")
+                || args.resume_session_id.is_some()
+                || !std::path::Path::new(&args.command.program).is_absolute()
+                || !args
+                    .command
+                    .cwd
+                    .as_ref()
+                    .is_some_and(|cwd| cwd.is_absolute())
+            {
+                return Err(ExecServerError::Protocol("owned stdio executor requires explicit local Linux command/cwd and no session resume".into()));
+            }
+            let cwd =
+                args.command.cwd.as_ref().ok_or_else(|| {
+                    ExecServerError::Protocol("missing owned executor cwd".into())
+                })?;
+            let mut command = codex_utils_pty::Command::new(&args.command.program);
+            command
+                .args(&args.command.args)
+                .envs(&args.command.env)
+                .current_dir(cwd)
+                .process_mode(codex_utils_pty::ProcessMode::NewSession)
+                .descriptor_policy(codex_utils_pty::DescriptorPolicy::Explicit);
+            launcher
+                .spawn(command)
+                .await
+                .map_err(ExecServerError::Spawn)?
+        } else {
+            stdio_command_process(&args.command)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(ExecServerError::Spawn)?
+                .into()
+        };
 
         let stdin = child.stdin.take().ok_or_else(|| {
             ExecServerError::Protocol("spawned exec-server command has no stdin".to_string())

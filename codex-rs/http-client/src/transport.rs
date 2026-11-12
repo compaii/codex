@@ -34,6 +34,12 @@ pub struct StreamResponse {
 }
 
 pub trait HttpTransport: Send + Sync {
+    /// True only when one invocation cannot follow redirects or replay internally.
+    /// Unknown/custom transports refuse metered inference until qualified.
+    fn supports_single_attempt(&self) -> bool {
+        false
+    }
+
     fn execute(
         &self,
         req: Request,
@@ -172,6 +178,13 @@ fn request_body_for_trace(req: &Request) -> String {
 }
 
 impl HttpTransport for ReqwestTransport {
+    fn supports_single_attempt(&self) -> bool {
+        match &self.client {
+            TransportClient::Fixed(client) => client.supports_single_attempt(),
+            TransportClient::RouteAware(pool) => pool.supports_single_attempt(),
+        }
+    }
+
     async fn execute(&self, req: Request) -> Result<Response, TransportError> {
         self.trace_request(&req);
 

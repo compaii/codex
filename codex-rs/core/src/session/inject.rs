@@ -5,8 +5,33 @@ use codex_analytics::ImagePreparationMetadata;
 use codex_features::Feature;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
+use codex_protocol::error::CodexErr;
+use codex_protocol::error::Result as CodexResult;
+use codex_protocol::models::AudioReference;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::protocol::AdditionalContextEntry;
+use std::collections::BTreeMap;
+
+/// Uploaded files need the admission checks on typed turn input before entering history.
+pub(crate) fn validate_injected_response_item(item: &ResponseItem) -> CodexResult<()> {
+    if let ResponseItem::Message { content, .. } = item
+        && content.iter().any(|part| {
+            matches!(
+                part,
+                ContentItem::InputAudio {
+                    audio: AudioReference::File { .. }
+                }
+            )
+        })
+    {
+        return Err(CodexErr::InvalidRequest(
+            "Uploaded audio files must be submitted as turn input.".to_string(),
+        ));
+    }
+    Ok(())
+}
 
 impl Session {
     /// Returns the input if there is no active turn to inject into.
@@ -19,7 +44,7 @@ impl Session {
         input: Vec<T>,
     ) -> Result<(), Vec<T>> {
         let mut active = self.active_turn.lock().await;
-        match active.as_mut() {
+        match active.as_mut().filter(|turn| turn.finishing.is_none()) {
             Some(active_turn) => {
                 self.input_queue
                     .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
@@ -35,6 +60,49 @@ impl Session {
             }
             None => Err(input),
         }
+    }
+
+    /// Admit internal goal steering and its fresh client context to one exact
+    /// regular turn. This preserves internal authorship instead of synthesizing
+    /// a human message solely to pass the public user-steering API.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "active turn validation and context admission must remain atomic"
+    )]
+    pub(crate) async fn inject_context_for_running_turn(
+        &self,
+        expected_turn: &str,
+        items: Vec<ResponseItem>,
+        context: BTreeMap<String, AdditionalContextEntry>,
+    ) -> Option<String> {
+        let mut active = self.active_turn.lock().await;
+        let active = active.as_mut().filter(|turn| turn.finishing.is_none())?;
+        let task = active.task.as_ref()?;
+        if task.turn_context.sub_id != expected_turn
+            || !matches!(task.kind, crate::state::TaskKind::Regular)
+        {
+            return None;
+        }
+        let turn_id = task.turn_context.sub_id.clone();
+        let mut pending = super::turn_input::merge_additional_context_input(
+            self,
+            task.turn_context.as_ref(),
+            context,
+        )
+        .await;
+        pending.extend(
+            items
+                .into_iter()
+                .map(ResponseItemEnvelope::new)
+                .map(PendingTurnInput::ResponseItem),
+        );
+        self.input_queue
+            .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
+                active.turn_state.as_ref(),
+                pending,
+            )
+            .await;
+        Some(turn_id)
     }
 
     /// Injects hook context into the running turn atomically.
@@ -81,7 +149,7 @@ impl Session {
             .map(|item| self.annotate_client_response_item(item))
             .collect::<Vec<_>>();
         let mut active = self.active_turn.lock().await;
-        if let Some(active_turn) = active.as_mut() {
+        if let Some(active_turn) = active.as_mut().filter(|turn| turn.finishing.is_none()) {
             self.input_queue
                 .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
                     active_turn.turn_state.as_ref(),
@@ -93,7 +161,11 @@ impl Session {
                 .await;
             return;
         }
+        let finishing = active.as_ref().and_then(|turn| turn.finishing.clone());
         drop(active);
+        if let Some(finishing) = finishing {
+            finishing.cancelled().await;
+        }
         self.record_annotated_conversation_items(turn_context, turn_context.model_info(), items)
             .await;
     }
@@ -175,6 +247,15 @@ impl Session {
         let Err(items) = self.inject_if_running(items).await else {
             return;
         };
+        let finishing = self
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|turn| turn.finishing.clone());
+        if let Some(finishing) = finishing {
+            finishing.cancelled().await;
+        }
         let default_turn_context;
         let turn_context = match current_turn_context {
             Some(turn_context) => turn_context,

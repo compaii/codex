@@ -65,6 +65,12 @@ impl WithStatus for StreamResponse {
     }
 }
 
+impl<T: WithStatus, A> WithStatus for (T, A) {
+    fn status(&self) -> StatusCode {
+        self.0.status()
+    }
+}
+
 pub(crate) async fn run_with_request_telemetry<T, F, Fut>(
     policy: RetryPolicy,
     telemetry: Option<Arc<dyn RequestTelemetry>>,

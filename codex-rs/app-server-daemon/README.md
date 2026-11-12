@@ -69,6 +69,16 @@ and running versions. A running daemon restarts, so active or queued work may be
 interrupted; a stopped daemon stays stopped. Installer errors return nonzero.
 The updater uses saved network settings; CLI `-c` overrides do not reach it.
 
+For a confirmed nonblocking maintenance handoff, the qualified complete package
+can use `daemon update --from-cli --if-stopped --yes`, then
+`daemon restart --if-stopped` after actual old-process exit. The stopped-only
+installer refuses a new running receiver before replacement and rechecks under
+its existing operation lock. Stopped-only restart refuses serving/starting
+receivers and missing, invalid or recorded-interrupted recovery snapshots under
+the lifecycle lock. It preserves the saved context rather than using fresh
+`start`, which discards recovery. See [nonblocking maintenance](../../docs/nonblocking-maintenance.md)
+for the full sequence, uncertainty and independent-launch requirements.
+
 For all managed app-server shutdowns, including explicit stop and restart and
 updater-triggered restarts, `shutdownGraceSeconds` defaults to 60 and accepts
 an integer from 0 through 300. Zero forces shutdown immediately after requesting

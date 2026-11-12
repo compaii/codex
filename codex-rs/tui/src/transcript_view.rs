@@ -17,6 +17,7 @@ mod layout;
 mod mutations;
 mod prompt_header;
 mod search;
+mod select_mode;
 mod selection;
 mod snapshot;
 mod text;
@@ -29,6 +30,7 @@ use crate::history_cell::HistoryCell;
 use crate::history_cell::HistoryRenderMode;
 use crate::pager_overlay::TranscriptHistoryState;
 use crate::terminal_hyperlinks::HyperlinkLine;
+use crate::tui::SelectionCopy;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Stylize;
@@ -38,34 +40,15 @@ use ratatui::widgets::Widget;
 
 use layout::LayoutCache;
 use search::Search;
+use select_mode::SelectMode;
 use selection::Selection;
 use snapshot::ViewSnapshot;
-use text::TextLayout;
+pub(crate) use text::TextLayout;
 
 pub(crate) use bookmark::TranscriptBookmark;
 pub(crate) use input::JumpTarget;
 pub(crate) use input::ViewAction;
 pub(crate) use layout::ActivityTranscriptLines;
-
-/// Copy origin plus the deselection policy applied after confirmed delivery.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SelectionCopy {
-    Explicit,
-    OnSelect { clear_selection: bool },
-}
-
-impl SelectionCopy {
-    fn clear_selection(self) -> bool {
-        match self {
-            Self::Explicit => true,
-            Self::OnSelect { clear_selection } => clear_selection,
-        }
-    }
-
-    fn publishes_primary(self) -> bool {
-        matches!(self, Self::OnSelect { .. })
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum EntryKey {
@@ -106,6 +89,7 @@ struct VisibleRow {
 
 /// Shared scrolling and interaction state for compact and detailed transcript presentations.
 pub(crate) struct TranscriptView {
+    pub(crate) image_protocol: Option<crate::pets::ImageProtocol>,
     pub(crate) mouse_scroll_speed: f64,
     pending_mouse_scroll: f64,
     pub(crate) copy_on_select: bool,
@@ -126,6 +110,7 @@ pub(crate) struct TranscriptView {
     suppressed_prompt_header: Option<prompt_header::SuppressedHeader>,
     visible: Vec<VisibleRow>,
     selection: Option<Selection>,
+    select_mode: Option<SelectMode>,
     copy_mode: Option<copy_mode::CopyMode>,
     held_reading: Option<ViewSnapshot>,
     search: Search,
@@ -144,6 +129,7 @@ pub(crate) struct TranscriptView {
 impl Default for TranscriptView {
     fn default() -> Self {
         Self {
+            image_protocol: None,
             mouse_scroll_speed: 1.0,
             pending_mouse_scroll: 0.0,
             copy_on_select: false,
@@ -164,6 +150,7 @@ impl Default for TranscriptView {
             suppressed_prompt_header: None,
             visible: Vec::new(),
             selection: None,
+            select_mode: None,
             copy_mode: None,
             held_reading: None,
             search: Search::default(),
@@ -232,7 +219,9 @@ impl TranscriptView {
         {
             // Freezing follow must preserve a header that yielded to the next visible prompt.
             self.suppressed_prompt_header = Some(header_position);
-        } else if area.height >= 4 && prompt_header::line(cells, start.0, area.width).is_some() {
+        } else if area.height >= 4
+            && prompt_header::line(cells, start.0, area.width, self.detailed).is_some()
+        {
             body = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
             let resized = resized || previous_height != body.height;
             self.area = body;
@@ -242,7 +231,9 @@ impl TranscriptView {
             }
             // Following may advance into the next turn after reserving the header row.
             start = self.start(cells);
-            if let Some((header, key)) = prompt_header::line(cells, start.0, area.width) {
+            if let Some((header, key)) =
+                prompt_header::line(cells, start.0, area.width, self.detailed)
+            {
                 let header_area = Rect::new(area.x, area.y, area.width, /*height*/ 1);
                 header.render(header_area, buf);
                 self.prompt_header_target = Some((header_area, key));
@@ -313,10 +304,42 @@ impl TranscriptView {
             self.unseen_activity = false;
         }
         self.render_selection(buf);
+        self.render_select_cursor(buf);
         if self.history == TranscriptHistoryState::LoadingBeginning && self.is_following() {
             self.scroll(current_cells, /*rows*/ 0);
         }
         self.render_search(buf);
+    }
+
+    pub(crate) fn image_placements(&self) -> Vec<crate::transcript_image::ImagePlacement> {
+        let mut placements = Vec::new();
+        let mut y = self.area.y;
+        for rows in self.visible.chunk_by(|a, b| a.index == b.index) {
+            let entry_y = y;
+            y += rows.len() as u16;
+            let visible = &rows[0];
+            let Some(image) = visible.layout.visible_image() else {
+                continue;
+            };
+            let image_start = visible.layout.text_row_count();
+            let skip = image_start.saturating_sub(visible.row);
+            if skip >= rows.len() {
+                continue;
+            }
+            let area = Rect::new(
+                self.area.x + self.area.width.saturating_sub(image.columns) / 2,
+                entry_y + skip as u16,
+                image.columns,
+                (rows.len() - skip) as u16,
+            );
+            placements.push(crate::transcript_image::ImagePlacement {
+                image: Arc::clone(image),
+                area,
+                first_row: visible.row.saturating_sub(image_start),
+                file: None,
+            });
+        }
+        placements
     }
 
     pub(crate) fn sync_live_tail(
@@ -346,7 +369,7 @@ impl TranscriptView {
         })
     }
 
-    fn sync_live_layout(
+    pub(crate) fn sync_live_layout(
         &mut self,
         width: u16,
         key: Option<ActiveCellTranscriptKey>,
@@ -380,6 +403,7 @@ impl TranscriptView {
             return;
         }
         self.selection = None;
+        self.select_mode = None;
         self.copy_mode = None;
         self.release_live_reading();
         self.cache.clear();
@@ -397,7 +421,10 @@ impl TranscriptView {
     }
 
     pub(crate) fn has_active_interaction(&self) -> bool {
-        self.selection.is_some() || self.search.is_active() || self.is_activity_focused()
+        self.select_mode.is_some()
+            || self.selection.is_some()
+            || self.search.is_active()
+            || self.is_activity_focused()
     }
 
     pub(crate) fn is_detailed(&self) -> bool {
@@ -405,11 +432,20 @@ impl TranscriptView {
     }
 
     pub(crate) fn is_following(&self) -> bool {
-        self.selection.is_none() && self.position == Position::Latest
+        self.select_mode.is_none() && self.selection.is_none() && self.position == Position::Latest
     }
 
     /// Hold the current reading position until every older page has arrived.
     pub(crate) fn jump_to_beginning(&mut self, cells: &[Arc<dyn HistoryCell>]) {
+        if !self.detailed
+            && !self.is_select_mode()
+            && let Some(index) = cells
+                .iter()
+                .rposition(|cell| cell.as_any().is::<crate::history_cell::ClearScreenHeader>())
+        {
+            self.jump_to_entry(cells, index);
+            return;
+        }
         if self.history == TranscriptHistoryState::LoadingBeginning {
             return;
         }
@@ -422,10 +458,12 @@ impl TranscriptView {
     }
 
     pub(crate) fn jump_to_latest(&mut self) {
+        self.disclosure.resume_after_approval = None;
         self.cancel_search();
         self.cancel_beginning();
         self.position = Position::Latest;
         self.selection = None;
+        self.select_mode = None;
         self.copy_mode = None;
         self.release_live_reading();
         self.unseen_activity = false;
@@ -434,6 +472,7 @@ impl TranscriptView {
 
     pub(crate) fn scroll(&mut self, cells: &[Arc<dyn HistoryCell>], rows: isize) {
         if rows != 0 {
+            self.disclosure.resume_after_approval = None;
             self.last_click = None;
             self.cancel_beginning();
         }
@@ -607,6 +646,13 @@ impl TranscriptView {
         if rows < 0 {
             let mut remaining = rows.unsigned_abs();
             while remaining > row && index > 0 {
+                if !self.detailed
+                    && cells.get(index).is_some_and(|cell| {
+                        cell.as_any().is::<crate::history_cell::ClearScreenHeader>()
+                    })
+                {
+                    return (index, 0);
+                }
                 remaining -= row;
                 index -= 1;
                 row = self

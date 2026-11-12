@@ -256,6 +256,30 @@ impl Command {
         Ok(())
     }
 
+    /// Launch a new Linux session only after trusted parent-side admission.
+    ///
+    /// The callback receives the owned, unreaped helper PID before target exec
+    /// or environment transfer. It may assign that helper to an execution-owned
+    /// resource group. Refusal, cancellation or unavailable helper support kills
+    /// the incomplete launch; this method never falls back to an ungated spawn.
+    /// The caller must bound admission and own the resource group's lifetime.
+    #[cfg(target_os = "linux")]
+    pub async fn spawn_with_admission<F, Fut>(self, admit: F) -> io::Result<Child>
+    where
+        F: FnOnce(u32) -> Fut,
+        Fut: std::future::Future<Output = io::Result<()>>,
+    {
+        if !matches!(self.process_mode, ProcessMode::NewSession)
+            || self.descriptor_policy != DescriptorPolicy::Explicit
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "admitted launch requires a new session and explicit descriptors",
+            ));
+        }
+        crate::spawn_helper::spawn_with_admission(&self, admit).await
+    }
+
     /// Launch with native platform settings and the existing compatibility fallback.
     pub fn spawn(mut self) -> io::Result<Child> {
         #[cfg(unix)]

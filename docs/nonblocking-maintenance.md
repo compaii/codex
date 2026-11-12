@@ -1,0 +1,192 @@
+# Nonblocking native maintenance
+
+Routine maintenance must preserve shared human admission while another turn is
+running. Availability takes precedence over completing an update. A deployment
+request never authorizes forced shutdown, paused goals, replay or global Stop.
+
+## Incident and correction
+
+On 2026-10-27 the selected older server handled SIGHUP by closing admission
+immediately and waiting for live work. This rejected independent human requests
+while another session was genuinely working. A separate diagnostic loaded an
+entire large rollout into memory and triggered OOM; previous-package fallback
+restored availability. Neither event proves candidate adoption or graceful exit.
+
+The correction keeps maintenance pending with human admission open for at most120s.
+During that existing bounded lease, the same admission mutex withholds fresh
+internally generated goal continuations. A goal reservation already acquired may
+finish submitting; its permit prevents an idle claim. Active steering and human
+starts remain available, and required delegated work retains its existing path.
+This does not pause a goal, change an objective/status/budget or alter accounting.
+
+On timeout/defer/snapshot failure the gate releases one callback per withheld
+thread, outside its lock. Callbacks hold weak runtime references and perform one
+idle-start attempt after checking the exact goal snapshot revision under the
+existing goal-state semaphore. Later pause/clear/replacement/config changes win;
+Core still checks actual idle state and higher-priority pending trigger input.
+Resumption is bounded to one callback/attempt per withheld thread, not a poller or
+new maintenance lease. It serializes with ordinary goal control; no timeout
+cancels an in-flight control operation or a submitted turn. Existing persistent
+storage stalls remain an operational limitation, not permission to force work.
+Explicit Stop discards withheld callbacks. Successful handoff uses existing
+snapshot/startup recovery, not synthetic user originals or goal rewrites.
+
+The receiver claims an idle boundary only with no preparing starts, no Core task lifetime
+guards and no host-reported running turns. Shared guards cover both the task
+future and its abort owner through terminal persistence; delayed lifecycle events
+cannot manufacture idle. Mailbox/durable-sleep starts acquire admission before
+consuming pending input. Explicit parent-delegated child work can complete
+while another Core task remains live; it cannot bypass a claimed idle boundary.
+Mailbox delegation requires unambiguous parent lineage, revalidated atomically
+against the queue consumed so a later unrelated message remains pending.
+
+Final snapshot preparation has a five-second deadline. Maintenance abandons on
+root persistence failure, a still-interrupted root, write/publish error or timeout,
+reopening admission without disconnecting clients. Attempt-private staging paths
+prevent late abandoned writers from publishing startup recovery. Explicit stop
+retains its separate best-effort semantics; repeated maintenance is never force.
+The final atomic rename is a local filesystem commit: no application watchdog can
+guarantee progress if the operating system itself blocks that syscall.
+
+The goal-withholding behavior is a successor to source `15c365f19`. The existing
+v1 control capability proves nonblocking maintenance, not that an older serving
+binary contains this correction. Qualify and identify the actual selected source.
+An unselected package cannot retrofit suppression into its running predecessor;
+initial adoption still needs its supported idle handoff. An expired waiter must
+not be rearmed as a workaround.
+
+## Receiving operation
+
+Do not use the older SIGHUP path to close admission while unrelated work is live.
+Human correction2026-10-27 removes the blanket signal prohibition: a controlled
+scoped legacy replacement at verified idle is permitted. Do not hold the shared
+daemon operation lock while
+waiting for unrelated turns; it can itself block ordinary CLI attachment.
+Retired adoption helpers are historical evidence, not executable recovery routes.
+
+Use `codex app-server daemon maintenance` against a qualified receiver. It uses
+only the private managed control socket, without acquiring daemon.lock. The
+receiver must advertise the versioned nonblocking capability and its process ID
+before the caller sends any lifecycle request. Managed Unix receivers enable
+maintenance independently of the platform-specific explicit-shutdown socket;
+unmanaged receivers expose neither maintenance capability nor its control route. Older receivers are refused
+without sending a signal or a maintenance command. The caller waits at most133s
+and reports the exact receiver's outcome: `deferred`, `alreadyPending`,
+`supersededByExplicitStop`, or `handoffReady`. The last confirms a saved handoff,
+not process exit or installation. A lost/expired response is unconfirmed. Never force, resend, select a package or start another writer after
+an uncertain result. A fixed lease begins at socket receipt; enqueueing is bounded, and the receiver
+rejects expired or abandoned requests before arming maintenance. Queue delay can
+never create a fresh pending window after the observer expires. Preserve the exact snapshot and all
+uncertain originals. Initial pinned local-package selection/restart is a separate
+operation only after confirmed old-process exit, using the supported complete
+local-package route.
+
+### Pinned local packages
+
+Use the existing confirmed-handoff sequence for a complete local package:
+
+```text
+codex app-server daemon maintenance
+# Require handoffReady, actual old-process exit and the saved idle snapshot.
+PACKAGE/bin/codex app-server daemon update --from-cli --if-stopped --yes
+PACKAGE/bin/codex app-server daemon restart --if-stopped
+```
+
+The first command retains its existing private control/133second observation.
+Unsupported, busy, lost or unconfirmed handoffs leave work serving; never proceed
+to package selection from an unconfirmed outcome. Observe actual process exit,
+not just a stale PID file, failed probe, elapsed timeout or saved snapshot.
+
+For0.167, use the current canonical package builder: the package includes the
+native CLI, `codex-code-mode-host` and the standalone `codex-exec-server`, plus
+its platform resources and `execServer` manifest entry. A previously qualified
+two-executable0.163 artifact is not a complete0.167 package. Keep all binaries
+from the same qualified source; the existing executor stdio/helper re-exec test
+checks that new component without model input or live session changes.
+
+`update --from-cli --if-stopped` uses the existing complete-package installer,
+confirmation and operation-lock recheck. It refuses a running receiver even with
+`--yes`; a receiver that appears after confirmation also prevents replacement.
+`restart --if-stopped` takes the existing lifecycle lock, refuses any serving or
+starting receiver, and requires a stored parseable native snapshot within64MiB
+with no recorded interrupted turns. It uses the existing stopped restart route,
+preserving recovery; missing/consumed/invalid/interrupted snapshots never become
+a fresh start. The flags leave ordinary explicit update/restart semantics intact.
+
+Run the finite receiving coordinator through its existing independent managed
+launcher/checkpoint. Verify the actual launch and replacement cgroups: detaching
+a process/session does not move it out of a service scheduled to stop. Do not put
+the replacement daemon in a transient build unit whose completion will kill its
+children. Keep the previous selected code and current native state; no historical
+machine archive, input replay or new model attention is required.
+
+Scheduled automatic updates prepare/select the available complete package through
+the existing installer, but adopt it in the running daemon only after nonblocking
+maintenance and observed exit of the retained process generation. The updater
+releases the shared operation lock before waiting. Unsupported, deferred, lost or
+handoff-ready-without-exit outcomes leave the running process alone and return to
+the ordinary update schedule, without force or a tight retry loop. After exit it
+reacquires the lock and revalidates the selected package and absence of another
+receiver before starting a replacement; it preserves the recovery snapshot.
+After `handoffReady`, a private atomic journal retains the exact process,
+selected package and snapshot identity across bounded exit observations, lock
+contention and updater re-exec. Later scheduled passes resume that continuation
+without sending another maintenance request. Accepted handoffs use the existing
+updater loop at a one-second continuation cadence, before installer/updater
+adoption; pre-handoff deferral retains the ordinary update interval. Explicit Stop retires both recovery
+and the journal; changed/consumed recovery cancels automatic replacement.
+Explicit manual update, Stop and Restart retain their separate semantics.
+
+For the initial older receiver, wait with admission open and inspect actual loaded
+thread activity. When every loaded thread is idle, recheck the exact receiver
+identity and perform one controlled SIGTERM, without force or repeated signals.
+If busy or unknown, defer; do not substitute paused goals or global Stop. Require
+confirmed exit and a fresh complete recovery snapshot without interrupted turns
+before package selection. Retain the previous package and snapshot.
+
+Use the existing complete-package install confirmation, not a new approval gate:
+the installer describes whether a running daemon would restart. Cancel if it
+would restart another receiver; confirm only a stopped replacement. Its existing
+operation-lock recheck rejects a changed running state. Then use supported
+`restart` so recovery is preserved; fresh `start` clears it. This is a finite
+initial compatibility bridge, not the routine path for the repaired receiver.
+Native metadata readiness and actual CLI/Telegram/Interaction admission are
+separate receiving observations. Keep qualification, publication, installation and
+human acceptance distinct.
+
+## Qualification and diagnosis
+
+The focused native-maintenance workflow exercises admission/shutdown units,
+independent conversation admission while another turn is held, actual managed
+idle snapshots, publish failure reopening, blocked persistence timeout and late
+completion, plus Core input and task-lifetime contracts. Use mock providers;
+production conversations and input replay are unnecessary for these regressions.
+
+For the complete App Server library suite, first build the existing MCP fixture
+with `cargo build -p codex-rmcp-client --bin test_stdio_server` in the same
+profile/target directory. A library-only invocation does not build that dependency
+binary; its absence is a test setup failure, not a native startup incident.
+
+Read retained outcomes before retrying a failed operation. Inspect rollout tails
+with bounded seek/read windows or stream selected records; never use whole-file
+read_text/read_bytes/splitlines to inspect a long-lived session. A bounded-tail
+miss is not proof that a terminal record does not exist. Keep diagnostics below
+available host memory and preserve original evidence.
+
+Parent plan: https://github.com/AlterMundi/telecodex/issues/301 (milestone9).
+Continuous-voice delivery resumes after this availability repair; staged latency
+optimizations are separate and must not override it.
+
+
+## Combined release qualification
+
+The maintenance branch now includes release/interaction-0.163 through PR8
+(36995731), retaining resolved idle-resume reuse and foreground TUI notices.
+Their separate earlier passing runs do not qualify this combined executable.
+The native-maintenance workflow now runs their resolved-configuration and notice
+regressions, plus goal accounting/conditional controls, alongside the existing
+admission, managed-recovery and strict-snapshot checks on one source tree.
+Only the artifact from a passing combined run is eligible to replace the older
+maintenance-only prepared candidate. Existing preparation/rollback remains
+unchanged until that qualification succeeds; this source integration is not
+receiving installation or a permission to interrupt live threads.

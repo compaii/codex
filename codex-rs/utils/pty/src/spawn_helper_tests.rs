@@ -117,7 +117,7 @@ fn initialize_spawn_helper() {
 }
 
 /// Pin a process identity so exit observation and cleanup cannot follow PID reuse.
-fn open_pidfd(pid: libc::pid_t) -> io::Result<OwnedFd> {
+pub(crate) fn open_pidfd(pid: libc::pid_t) -> io::Result<OwnedFd> {
     // SAFETY: pidfd_open takes a PID and flags, and returns a new owned descriptor.
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
     if fd == -1 {
@@ -125,6 +125,214 @@ fn open_pidfd(pid: libc::pid_t) -> io::Result<OwnedFd> {
     }
     // SAFETY: The successful syscall returned a fresh descriptor owned by this call.
     Ok(unsafe { OwnedFd::from_raw_fd(fd as _) })
+}
+
+fn admitted_fixture(marker: &Path) -> crate::Command {
+    let mut command = crate::Command::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            "printf '%s' \"$ADMITTED_VALUE\" > \"$1\"; printf admitted",
+            "fixture",
+        ])
+        .arg(marker)
+        .env("ADMITTED_VALUE", "target-only")
+        .current_dir("/")
+        .process_mode(crate::ProcessMode::NewSession)
+        .descriptor_policy(crate::DescriptorPolicy::Explicit);
+    command
+}
+
+#[tokio::test]
+async fn admitted_helper_gates_target_and_environment() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let marker = temp.path().join("executed");
+    let marker_ref = &marker;
+    let child = admitted_fixture(&marker)
+        .spawn_with_admission(|pid| async move {
+            assert!(!marker_ref.exists());
+            assert!(std::fs::read(format!("/proc/{pid}/environ"))?.is_empty());
+            assert_eq!(
+                std::fs::read_link(format!("/proc/{pid}/exe"))?,
+                std::fs::read_link("/proc/self/exe")?
+            );
+            Ok(())
+        })
+        .await?;
+    let output = child.wait_with_output().await?;
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"admitted");
+    assert_eq!(std::fs::read(&marker)?, b"target-only");
+    Ok(())
+}
+
+#[tokio::test]
+async fn admitted_helper_refusal_never_runs_target() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let marker = temp.path().join("executed");
+    let mut helper = None;
+    let result = admitted_fixture(&marker)
+        .spawn_with_admission(|pid| {
+            helper = Some(open_pidfd(pid as _));
+            std::future::ready(Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "fixture resource admission refused",
+            )))
+        })
+        .await;
+    let error = result.err().expect("admission refusal must fail launch");
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    let helper = tokio::io::unix::AsyncFd::new(helper.expect("helper was admitted")?)?;
+    let _ready = tokio::time::timeout(Duration::from_secs(5), helper.readable()).await??;
+    assert!(!marker.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn admitted_helper_cancellation_kills_incomplete_launch() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let marker = temp.path().join("executed");
+    let command = admitted_fixture(&marker);
+    let (sent, received) = tokio::sync::oneshot::channel();
+    let launch = tokio::spawn(async move {
+        command
+            .spawn_with_admission(|pid| async move {
+                let _ = sent.send(open_pidfd(pid as _));
+                std::future::pending::<io::Result<()>>().await
+            })
+            .await
+    });
+    let helper = tokio::io::unix::AsyncFd::new(
+        tokio::time::timeout(Duration::from_secs(5), received).await???,
+    )?;
+    assert!(!marker.exists());
+    launch.abort();
+    assert!(
+        launch
+            .await
+            .err()
+            .expect("launch was cancelled")
+            .is_cancelled()
+    );
+    let _ready = tokio::time::timeout(Duration::from_secs(5), helper.readable()).await??;
+    assert!(!marker.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn admitted_helper_bootstrap_failure_has_no_fallback() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let marker = temp.path().join("executed");
+    let mut command = admitted_fixture(&marker);
+    command.arg("--codex-test-fail-helper-bootstrap");
+    let result = command
+        .spawn_with_admission(|_| std::future::ready(Ok(())))
+        .await;
+    assert!(result.is_err());
+    assert!(!marker.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn admitted_helper_preserves_target_kill_on_drop() -> anyhow::Result<()> {
+    use tokio::io::AsyncBufReadExt;
+    let mut command = crate::Command::new("/bin/sh");
+    command
+        .args(["-c", "printf 'ready\\n'; read line"])
+        .process_mode(crate::ProcessMode::NewSession)
+        .descriptor_policy(crate::DescriptorPolicy::Explicit);
+    let mut child = command
+        .spawn_with_admission(|_| std::future::ready(Ok(())))
+        .await?;
+    let mut output = tokio::io::BufReader::new(child.stdout.take().expect("child stdout")).lines();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), output.next_line())
+            .await??
+            .as_deref(),
+        Some("ready")
+    );
+    // Keep stdin open independently: EOF must not disguise a missing kill.
+    let stdin = child.stdin.take().expect("child stdin");
+    let pid = tokio::io::unix::AsyncFd::new(open_pidfd(child.id().expect("owned child") as _)?)?;
+    drop(child);
+    let exited = matches!(
+        tokio::time::timeout(Duration::from_secs(1), pid.readable()).await,
+        Ok(Ok(_))
+    );
+    drop(stdin);
+    let _ready = tokio::time::timeout(Duration::from_secs(5), pid.readable()).await??;
+    assert!(
+        exited,
+        "admitted child ignored its target kill-on-drop policy"
+    );
+    Ok(())
+}
+
+/// Run only with a fresh, owned delegated user service supplied by the operator.
+/// The holder owns resource limits, expiry and cleanup; no service is created here.
+#[tokio::test]
+#[ignore = "requires an explicitly selected finite resource fixture"]
+async fn admitted_helper_joins_owned_resource_group() -> anyhow::Result<()> {
+    let unit = std::env::var("CODEX_TEST_RESOURCE_UNIT")?;
+    let suffix = unit
+        .strip_prefix("matrix-work-")
+        .and_then(|name| name.strip_suffix(".service"))
+        .ok_or_else(|| io::Error::other("not an owned fixture unit"))?;
+    assert!(suffix.len() == 32 && suffix.bytes().all(|b| b.is_ascii_hexdigit()));
+    let parent = std::fs::read_to_string("/proc/self/cgroup")?;
+    let group = tokio::process::Command::new("systemctl")
+        .args(["--user", "show", &unit, "-p", "ControlGroup", "--value"])
+        .output()
+        .await?;
+    assert!(group.status.success());
+    let group = String::from_utf8(group.stdout)?.trim().to_owned();
+    assert!(group.ends_with(&unit));
+    let expected = format!("0::{group}\n");
+    let mut command = crate::Command::new("/bin/sh");
+    command
+        .args([
+            "-c",
+            "/bin/cat /proc/self/cgroup; /bin/sh -c '/bin/cat /proc/self/cgroup'",
+        ])
+        .process_mode(crate::ProcessMode::NewSession)
+        .descriptor_policy(crate::DescriptorPolicy::Explicit);
+    let expected_ref = &expected;
+    let unit_ref = &unit;
+    let child = command
+        .spawn_with_admission(|pid| async move {
+            let attached = tokio::process::Command::new("busctl")
+                .args([
+                    "--user",
+                    "call",
+                    "org.freedesktop.systemd1",
+                    "/org/freedesktop/systemd1",
+                    "org.freedesktop.systemd1.Manager",
+                    "AttachProcessesToUnit",
+                    "ssau",
+                    unit_ref,
+                    "",
+                    "1",
+                    &pid.to_string(),
+                ])
+                .output()
+                .await?;
+            assert!(
+                attached.status.success(),
+                "{}",
+                String::from_utf8_lossy(&attached.stderr)
+            );
+            assert_eq!(
+                std::fs::read_to_string(format!("/proc/{pid}/cgroup"))?,
+                *expected_ref
+            );
+            Ok(())
+        })
+        .await?;
+    let output = child.wait_with_output().await?;
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stdout)?, expected.repeat(2));
+    assert_eq!(std::fs::read_to_string("/proc/self/cgroup")?, parent);
+    Ok(())
 }
 
 #[tokio::test]
@@ -619,7 +827,7 @@ fn helper_dispatch_before_rust_initializes_argv() -> anyhow::Result<()> {
     let output = std::process::Command::new(std::env::current_exe()?)
         .args([
             "--exact",
-            "spawn_helper_tests::helper_preserves_cwd_env_arg0_and_streams",
+            "tests::spawn_helper_tests::helper_preserves_cwd_env_arg0_and_streams",
             "--nocapture",
         ])
         .env("CODEX_TEST_EARLY_HELPER_ARGV", "1")
@@ -659,7 +867,7 @@ async fn helper_control_socket_survives_closed_stdio() -> anyhow::Result<()> {
         let output = std::process::Command::new(std::env::current_exe()?)
             .args([
                 "--exact",
-                "spawn_helper_tests::helper_control_socket_survives_closed_stdio",
+                "tests::spawn_helper_tests::helper_control_socket_survives_closed_stdio",
                 "--nocapture",
             ])
             .env("CODEX_TEST_HELPER_CLOSED_STDIO", "1")
@@ -709,7 +917,7 @@ async fn helper_descriptor_pressure_falls_back_to_direct_spawn() -> anyhow::Resu
         let output = std::process::Command::new(std::env::current_exe()?)
             .args([
                 "--exact",
-                "spawn_helper_tests::helper_descriptor_pressure_falls_back_to_direct_spawn",
+                "tests::spawn_helper_tests::helper_descriptor_pressure_falls_back_to_direct_spawn",
                 "--nocapture",
             ])
             .env("CODEX_TEST_HELPER_FD_PRESSURE", "1")
@@ -782,7 +990,7 @@ async fn parent_loader_environment_does_not_disable_helper_dispatch() -> anyhow:
         let output = std::process::Command::new(std::env::current_exe()?)
             .args([
                 "--exact",
-                "spawn_helper_tests::parent_loader_environment_does_not_disable_helper_dispatch",
+                "tests::spawn_helper_tests::parent_loader_environment_does_not_disable_helper_dispatch",
                 "--nocapture",
             ])
             .env("CODEX_TEST_PARENT_LOADER_ENV", "1")

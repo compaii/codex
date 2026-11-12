@@ -403,6 +403,102 @@
             },
             "method": {
               "enum": [
+                "thread/goal/snapshot"
+              ],
+              "title": "Thread/goal/snapshotRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadGoalSnapshotParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/goal/snapshotRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "thread/goal/conditionalActivate"
+              ],
+              "title": "Thread/goal/conditionalActivateRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadGoalConditionalActivateParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/goal/conditionalActivateRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "thread/goal/conditionalSet"
+              ],
+              "title": "Thread/goal/conditionalSetRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadGoalConditionalSetParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/goal/conditionalSetRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "thread/goal/conditionalClear"
+              ],
+              "title": "Thread/goal/conditionalClearRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadGoalConditionalClearParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Thread/goal/conditionalClearRequest",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
                 "thread/goal/set"
               ],
               "title": "Thread/goal/setRequestMethod",
@@ -1742,6 +1838,56 @@
           "type": "object"
         },
         {
+          "description": "Start a new turn only while idle; never steer or enqueue into another writer.",
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "turn/startIfIdle"
+              ],
+              "title": "Turn/startIfIdleRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/TurnStartParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Turn/startIfIdleRequest",
+          "type": "object"
+        },
+        {
+          "description": "Idle-only admission with mandatory physical-execution limits.",
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "turn/startBoundedIfIdle"
+              ],
+              "title": "Turn/startBoundedIfIdleRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/TurnStartBoundedIfIdleParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Turn/startBoundedIfIdleRequest",
+          "type": "object"
+        },
+        {
           "properties": {
             "id": {
               "$ref": "#/definitions/v2/RequestId"
@@ -2395,6 +2541,30 @@
           "type": "object"
         },
         {
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "feedback/save"
+              ],
+              "title": "Feedback/saveRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/FeedbackSaveParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Feedback/saveRequest",
+          "type": "object"
+        },
+        {
           "description": "Execute a standalone command (argv vector) under the server's sandbox.",
           "properties": {
             "id": {
@@ -2816,11 +2986,22 @@
     },
     "CommandExecutionApprovalKind": {
       "description": "Distinguishes a command approval from input sent to an existing terminal.",
-      "enum": [
-        "command",
-        "writeStdin"
-      ],
-      "type": "string"
+      "oneOf": [
+        {
+          "enum": [
+            "command",
+            "writeStdin"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A managed checkpoint requiring a fresh human decision. Only `accept`, `decline`, and `cancel` are valid. Requires the `requiredHumanApproval` initialize capability. This prompt does not itself start a command execution item.",
+          "enum": [
+            "humanCommand"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "CommandExecutionRequestApprovalParams": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -3413,6 +3594,10 @@
           "default": false,
           "description": "Opt into `attestation/generate` requests for upstream `x-oai-attestation`.",
           "type": "boolean"
+        },
+        "requiredHumanApproval": {
+          "description": "Present `humanCommand` approvals to a person and return only a one-time decision. Requires `experimentalApi`. Pending requests can be replayed to compatible clients.",
+          "type": "boolean"
         }
       },
       "type": "object"
@@ -3443,6 +3628,10 @@
     "InitializeResponse": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
+        "boundedIdleTurn": {
+          "description": "This server implements the finite, idle-only turn admission primitive. This advertises support only, never permission, funding, availability of a particular thread/provider or evidence that a turn was submitted. Older servers omit it; clients must treat omission as unsupported.",
+          "type": "boolean"
+        },
         "codexHome": {
           "allOf": [
             {
@@ -4496,6 +4685,151 @@
       "title": "PermissionsRequestApprovalResponse",
       "type": "object"
     },
+    "ProviderAttemptReservationParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "description": "Host accounting request, never a model tool or human approval ceremony.",
+      "properties": {
+        "attemptId": {
+          "type": "string"
+        },
+        "cycleId": {
+          "type": "string"
+        },
+        "deadlineUnixMs": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "maxRequestBytes": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "ordinal": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "attemptId",
+        "cycleId",
+        "deadlineUnixMs",
+        "maxRequestBytes",
+        "ordinal",
+        "threadId"
+      ],
+      "title": "ProviderAttemptReservationParams",
+      "type": "object"
+    },
+    "ProviderAttemptReservationResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "description": "Authorizes only the exact retained journal operation. A lost response must retain exposure; repeating this request must never mint a replacement call.",
+      "properties": {
+        "attemptId": {
+          "type": "string"
+        },
+        "authorized": {
+          "type": "boolean"
+        },
+        "cycleId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "attemptId",
+        "authorized",
+        "cycleId"
+      ],
+      "title": "ProviderAttemptReservationResponse",
+      "type": "object"
+    },
+    "ProviderAttemptUsageParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "description": "Exact physical response evidence, not a financial settlement or grant.",
+      "properties": {
+        "attemptId": {
+          "type": "string"
+        },
+        "cycleId": {
+          "type": "string"
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ordinal": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "responseId": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "tokenUsage": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/v2/TokenUsageBreakdown"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "usageMetadata": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/v2/ResponseUsageMetadata"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "attemptId",
+        "cycleId",
+        "ordinal",
+        "responseId",
+        "threadId"
+      ],
+      "title": "ProviderAttemptUsageParams",
+      "type": "object"
+    },
+    "ProviderAttemptUsageResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "description": "True acknowledges retained evidence only. A missing/false acknowledgment never proves absence or authorizes releasing conservative exposure.",
+      "properties": {
+        "attemptId": {
+          "type": "string"
+        },
+        "cycleId": {
+          "type": "string"
+        },
+        "recorded": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "attemptId",
+        "cycleId",
+        "recorded"
+      ],
+      "title": "ProviderAttemptUsageResponse",
+      "type": "object"
+    },
     "RequestId": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "anyOf": [
@@ -4841,6 +5175,26 @@
             "params"
           ],
           "title": "Thread/name/updatedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
+                "thread/section/changed"
+              ],
+              "title": "Thread/section/changedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/v2/ThreadSectionChangedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Thread/section/changedNotification",
           "type": "object"
         },
         {
@@ -6345,6 +6699,56 @@
       "description": "Request initiated from the server and sent to the client.",
       "oneOf": [
         {
+          "description": "Account reservation for a bounded native physical attempt. Only the initiating owner connection may answer; never replay to subscribers.",
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "turn/providerAttempt/reserve"
+              ],
+              "title": "Turn/providerAttempt/reserveRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/ProviderAttemptReservationParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Turn/providerAttempt/reserveRequest",
+          "type": "object"
+        },
+        {
+          "description": "Exact usage observation for the initiating accounting owner only.",
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/v2/RequestId"
+            },
+            "method": {
+              "enum": [
+                "turn/providerAttempt/usage"
+              ],
+              "title": "Turn/providerAttempt/usageRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/ProviderAttemptUsageParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Turn/providerAttempt/usageRequest",
+          "type": "object"
+        },
+        {
           "description": "NEW APIs Sent when approval is requested for a specific command execution. This request is used for Turns started via turn/start.",
           "properties": {
             "id": {
@@ -6781,6 +7185,13 @@
                 ],
                 "title": "ChatgptAccountType",
                 "type": "string"
+              },
+              "workspaceName": {
+                "description": "Display name of the selected ChatGPT workspace, when available.",
+                "type": [
+                  "string",
+                  "null"
+                ]
               }
             },
             "required": [
@@ -6809,6 +7220,23 @@
               "type"
             ],
             "title": "AmazonBedrockAccount",
+            "type": "object"
+          },
+          {
+            "description": "Google Cloud Vertex AI with externally managed credentials.",
+            "properties": {
+              "type": {
+                "enum": [
+                  "gcp"
+                ],
+                "title": "GcpAccountType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "title": "GcpAccount",
             "type": "object"
           }
         ]
@@ -6868,6 +7296,103 @@
           "NO_CONSTRAINT",
           "us",
           "us_cr"
+        ],
+        "type": "string"
+      },
+      "AccountSession": {
+        "properties": {
+          "displayName": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "imageUrl": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "isActive": {
+            "type": "boolean"
+          },
+          "lastUsedAt": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "selectedWorkspaceAccountId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sessionId": {
+            "type": "string"
+          },
+          "userId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "workspaces": {
+            "items": {
+              "$ref": "#/definitions/v2/AccountSessionWorkspace"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "isActive",
+          "lastUsedAt",
+          "sessionId",
+          "workspaces"
+        ],
+        "type": "object"
+      },
+      "AccountSessionWorkspace": {
+        "properties": {
+          "accountId": {
+            "type": "string"
+          },
+          "imageUrl": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/AccountSessionWorkspaceKind"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "accountId"
+        ],
+        "type": "object"
+      },
+      "AccountSessionWorkspaceKind": {
+        "enum": [
+          "personal",
+          "workspace"
         ],
         "type": "string"
       },
@@ -6992,6 +7517,13 @@
         "properties": {
           "kind": {
             "$ref": "#/definitions/v2/AdditionalContextKind"
+          },
+          "name": {
+            "description": "Optional name for untrusted context, used to label its tool output.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "value": {
             "type": "string"
@@ -7756,6 +8288,42 @@
                 "type": "null"
               }
             ]
+          },
+          "storage": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ApplicationStorageRequirements"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ApplicationStorageRequirements": {
+        "description": "Managed storage settings for new Desktop workspaces, not filesystem access restrictions.",
+        "properties": {
+          "defaultProjectParent": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/LegacyAppPathString"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "projectlessWorkspaceRoot": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/LegacyAppPathString"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "type": "object"
@@ -8175,6 +8743,48 @@
         },
         "type": "object"
       },
+      "BoundedTurnHostRestrictions": {
+        "additionalProperties": false,
+        "description": "A complete narrowing selection for one bounded idle start. Existing named permissions are resolved by the server; raw permission profiles are not input.",
+        "properties": {
+          "codeModeLimits": {
+            "$ref": "#/definitions/v2/TurnCodeModeLimits"
+          },
+          "environment": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Explicit environment only: the server disables inheritance and profiles.",
+            "type": "object"
+          },
+          "permissions": {
+            "type": "string"
+          },
+          "processLimits": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/TurnProcessLimits"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "tools": {
+            "items": {
+              "$ref": "#/definitions/v2/ToolName"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "codeModeLimits",
+          "environment",
+          "permissions",
+          "tools"
+        ],
+        "type": "object"
+      },
       "BrowserUseAccessApprovalLifetime": {
         "enum": [
           "turn",
@@ -8502,6 +9112,8 @@
               "rateLimitExceeded",
               "flexUnavailable",
               "serverOverloaded",
+              "modelNotFound",
+              "policyCapacityUnavailable",
               "cyberPolicy",
               "misalignmentPolicyViolation",
               "tooManyDenials",
@@ -10216,6 +10828,16 @@
               }
             ]
           },
+          "otel": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/OtelRequirements"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "sqliteHome": {
             "type": [
               "string",
@@ -10725,10 +11347,34 @@
             "type": "object"
           },
           {
-            "properties": {
-              "audio_url": {
-                "type": "string"
+            "anyOf": [
+              {
+                "properties": {
+                  "audio_url": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "audio_url"
+                ],
+                "title": "AudioUrlContentItem",
+                "type": "object"
               },
+              {
+                "properties": {
+                  "file_id": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "file_id"
+                ],
+                "title": "FileIdContentItem",
+                "type": "object"
+              }
+            ],
+            "description": "Inline audio data or an uploaded file loaded by the Responses API.",
+            "properties": {
               "type": {
                 "enum": [
                   "input_audio"
@@ -10738,7 +11384,6 @@
               }
             },
             "required": [
-              "audio_url",
               "type"
             ],
             "title": "InputAudioContentItem",
@@ -11805,6 +12450,85 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "FeedbackSaveParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "classification": {
+            "type": "string"
+          },
+          "extraLogFiles": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "includeLogs": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "savePath": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/LegacyAppPathString"
+              }
+            ],
+            "description": "Absolute, previously unused ZIP path on the app-server host. The caller owns this file, including after a disconnected RPC."
+          },
+          "tags": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "threadId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "classification",
+          "savePath"
+        ],
+        "title": "FeedbackSaveParams",
+        "type": "object"
+      },
+      "FeedbackSaveResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "promptHash": {
+            "description": "Same prompt hash as feedback/upload; null when prompt metadata is absent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "savedPath": {
+            "$ref": "#/definitions/v2/LegacyAppPathString"
+          },
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "savedPath",
+          "threadId"
+        ],
+        "title": "FeedbackSaveResponse",
         "type": "object"
       },
       "FeedbackUploadParams": {
@@ -13325,6 +14049,8 @@
       },
       "HookEventName": {
         "enum": [
+          "preModelRequest",
+          "postModelRequest",
           "preToolUse",
           "permissionRequest",
           "postToolUse",
@@ -13452,6 +14178,13 @@
           },
           "enabled": {
             "type": "boolean"
+          },
+          "environmentId": {
+            "description": "The owning execution environment, if this hook came from its requirements.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "eventName": {
             "$ref": "#/definitions/v2/HookEventName"
@@ -13620,7 +14353,7 @@
             "default": "unknown"
           },
           "sourcePath": {
-            "$ref": "#/definitions/v2/AbsolutePathBuf"
+            "$ref": "#/definitions/v2/LegacyAppPathString"
           },
           "startedAt": {
             "format": "int64",
@@ -13741,11 +14474,18 @@
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "cwds": {
-            "description": "When empty, defaults to the current session working directory.",
+            "description": "Working directories to inspect when no thread is specified. An empty list uses the session cwd.",
             "items": {
               "type": "string"
             },
             "type": "array"
+          },
+          "threadId": {
+            "description": "List a loaded thread's hooks, including its selected environments. Omit `cwds` in this mode.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "title": "HooksListParams",
@@ -13806,6 +14546,23 @@
             "type": "object"
           }
         ]
+      },
+      "ImageGenerationInputImage": {
+        "description": "A local image file successfully read for this exact image-generation request.",
+        "properties": {
+          "path": {
+            "$ref": "#/definitions/v2/AbsolutePathBuf"
+          },
+          "sha256": {
+            "description": "Lowercase SHA-256 of the file bytes read before image normalization.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "sha256"
+        ],
+        "type": "object"
       },
       "InAppBrowserRequirements": {
         "properties": {
@@ -14485,6 +15242,13 @@
             },
             "type": "array"
           },
+          "PostModelRequest": {
+            "default": [],
+            "items": {
+              "$ref": "#/definitions/v2/ConfiguredHookMatcherGroup"
+            },
+            "type": "array"
+          },
           "PostToolUse": {
             "items": {
               "$ref": "#/definitions/v2/ConfiguredHookMatcherGroup"
@@ -14492,6 +15256,13 @@
             "type": "array"
           },
           "PreCompact": {
+            "items": {
+              "$ref": "#/definitions/v2/ConfiguredHookMatcherGroup"
+            },
+            "type": "array"
+          },
+          "PreModelRequest": {
+            "default": [],
             "items": {
               "$ref": "#/definitions/v2/ConfiguredHookMatcherGroup"
             },
@@ -15140,6 +15911,9 @@
               }
             ]
           },
+          "toolListMeta": {
+            "description": "Opaque `_meta` from the first page of the corresponding MCP tool catalog. Null when unavailable."
+          },
           "tools": {
             "additionalProperties": {
               "$ref": "#/definitions/v2/Tool"
@@ -15782,6 +16556,81 @@
         "title": "ModelProviderCapabilitiesReadResponse",
         "type": "object"
       },
+      "ModelProviderError": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Structured JSON-RPC error data. Unknown errors must retain the client's normal fallback.",
+        "oneOf": [
+          {
+            "properties": {
+              "currentModelProvider": {
+                "type": "string"
+              },
+              "modelProvider": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "modelProviderMismatch"
+                ],
+                "title": "ModelProviderMismatchv2::ModelProviderErrorType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "currentModelProvider",
+              "modelProvider",
+              "type"
+            ],
+            "title": "ModelProviderMismatchv2::ModelProviderError",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "modelProvider": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "modelProviderNotConfigured"
+                ],
+                "title": "ModelProviderNotConfiguredv2::ModelProviderErrorType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "modelProvider",
+              "type"
+            ],
+            "title": "ModelProviderNotConfiguredv2::ModelProviderError",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "modelProvider": {
+                "type": "string"
+              },
+              "requiredModelProvider": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "modelProviderPolicyConflict"
+                ],
+                "title": "ModelProviderPolicyConflictv2::ModelProviderErrorType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "modelProvider",
+              "requiredModelProvider",
+              "type"
+            ],
+            "title": "ModelProviderPolicyConflictv2::ModelProviderError",
+            "type": "object"
+          }
+        ],
+        "title": "ModelProviderError"
+      },
       "ModelRerouteReason": {
         "enum": [
           "highRiskCyberActivity"
@@ -16080,7 +16929,7 @@
             "additionalProperties": {
               "$ref": "#/definitions/v2/NetworkDomainPermission"
             },
-            "description": "Canonical network permission map for `experimental_network`.",
+            "description": "Canonical managed network permission map.",
             "type": [
               "object",
               "null"
@@ -16107,6 +16956,16 @@
               "null"
             ]
           },
+          "reviewDomains": {
+            "description": "Host patterns routed to network approval before ordinary allow rules.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "socksPort": {
             "format": "uint16",
             "minimum": 0.0,
@@ -16119,7 +16978,7 @@
             "additionalProperties": {
               "$ref": "#/definitions/v2/NetworkUnixSocketPermission"
             },
-            "description": "Canonical unix socket permission map for `experimental_network`.",
+            "description": "Canonical managed unix socket permission map.",
             "type": [
               "object",
               "null"
@@ -16192,6 +17051,238 @@
           }
         ],
         "title": "Nullable_GetAccountTokenUsageParams"
+      },
+      "OtelExporter": {
+        "oneOf": [
+          {
+            "enum": [
+              "none",
+              "statsig"
+            ],
+            "type": "string"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "otlp-http": {
+                "properties": {
+                  "endpoint": {
+                    "type": "string"
+                  },
+                  "headers": {
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "description": "Header names are retained; values are redacted by the server.",
+                    "type": "object"
+                  },
+                  "protocol": {
+                    "$ref": "#/definitions/v2/OtelHttpProtocol"
+                  },
+                  "tls": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/definitions/v2/OtelTlsConfig"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "endpoint",
+                  "headers",
+                  "protocol"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "otlp-http"
+            ],
+            "title": "OtlpHttpOtelExporter",
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "otlp-grpc": {
+                "properties": {
+                  "endpoint": {
+                    "type": "string"
+                  },
+                  "headers": {
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "description": "Header names are retained; values are redacted by the server.",
+                    "type": "object"
+                  },
+                  "tls": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/definitions/v2/OtelTlsConfig"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "endpoint",
+                  "headers"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "otlp-grpc"
+            ],
+            "title": "OtlpGrpcOtelExporter",
+            "type": "object"
+          }
+        ]
+      },
+      "OtelHttpProtocol": {
+        "enum": [
+          "binary",
+          "json"
+        ],
+        "type": "string"
+      },
+      "OtelRequirements": {
+        "properties": {
+          "environment": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "exporter": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/OtelExporter"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "log_agent_responses": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "log_guardian_assessments": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "log_sse_deltas": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "log_user_prompt": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "metrics_exporter": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/OtelExporter"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "span_attributes": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "tool_result": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/OtelToolResultLogConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "trace_exporter": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/OtelExporter"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "tracestate": {
+            "additionalProperties": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "OtelTlsConfig": {
+        "properties": {
+          "ca-certificate": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "client-certificate": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "client-private-key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "OtelToolResultLogConfig": {
+        "properties": {
+          "max_bytes": {
+            "format": "uint",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "max_bytes"
+        ],
+        "type": "object"
       },
       "OverriddenMetadata": {
         "properties": {
@@ -16411,6 +17502,8 @@
           "edu",
           "edu_plus",
           "edu_pro",
+          "sci",
+          "sci_plus",
           "unknown"
         ],
         "type": "string"
@@ -17785,6 +18878,13 @@
             "description": "Process exit code.",
             "format": "int32",
             "type": "integer"
+          },
+          "outputDrainTimedOut": {
+            "description": "Whether output collection hit its post-exit deadline before seeing EOF or reaching the requested byte cap on either stream. Older servers omit this field.",
+            "type": [
+              "boolean",
+              "null"
+            ]
           },
           "processHandle": {
             "description": "Client-supplied, connection-scoped `processHandle` from `process/spawn`.",
@@ -19763,8 +20863,7 @@
       },
       "ReviewDelivery": {
         "enum": [
-          "inline",
-          "detached"
+          "inline"
         ],
         "type": "string"
       },
@@ -19781,7 +20880,7 @@
               }
             ],
             "default": null,
-            "description": "Where to run the review: inline (default) on the current thread or detached on a new thread (returned in `reviewThreadId`). Detached delivery is deprecated and emits `deprecationNotice`. Use `thread/start` followed by an inline review for a separate review thread."
+            "description": "Reviews run inline on the supplied thread. Omit this field or pass `inline`. To review on a separate thread, start a thread first and use its id."
           },
           "target": {
             "$ref": "#/definitions/v2/ReviewTarget"
@@ -19801,7 +20900,7 @@
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
           "reviewThreadId": {
-            "description": "Identifies the thread where the review runs.\n\nFor inline reviews, this is the original thread id. For detached reviews, this is the id of the new review thread.",
+            "description": "The thread id supplied to `review/start`.",
             "type": "string"
           },
           "turn": {
@@ -21880,6 +22979,83 @@
         ],
         "type": "object"
       },
+      "ThreadGoalActivationDisposition": {
+        "description": "Admission is not evidence of incorporation, goal completion or hearing.",
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "uncertain"
+                ],
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "started"
+                ],
+                "type": "string"
+              },
+              "turn_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "turn_id"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "steered"
+                ],
+                "type": "string"
+              },
+              "turn_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "turn_id"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "notStarted"
+                ],
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "ThreadGoalClearParams": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "properties": {
@@ -21928,6 +23104,185 @@
           "threadId"
         ],
         "title": "ThreadGoalClearedNotification",
+        "type": "object"
+      },
+      "ThreadGoalConditionalActivateParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "additionalContext": {
+            "additionalProperties": {
+              "$ref": "#/definitions/v2/AdditionalContextEntry"
+            },
+            "type": "object"
+          },
+          "expectedRevision": {
+            "type": "string"
+          },
+          "objective": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "origin": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ThreadGoalMutationOrigin"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "threadId": {
+            "type": "string"
+          },
+          "tokenBudget": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "additionalContext",
+          "expectedRevision",
+          "threadId"
+        ],
+        "title": "ThreadGoalConditionalActivateParams",
+        "type": "object"
+      },
+      "ThreadGoalConditionalActivateResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "activation": {
+            "$ref": "#/definitions/v2/ThreadGoalActivationDisposition"
+          },
+          "goal": {
+            "$ref": "#/definitions/v2/ThreadGoal"
+          },
+          "revision": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "activation",
+          "goal",
+          "revision"
+        ],
+        "title": "ThreadGoalConditionalActivateResponse",
+        "type": "object"
+      },
+      "ThreadGoalConditionalClearParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "expectedRevision": {
+            "type": "string"
+          },
+          "origin": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ThreadGoalMutationOrigin"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "expectedRevision",
+          "threadId"
+        ],
+        "title": "ThreadGoalConditionalClearParams",
+        "type": "object"
+      },
+      "ThreadGoalConditionalClearResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "cleared": {
+            "type": "boolean"
+          },
+          "revision": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "cleared",
+          "revision"
+        ],
+        "title": "ThreadGoalConditionalClearResponse",
+        "type": "object"
+      },
+      "ThreadGoalConditionalSetParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "expectedRevision": {
+            "type": "string"
+          },
+          "objective": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "origin": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ThreadGoalMutationOrigin"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ThreadGoalStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "threadId": {
+            "type": "string"
+          },
+          "tokenBudget": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "expectedRevision",
+          "threadId"
+        ],
+        "title": "ThreadGoalConditionalSetParams",
+        "type": "object"
+      },
+      "ThreadGoalConditionalSetResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "goal": {
+            "$ref": "#/definitions/v2/ThreadGoal"
+          },
+          "revision": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "goal",
+          "revision"
+        ],
+        "title": "ThreadGoalConditionalSetResponse",
         "type": "object"
       },
       "ThreadGoalGetParams": {
@@ -22028,6 +23383,43 @@
         "title": "ThreadGoalSetResponse",
         "type": "object"
       },
+      "ThreadGoalSnapshotParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "threadId"
+        ],
+        "title": "ThreadGoalSnapshotParams",
+        "type": "object"
+      },
+      "ThreadGoalSnapshotResponse": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "A consistent goal/definition snapshot. Revision survives clear/recreate and excludes ordinary usage accounting; it is not an authorization credential.",
+        "properties": {
+          "goal": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/ThreadGoal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "revision": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "revision"
+        ],
+        "title": "ThreadGoalSnapshotResponse",
+        "type": "object"
+      },
       "ThreadGoalStatus": {
         "enum": [
           "active",
@@ -22097,6 +23489,7 @@
         "type": "object"
       },
       "ThreadItem": {
+        "description": "A thread item and its recorded lifecycle times. The payload stays flat on the wire.",
         "oneOf": [
           {
             "properties": {
@@ -22840,6 +24233,33 @@
             "type": "object"
           },
           {
+            "anyOf": [
+              {
+                "properties": {
+                  "fileId": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "fileId"
+                ],
+                "title": "FileIdThreadItem",
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "result": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "result"
+                ],
+                "title": "ResultThreadItem",
+                "type": "object"
+              }
+            ],
+            "description": "Either inline generated-image data or its durable attachment-store identity.\n\n`File` must remain first so rollouts written during the migration, which contain both an empty `result` and a `fileId`, retain the file reference when deserialized.",
             "properties": {
               "failure": {
                 "anyOf": [
@@ -22852,11 +24272,23 @@
                 ],
                 "default": null
               },
+              "generationId": {
+                "default": null,
+                "description": "Image generation identifier for the generated image, when provided by the image backend.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "id": {
                 "type": "string"
               },
-              "result": {
-                "type": "string"
+              "inputImages": {
+                "description": "Observed local inputs for a completed generation, absent on older items.",
+                "items": {
+                  "$ref": "#/definitions/v2/ImageGenerationInputImage"
+                },
+                "type": "array"
               },
               "revisedPrompt": {
                 "type": [
@@ -22894,7 +24326,6 @@
             },
             "required": [
               "id",
-              "result",
               "status",
               "type"
             ],
@@ -22969,7 +24400,28 @@
             "title": "ContextCompactionThreadItem",
             "type": "object"
           }
-        ]
+        ],
+        "properties": {
+          "completedAtMs": {
+            "default": null,
+            "description": "Unix timestamp in milliseconds when the item completed, if recorded.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "startedAtMs": {
+            "default": null,
+            "description": "Unix timestamp in milliseconds when the item started, if recorded.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
       },
       "ThreadItemEntry": {
         "properties": {
@@ -24516,6 +25968,28 @@
         },
         "type": "object"
       },
+      "ThreadSectionChangedNotification": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Broadcast after a successful move into, within, or out of a section.",
+        "properties": {
+          "sectionId": {
+            "description": "Destination section, or `null` when the thread was removed from its section.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "threadId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sectionId",
+          "threadId"
+        ],
+        "title": "ThreadSectionChangedNotification",
+        "type": "object"
+      },
       "ThreadSectionCreateParams": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "description": "Parameters for creating an independently persisted thread section.",
@@ -25621,6 +27095,14 @@
             },
             "type": "array"
           },
+          "nativeUsageUsdMicros": {
+            "description": "Native dollar usage, independent of credit estimates. None means unknown, not zero.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "threadId": {
             "type": "string"
           }
@@ -25796,6 +27278,24 @@
           }
         ]
       },
+      "ToolName": {
+        "description": "Identifies a callable tool, preserving the namespace split when the model provides one.",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "namespace": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
       "ToolsV2": {
         "properties": {
           "web_search": {
@@ -25883,6 +27383,27 @@
           "id",
           "items",
           "status"
+        ],
+        "type": "object"
+      },
+      "TurnCodeModeLimits": {
+        "additionalProperties": false,
+        "description": "Explicit per-execution Code Mode limits, captured without changing thread data.",
+        "properties": {
+          "maxHeapSizeBytes": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "maxYieldTimeMs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "maxHeapSizeBytes",
+          "maxYieldTimeMs"
         ],
         "type": "object"
       },
@@ -25987,6 +27508,32 @@
         },
         "required": [
           "message"
+        ],
+        "type": "object"
+      },
+      "TurnInferenceAllowance": {
+        "additionalProperties": false,
+        "description": "A durably reserved allocation for one physical execution. This is not an account grant. Never reconstruct it to recover accepted or uncertain work.",
+        "properties": {
+          "deadlineUnixMs": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "maxProviderAttempts": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "maxRequestBytes": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "deadlineUnixMs",
+          "maxProviderAttempts",
+          "maxRequestBytes"
         ],
         "type": "object"
       },
@@ -26107,6 +27654,86 @@
           "turnId"
         ],
         "title": "TurnPlanUpdatedNotification",
+        "type": "object"
+      },
+      "TurnProcessLimits": {
+        "additionalProperties": false,
+        "description": "Aggregate host-selected Linux limits for one physical execution, never a grant.",
+        "properties": {
+          "cpuPercent": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "memoryBytes": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "tasks": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "cpuPercent",
+          "memoryBytes",
+          "tasks"
+        ],
+        "type": "object"
+      },
+      "TurnStartBoundedIfIdleParams": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "description": "Mandatory bounded idle-only admission. An older server must reject this method rather than ignore an optional field on ordinary turn/start.",
+        "properties": {
+          "allowance": {
+            "$ref": "#/definitions/v2/TurnInferenceAllowance"
+          },
+          "hostRestrictions": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/BoundedTurnHostRestrictions"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Additional execution-local ceilings, resolved by the host. Requires no persistent thread configuration change and never grants permissions."
+          },
+          "providerMaxOutputTokens": {
+            "description": "Owner-selected output ceiling, applied at HTTP/WS request construction. Requires the same reservation cycle; older closed readers reject it.",
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "providerReservationCycleId": {
+            "description": "Owner journal cycle whose exact physical attempts require a reservation response from this initiating connection. This is not a budget grant. Older bounded-start servers reject this field rather than ignore it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "providerUsageObservations": {
+            "description": "Opt in to owner-only completion observations. Older closed readers reject this field; legacy reservation-only clients omit it.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "turn": {
+            "$ref": "#/definitions/v2/TurnStartParams"
+          }
+        },
+        "required": [
+          "allowance",
+          "turn"
+        ],
+        "title": "TurnStartBoundedIfIdleParams",
         "type": "object"
       },
       "TurnStartParams": {
@@ -26522,6 +28149,32 @@
             "type": "object"
           },
           {
+            "anyOf": [
+              {
+                "properties": {
+                  "url": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "url"
+                ],
+                "title": "UrlUserInput",
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "fileId": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "fileId"
+                ],
+                "title": "FileIdUserInput",
+                "type": "object"
+              }
+            ],
             "properties": {
               "type": {
                 "enum": [
@@ -26529,14 +28182,10 @@
                 ],
                 "title": "AudioUserInputType",
                 "type": "string"
-              },
-              "url": {
-                "type": "string"
               }
             },
             "required": [
-              "type",
-              "url"
+              "type"
             ],
             "title": "AudioUserInput",
             "type": "object"

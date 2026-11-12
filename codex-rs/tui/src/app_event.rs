@@ -279,7 +279,8 @@ pub(crate) enum RecapTrigger {
 
 #[derive(Debug)]
 pub(crate) struct AgentsOverviewThreadRefresh {
-    pub(crate) threads: std::collections::HashMap<ThreadId, Option<Thread>>,
+    pub(crate) cleared_unread: Vec<ThreadId>,
+    pub(crate) threads: std::collections::HashMap<ThreadId, Option<(Thread, bool)>>,
     pub(crate) last_messages: std::collections::HashMap<ThreadId, String>,
     pub(crate) recent_seed_complete: bool,
     pub(crate) discovery: Option<crate::app::agents_overview_discovery::AgentsOverviewDiscovery>,
@@ -295,9 +296,15 @@ pub(crate) struct AgentPickerThreadRefresh {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, IntoStaticStr)]
 pub(crate) enum AppEvent {
+    ForegroundNoticesLoaded {
+        thread: codex_protocol::ThreadId,
+        request: Uuid,
+        result: Result<crate::app::foreground_notices::NoticeBatch, ()>,
+    },
     AccountEmailLoaded {
         request_id: uuid::Uuid,
         email: Option<String>,
+        workspace: Option<String>,
     },
     SecuritySetupLoaded {
         request_id: uuid::Uuid,
@@ -305,6 +312,8 @@ pub(crate) enum AppEvent {
         notice: crate::security_setup::Notice,
     },
     OpenDaemonMenu,
+    ConfirmDaemonRestart,
+    RunDaemonRestart,
     ConfirmDaemonUpdate(crate::update_action::DaemonUpdateSource),
     RunDaemonUpdate(crate::update_action::DaemonUpdateSource),
     ReviewMisalignment(Arc<crate::chatwidget::MisalignmentReview>),
@@ -313,11 +322,16 @@ pub(crate) enum AppEvent {
     /// Open the live command center for recent and locally retained root sessions.
     OpenAgentsOverview,
     ShowMoreAgentsOverview,
+    RefreshViewedThread {
+        backend_id: crate::backend_id::BackendId,
+        thread_id: ThreadId,
+        revision: String,
+    },
     /// Create an empty thread from the command center.
     NewAgentsOverviewSession {
         cwd: Option<AbsolutePathBuf>,
     },
-    /// Update the daemon-wide overview after a background thread listing finishes.
+    /// Update the agents overview after a background thread listing finishes.
     AgentsOverviewThreadsLoaded {
         request_id: Uuid,
         result: Result<AgentsOverviewThreadRefresh, String>,
@@ -396,14 +410,6 @@ pub(crate) enum AppEvent {
         thread_id: ThreadId,
         action: AgentsOverviewAction,
     },
-    /// Start the shared app-server daemon without moving the current embedded session.
-    #[cfg(any(unix, windows))]
-    StartAgentsDaemon,
-    /// Report whether starting the shared app-server daemon succeeded.
-    #[cfg(any(unix, windows))]
-    AgentsDaemonStarted {
-        result: Result<(), String>,
-    },
     /// Open the agent picker for switching active threads.
     OpenAgentPicker,
     /// Merge a completed root-scoped agent-picker refresh without blocking terminal input.
@@ -461,6 +467,13 @@ pub(crate) enum AppEvent {
         model: String,
         turn: AppCommand,
         prompt: UserMessage,
+    },
+
+    /// Fork before a blocked turn and send the selected safer follow-up.
+    ContinueSafetyRecourse {
+        thread_id: ThreadId,
+        turn_id: String,
+        prompt: String,
     },
 
     /// Deliver a synthetic history lookup response to a specific thread channel.
@@ -546,6 +559,11 @@ pub(crate) enum AppEvent {
         name: Option<String>,
     },
 
+    /// Continue a provider-locked conversation in a fresh chat using its saved history.
+    ContinueProviderChat {
+        thread_id: ThreadId,
+    },
+
     /// Create a managed checkout and start or fork a session into it.
     StartManagedWorktree {
         mode: ManagedWorktreeMode,
@@ -588,6 +606,7 @@ pub(crate) enum AppEvent {
 
     /// Result of the fresh startup thread that is attached after the input UI is live.
     StartupThreadStarted {
+        backend_id: crate::backend_id::BackendId,
         result: color_eyre::Result<AppServerStartedThread>,
     },
 
@@ -642,10 +661,13 @@ pub(crate) enum AppEvent {
     /// Resume a thread by UUID or thread name inside the running TUI session.
     ResumeSessionByIdOrName(String),
 
-    /// Archive the current active main thread and exit after it succeeds.
+    /// Attach a conversation through the registered backend that owns it.
+    ResumeBackendSession(crate::resume_picker::SessionTarget),
+
+    /// Archive the current active main thread and return to the command center.
     ArchiveCurrentThread,
 
-    /// Permanently delete the current active main thread and exit after it succeeds.
+    /// Permanently delete the current active main thread and return to the command center.
     DeleteCurrentThread,
 
     /// Fork the current session into a new thread, optionally assigning it a name.
@@ -671,6 +693,8 @@ pub(crate) enum AppEvent {
     /// escape hatch that skips shutdown and may drop in-flight work (e.g.,
     /// background tasks, rollout flush, or child process cleanup).
     Exit(ExitMode),
+    /// The user accepted stopping other sessions owned by this embedded server.
+    ConfirmedEmbeddedExit(ExitMode),
 
     /// Apply a choice from the running-task exit menu to its originating thread.
     RunningTaskExit {
@@ -934,9 +958,9 @@ pub(crate) enum AppEvent {
         cwd: PathBuf,
     },
 
-    /// Fetch lifecycle hook inventory for the provided working directory.
+    /// Fetch lifecycle hook inventory for the current thread or working directory.
     FetchHooksList {
-        cwd: PathBuf,
+        target: crate::hooks_rpc::HooksListTarget,
     },
 
     /// Result of fetching plugin marketplace state.
@@ -960,8 +984,8 @@ pub(crate) enum AppEvent {
 
     /// Result of fetching lifecycle hook inventory.
     HooksLoaded {
-        cwd: PathBuf,
-        result: Result<codex_app_server_protocol::HooksListResponse, String>,
+        target: crate::hooks_rpc::HooksListTarget,
+        result: Result<codex_app_server_protocol::HooksListEntry, String>,
     },
 
     /// Open the prompt for adding a marketplace source.
@@ -1229,7 +1253,13 @@ pub(crate) enum AppEvent {
     /// Update the current model slug in the running app and widget.
     UpdateModel(String),
 
-    /// Apply a final Astra picker action and offer the flourish only if it changed the model on
+    /// Apply a model-picker selection to the active conversation and saved local defaults.
+    ApplyModelSelection {
+        model: String,
+        effort: Option<ReasoningEffort>,
+    },
+
+    /// Apply an explicit Astra selection and offer the flourish only if it changed the model on
     /// its original task. Automatic model updates do not use this event.
     AstraSelectedFromModelPicker {
         thread_id: ThreadId,
@@ -1267,10 +1297,29 @@ pub(crate) enum AppEvent {
         effort: Option<ReasoningEffort>,
     },
 
-    /// Apply a model and effort only to the active session, preserving saved defaults.
+    /// Apply a model, effort, and optional speed only to the active session, preserving saved defaults.
     SelectSessionModel {
         model: String,
         effort: Option<ReasoningEffort>,
+        service_tier: Option<String>,
+    },
+
+    OpenQuickDialEditor {
+        target: crate::chatwidget::quick_dials::QuickDialEditorTarget,
+        dial: Option<codex_config::types::QuickDial>,
+    },
+    OpenQuickDialSavePicker(codex_config::types::QuickDial),
+    ConfirmQuickDial {
+        slot: u8,
+        dial: Option<codex_config::types::QuickDial>,
+    },
+    SaveQuickDial {
+        slot: u8,
+        dial: Option<codex_config::types::QuickDial>,
+    },
+    RecallQuickDial {
+        slot: u8,
+        thread_id: Option<ThreadId>,
     },
 
     /// Show the cyber auto-review notice after the model selection confirmation.
@@ -1320,6 +1369,11 @@ pub(crate) enum AppEvent {
         request_id: uuid::Uuid,
     },
     ModelsLoaded {
+        request_id: uuid::Uuid,
+        result: Result<Vec<ModelPreset>, String>,
+    },
+    /// Finished the API-key compatibility check; do not check the same catalog again.
+    ApiKeyCompatModelsLoaded {
         request_id: uuid::Uuid,
         result: Result<Vec<ModelPreset>, String>,
     },
@@ -1533,6 +1587,11 @@ pub(crate) enum AppEvent {
 
     /// Re-open the permissions presets popup.
     OpenPermissionsPopup,
+
+    /// Resolve an inline permission profile after any app-owned platform preflight.
+    ResolvePermissionProfile {
+        profile_id: String,
+    },
 
     /// Open the branch picker option from the review popup.
     OpenReviewBranchPicker(PathBuf),

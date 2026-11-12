@@ -1,4 +1,6 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -10,7 +12,9 @@ use codex_core::TurnInputRequest;
 use codex_core::TurnStartOptions;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::AdditionalContextEntry;
 use codex_protocol::protocol::ThreadGoal;
+use codex_protocol::turn_input::TurnInputSubmission;
 
 use crate::accounting::BudgetLimitedGoalDisposition;
 use crate::accounting::GoalAccountingState;
@@ -23,6 +27,14 @@ use crate::steering::objective_updated_steering_item;
 use crate::tool::protocol_goal_from_state;
 use tokio::sync::Semaphore;
 use tokio::sync::SemaphorePermit;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoalActivationDisposition {
+    Started { turn_id: String },
+    Steered { turn_id: String },
+    NotStarted { reason: String },
+    Uncertain { reason: String },
+}
 
 #[derive(Clone)]
 pub struct GoalRuntimeHandle {
@@ -44,6 +56,12 @@ pub(crate) enum ActiveGoalStopReason {
     EmptyResponse,
 }
 
+#[derive(Default)]
+struct IdleCheckpoint {
+    generation: u64,
+    waiting: Option<tokio::task::AbortHandle>,
+}
+
 struct GoalRuntimeInner {
     thread_id: ThreadId,
     state_dbs: Arc<codex_state::StateRuntime>,
@@ -56,7 +74,8 @@ struct GoalRuntimeInner {
     enabled: AtomicBool,
     tools_available_for_thread: bool,
     tools_visible_for_thread: bool,
-    goal_state_lock: Semaphore,
+    goal_state_lock: Arc<Semaphore>,
+    idle_checkpoint: Mutex<IdleCheckpoint>,
 }
 
 pub(crate) struct AccountedGoalProgress {
@@ -110,7 +129,8 @@ impl GoalRuntimeHandle {
                 enabled: AtomicBool::new(config.enabled),
                 tools_available_for_thread: config.tools_available_for_thread,
                 tools_visible_for_thread: config.tools_visible_for_thread,
-                goal_state_lock: Semaphore::new(/*permits*/ 1),
+                goal_state_lock: Arc::new(Semaphore::new(/*permits*/ 1)),
+                idle_checkpoint: Mutex::new(IdleCheckpoint::default()),
             }),
         }
     }
@@ -161,6 +181,17 @@ impl GoalRuntimeHandle {
             .map_err(|err| err.to_string())
     }
 
+    pub(crate) async fn owned_goal_state_permit(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
+        self.inner
+            .goal_state_lock
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|err| err.to_string())
+    }
+
     pub async fn prepare_external_goal_mutation(&self) -> Result<(), String> {
         if !self.is_enabled() {
             return Ok(());
@@ -168,6 +199,15 @@ impl GoalRuntimeHandle {
         // Invalidate the old turn before the persisted objective/status changes.
         self.inner.accounting_state.reset_empty_responses();
 
+        self.flush_external_goal_progress().await
+    }
+
+    /// Accounting is legitimate even when a conditional control later becomes
+    /// stale. Reset continuation/breaker state only after a matched mutation.
+    pub(crate) async fn flush_external_goal_progress(&self) -> Result<(), String> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
         if let Some(turn_id) = self.inner.accounting_state.current_turn_id() {
             self.account_active_goal_progress(
                 turn_id.as_str(),
@@ -188,15 +228,11 @@ impl GoalRuntimeHandle {
         Ok(())
     }
 
-    pub async fn apply_external_goal_set(
+    fn record_external_goal_set(
         &self,
-        goal: codex_state::ThreadGoal,
+        goal: &codex_state::ThreadGoal,
         previous_goal: Option<PreviousGoalSnapshot>,
-    ) -> Result<(), String> {
-        if !self.is_enabled() {
-            return Ok(());
-        }
-
+    ) -> bool {
         self.inner.accounting_state.reset_empty_responses();
         let replaced_existing_goal = previous_goal
             .as_ref()
@@ -205,7 +241,7 @@ impl GoalRuntimeHandle {
             self.inner.metrics.record_created();
             self.inner
                 .analytics
-                .created(&goal, GoalEventAttribution::NoTurn);
+                .created(goal, GoalEventAttribution::NoTurn);
         }
         let previous_status = previous_goal
             .as_ref()
@@ -215,10 +251,10 @@ impl GoalRuntimeHandle {
             .record_resumed_if_status_changed(previous_status, goal.status);
         self.inner
             .metrics
-            .record_terminal_if_status_changed(previous_status, &goal);
+            .record_terminal_if_status_changed(previous_status, goal);
         self.inner
             .analytics
-            .status_changed(&goal, previous_status, GoalEventAttribution::NoTurn);
+            .status_changed(goal, previous_status, GoalEventAttribution::NoTurn);
         let objective_changed = previous_goal.as_ref().is_some_and(|previous_goal| {
             !replaced_existing_goal && previous_goal.objective != goal.objective
         });
@@ -234,11 +270,6 @@ impl GoalRuntimeHandle {
                         .accounting_state
                         .mark_idle_goal_active(goal.goal_id.clone());
                 }
-                if objective_changed {
-                    let item = objective_updated_steering_item(&protocol_goal_from_state(goal));
-                    self.inject_active_turn_steering(item).await;
-                }
-                self.continue_if_idle().await?;
             }
             codex_state::ThreadGoalStatus::BudgetLimited => {
                 if self.inner.accounting_state.current_turn_id().is_none() {
@@ -252,7 +283,131 @@ impl GoalRuntimeHandle {
                 self.inner.accounting_state.clear_active_goal();
             }
         }
+        objective_changed
+    }
+
+    pub async fn apply_external_goal_set(
+        &self,
+        goal: codex_state::ThreadGoal,
+        previous_goal: Option<PreviousGoalSnapshot>,
+    ) -> Result<(), String> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
+        let objective_changed = self.record_external_goal_set(&goal, previous_goal);
+        if goal.status == codex_state::ThreadGoalStatus::Active {
+            if objective_changed {
+                self.inject_active_turn_steering(objective_updated_steering_item(
+                    &protocol_goal_from_state(goal),
+                ))
+                .await;
+            }
+            self.continue_if_idle().await?;
+        }
         Ok(())
+    }
+
+    /// Accept context together with this exact goal generation before useful work
+    /// starts. A superseding mutation can win after CAS; it never gets this context.
+    /// Caller holds the same goal-state permit used by the conditional write.
+    pub(crate) async fn activate_with_context(
+        &self,
+        goal: codex_state::ThreadGoal,
+        previous_goal: Option<PreviousGoalSnapshot>,
+        revision: &str,
+        context: BTreeMap<String, AdditionalContextEntry>,
+    ) -> Result<GoalActivationDisposition, String> {
+        let snapshot = self
+            .inner
+            .state_dbs
+            .thread_goals()
+            .snapshot_thread_goal(self.thread_id())
+            .await
+            .map_err(|e| e.to_string())?;
+        if snapshot.revision != revision
+            || snapshot
+                .goal
+                .as_ref()
+                .is_none_or(|current| current.goal_id != goal.goal_id)
+        {
+            return Ok(GoalActivationDisposition::NotStarted {
+                reason:
+                    "Goal changed after metadata commitment; activation context was not submitted"
+                        .into(),
+            });
+        }
+        self.record_external_goal_set(&goal, previous_goal);
+        if !self.tools_available() || goal.status != codex_state::ThreadGoalStatus::Active {
+            return Ok(GoalActivationDisposition::NotStarted {
+                reason: "Selected goal is not active or its runtime is unavailable".into(),
+            });
+        }
+        let Some(manager) = self.inner.thread_manager.upgrade() else {
+            return Err("Thread manager unavailable after goal commitment".into());
+        };
+        let thread = manager
+            .get_thread(self.thread_id())
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(current) = self.inner.accounting_state.current_turn_id()
+            && let Some(turn_id) = thread
+                .inject_context_for_running_turn(
+                    &current,
+                    vec![objective_updated_steering_item(&protocol_goal_from_state(
+                        goal.clone(),
+                    ))],
+                    context.clone(),
+                )
+                .await
+        {
+            return Ok(GoalActivationDisposition::Steered { turn_id });
+        }
+
+        if self
+            .inner
+            .state_dbs
+            .thread_goals()
+            .has_thread_goal_continuation_deferral(self.thread_id())
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(GoalActivationDisposition::NotStarted {
+                reason: "Native goal continuation remains explicitly deferred".into(),
+            });
+        }
+        let options = thread
+            .thread_extension_data()
+            .get::<TurnStartOptions>()
+            .map(|v| v.as_ref().clone())
+            .unwrap_or_default();
+        let input = continuation_steering_item(
+            &protocol_goal_from_state(goal),
+            thread.config().await.update_plan_enabled,
+        );
+        match thread
+            .start_turn_if_idle(
+                TurnInputRequest::new(TurnInput::ResponseItem(input))
+                    .on_start(TurnStartOptions {
+                        turn_trigger: Some("goal".into()),
+                        ..options
+                    })
+                    .with_additional_context(context),
+            )
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            StartIfIdleSubmission::Started { turn_id, .. } => {
+                self.inner
+                    .accounting_state
+                    .mark_goal_continuation(turn_id.clone());
+                Ok(GoalActivationDisposition::Started { turn_id })
+            }
+            StartIfIdleSubmission::NotSubmitted { reason } => {
+                Ok(GoalActivationDisposition::NotStarted {
+                    reason: format!("Native activation not submitted: {reason:?}"),
+                })
+            }
+        }
     }
 
     pub async fn apply_external_goal_clear(
@@ -434,6 +589,122 @@ impl GoalRuntimeHandle {
     }
 
     pub(crate) async fn continue_if_idle(&self) -> Result<(), String> {
+        self.continue_if_idle_matching(None, None).await
+    }
+
+    /// Cancel before any new native turn, including bounded attention, or teardown.
+    pub(crate) fn cancel_idle_checkpoint(&self) {
+        let mut checkpoint = self
+            .inner
+            .idle_checkpoint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        checkpoint.generation = checkpoint.generation.wrapping_add(1);
+        if let Some(task) = checkpoint.waiting.take() {
+            task.abort();
+        }
+    }
+
+    /// Retain one bounded checkpoint without holding terminal flush or native admission.
+    pub async fn continue_after_idle_gap(&self, gap: std::time::Duration) -> Result<(), String> {
+        self.cancel_idle_checkpoint();
+        if gap.is_zero() {
+            return self.continue_if_idle().await;
+        }
+        if !self.tools_available() {
+            return Ok(());
+        }
+        let generation = self
+            .inner
+            .idle_checkpoint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generation;
+        let snapshot = self
+            .inner
+            .state_dbs
+            .thread_goals()
+            .snapshot_thread_goal(self.thread_id())
+            .await
+            .map_err(|e| e.to_string())?;
+        if !snapshot
+            .goal
+            .as_ref()
+            .is_some_and(|g| g.status == codex_state::ThreadGoalStatus::Active)
+        {
+            return Ok(());
+        }
+        let Some(manager) = self.inner.thread_manager.upgrade() else {
+            return Ok(());
+        };
+        let Ok(thread) = manager.get_thread(self.inner.thread_id).await else {
+            return Ok(());
+        };
+        let Some(checkpoint_turn) = thread.idle_checkpoint_turn_id().await else {
+            return Ok(());
+        };
+        let weak = Arc::downgrade(&self.inner);
+        let mut slot = self
+            .inner
+            .idle_checkpoint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.generation != generation {
+            return Ok(());
+        }
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(gap.min(std::time::Duration::from_secs(300))).await;
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            {
+                let mut checkpoint = inner
+                    .idle_checkpoint
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if checkpoint.generation != generation {
+                    return;
+                }
+                checkpoint.waiting.take();
+            }
+            let runtime = Self { inner };
+            if let Err(error) = runtime
+                .continue_if_idle_matching(Some(&snapshot.revision), Some(checkpoint_turn))
+                .await
+            {
+                tracing::warn!(%error,"failed to revalidate checkpoint goal continuation");
+            }
+        });
+        slot.waiting = Some(task.abort_handle());
+        Ok(())
+    }
+
+    // The boxed boundary keeps resumption out of the async continuation's type.
+    // One callback, one revalidation attempt; no polling or periodic rearm.
+    fn resume_after_maintenance(
+        runtime: Weak<GoalRuntimeInner>,
+        revision: String,
+        expected_previous_turn_id: Option<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(async move {
+            let Some(inner) = runtime.upgrade() else {
+                return;
+            };
+            let runtime = Self { inner };
+            if let Err(error) = runtime
+                .continue_if_idle_matching(Some(&revision), expected_previous_turn_id)
+                .await
+            {
+                tracing::warn!(%error, "failed to revalidate withheld goal continuation");
+            }
+        })
+    }
+
+    async fn continue_if_idle_matching(
+        &self,
+        expected_revision: Option<&str>,
+        expected_previous_turn_id: Option<String>,
+    ) -> Result<(), String> {
         if !self.tools_available() {
             self.inner.accounting_state.clear_active_goal();
             return Ok(());
@@ -462,14 +733,17 @@ impl GoalRuntimeHandle {
             return Ok(());
         };
 
-        let Some(goal) = self
+        let snapshot = self
             .inner
             .state_dbs
             .thread_goals()
-            .get_thread_goal(self.thread_id())
+            .snapshot_thread_goal(self.thread_id())
             .await
-            .map_err(|err| err.to_string())?
-        else {
+            .map_err(|err| err.to_string())?;
+        if expected_revision.is_some_and(|expected| expected != snapshot.revision) {
+            return Ok(());
+        }
+        let Some(goal) = snapshot.goal else {
             self.inner.accounting_state.clear_active_goal();
             return Ok(());
         };
@@ -477,6 +751,16 @@ impl GoalRuntimeHandle {
             self.inner.accounting_state.clear_active_goal();
             return Ok(());
         }
+        let runtime = Arc::downgrade(&self.inner);
+        let revision = snapshot.revision;
+        let checkpoint = expected_previous_turn_id.clone();
+        let Some(_admission) = thread.admit_goal_continuation(Box::new(move || {
+            tokio::spawn(Self::resume_after_maintenance(
+                runtime, revision, checkpoint,
+            ));
+        })) else {
+            return Ok(());
+        };
         let start_options = thread
             .thread_extension_data()
             .get::<TurnStartOptions>()
@@ -487,25 +771,41 @@ impl GoalRuntimeHandle {
             thread.config().await.update_plan_enabled,
         );
 
-        match thread
-            .start_turn_if_idle(
-                TurnInputRequest::new(TurnInput::ResponseItem(item)).on_start(TurnStartOptions {
-                    turn_trigger: Some("goal".to_string()),
-                    ..start_options
-                }),
-            )
-            .await
-        {
-            Ok(StartIfIdleSubmission::Started { turn_id, .. }) => {
+        let request =
+            TurnInputRequest::new(TurnInput::ResponseItem(item)).on_start(TurnStartOptions {
+                turn_trigger: Some("goal".to_string()),
+                ..start_options
+            });
+        let submission = if let Some(previous) = expected_previous_turn_id {
+            thread.start_turn_if_idle_after(request, previous).await
+        } else {
+            thread.start_turn_if_idle(request).await.map(|v| match v {
+                StartIfIdleSubmission::Started {
+                    turn_id,
+                    root_turn_id,
+                } => TurnInputSubmission::Started {
+                    turn_id,
+                    root_turn_id,
+                },
+                StartIfIdleSubmission::NotSubmitted { reason } => {
+                    TurnInputSubmission::NotSubmitted { reason }
+                }
+            })
+        };
+        match submission {
+            Ok(TurnInputSubmission::Started { turn_id, .. }) => {
                 // Turn-stop evaluation takes the same permit, so even a fast response
                 // cannot finish before this host-admitted continuation is identified.
                 self.inner.accounting_state.mark_goal_continuation(turn_id);
             }
-            Ok(StartIfIdleSubmission::NotSubmitted { reason }) => {
+            Ok(TurnInputSubmission::NotSubmitted { reason }) => {
                 tracing::debug!(
                     ?reason,
                     "skipping goal continuation because automatic idle work was rejected"
                 );
+            }
+            Ok(TurnInputSubmission::Steered { .. }) => {
+                unreachable!("idle goal admission cannot steer")
             }
             Err(error) => {
                 tracing::debug!(

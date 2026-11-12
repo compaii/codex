@@ -11,16 +11,25 @@ use crate::clipboard_copy::worker::CopyResult;
 pub(crate) enum KeyEventAction {
     None,
     CopyLastResponse(Arc<str>),
-    PasteImage,
+    PasteImage { text_fallback: Option<KeyCode> },
 }
 
 impl ChatWidget {
+    pub(crate) fn current_patch_approval(&self) -> Option<(ThreadId, &str)> {
+        let patch = self.bottom_pane.current_patch_approval()?;
+        Some((patch.thread_id, &patch.id))
+    }
+
     pub(crate) fn clear_composer_selection(&mut self) {
         self.bottom_pane.clear_composer_selection();
     }
 
     pub(crate) fn end_composer_drag(&mut self) {
         self.bottom_pane.end_composer_drag();
+    }
+
+    pub(crate) fn cancel_composer_primary(&mut self) {
+        self.bottom_pane.cancel_composer_primary();
     }
 
     pub(crate) fn copy_composer_selection(
@@ -31,26 +40,34 @@ impl ChatWidget {
         self.bottom_pane.copy_composer_selection(event, copy)
     }
 
+    pub(crate) fn copy_composer_selection_on_release(
+        &mut self,
+        event: crossterm::event::MouseEvent,
+        selection_copy: crate::tui::SelectionCopy,
+        copy: impl FnOnce(&str, crate::tui::SelectionCopy) -> (CopyResult, Option<Arc<()>>),
+    ) -> Option<(usize, Option<CopyResult>)> {
+        self.bottom_pane
+            .copy_composer_selection_on_release(event, selection_copy, copy)
+    }
+
     pub(crate) fn handle_composer_mouse(&mut self, event: crossterm::event::MouseEvent) -> bool {
         self.bottom_pane.handle_composer_mouse(event)
     }
 
-    /// Snapshot only the editable paste target, without changing pending submissions.
-    pub(crate) fn right_click_paste_target(&self) -> Option<(String, usize)> {
-        self.bottom_pane.can_paste_on_right_click().then(|| {
-            (
-                self.bottom_pane.composer_text(),
-                self.bottom_pane.composer_cursor(),
-            )
-        })
+    /// Snapshot the paste target without changing pending submissions. Unlike mouse paste,
+    /// a keyboard paste may replace a composer selection or complete an active popup.
+    pub(crate) fn clipboard_paste_target(
+        &self,
+        shortcut: Option<KeyCode>,
+    ) -> Option<crate::bottom_pane::ClipboardPasteTarget> {
+        if self.blocks_direct_input {
+            return None;
+        }
+        self.bottom_pane.clipboard_paste_target(shortcut)
     }
 
     pub(crate) fn prepare_composer_mouse(&mut self, event: crossterm::event::MouseEvent) -> bool {
         self.bottom_pane.prepare_composer_mouse(event)
-    }
-
-    pub(crate) fn set_agents_navigation_enabled(&mut self, enabled: bool) {
-        self.bottom_pane.set_agents_navigation_enabled(enabled);
     }
 
     pub(crate) fn agents_navigation_key_available(&self) -> bool {
@@ -80,6 +97,9 @@ impl ChatWidget {
         key_event: KeyEvent,
         activation_key: Option<crate::key_hint::KeyBinding>,
     ) -> KeyEventAction {
+        if self.handle_quick_dial_menu(key_event) {
+            return KeyEventAction::None;
+        }
         if self.handle_startup_submission_key(key_event) {
             return KeyEventAction::None;
         }
@@ -117,6 +137,14 @@ impl ChatWidget {
         if self.shortcut_overlay_visible() && key_hint::plain(KeyCode::Esc).is_press(key_event) {
             self.bottom_pane
                 .handle_key_event_with_activation_key(key_event, activation_key);
+            return KeyEventAction::None;
+        }
+
+        if key_event.kind == KeyEventKind::Press
+            && self.chat_keymap.open_presets.is_pressed(key_event)
+            && self.bottom_pane.no_modal_or_popup_active()
+        {
+            self.open_quick_dial_menu();
             return KeyEventAction::None;
         }
 
@@ -177,13 +205,12 @@ impl ChatWidget {
                 self.quit_shortcut_expires_at = None;
                 self.quit_shortcut_key = None;
             }
-            KeyEvent {
-                code: KeyCode::Char(c),
-                modifiers,
-                kind: KeyEventKind::Press,
-                ..
-            } if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                && c.eq_ignore_ascii_case(&'v') =>
+            key if key.kind == KeyEventKind::Press
+                && ((matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'v'))
+                    && key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT))
+                    || (cfg!(windows) && key_hint::shift(KeyCode::Insert).is_press(key))) =>
             {
                 if Instant::now() < self.suppress_image_paste_until {
                     self.suppress_image_paste_until =
@@ -192,7 +219,14 @@ impl ChatWidget {
                 }
                 self.suppress_image_paste_until =
                     Instant::now() + clipboard::IMAGE_PASTE_REPEAT_WINDOW;
-                return KeyEventAction::PasteImage;
+                let text_fallback = (cfg!(windows)
+                    && (key.modifiers == KeyModifiers::CONTROL
+                        || key_hint::shift(KeyCode::Insert).is_press(key)))
+                .then_some(key.code);
+                if text_fallback.is_some() {
+                    self.bottom_pane.prepare_composer_clipboard_paste();
+                }
+                return KeyEventAction::PasteImage { text_fallback };
             }
             other if other.kind == KeyEventKind::Press => {
                 self.suppress_image_paste_until = Instant::now();
@@ -331,6 +365,7 @@ impl ChatWidget {
     }
 
     pub(crate) fn set_footer_hint_override(&mut self, items: Option<Vec<(String, String)>>) {
+        self.quick_dial_menu = false;
         if items.is_some() {
             // Active input instructions supersede transient feedback from a previous action.
             self.bottom_pane
@@ -507,7 +542,10 @@ impl ChatWidget {
     }
 
     pub(crate) fn handle_paste(&mut self, text: String) {
-        if self.external_writer_view && !self.bottom_pane.has_active_view() {
+        self.cancel_quick_dial_menu();
+        if (self.external_writer_view || self.has_provider_error())
+            && !self.bottom_pane.has_active_view()
+        {
             return;
         }
         if !self.startup_submission_has_protected_input() {

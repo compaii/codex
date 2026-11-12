@@ -1,4 +1,4 @@
-//! Daemon-wide overview of recent and locally retained sessions and their subagents.
+//! Overview of recent and locally retained sessions and their subagents.
 //! Tasks owned by another app server open as frozen, read-only history snapshots.
 //! Only the immediate attachment of a dashboard-created task is treated as fresh.
 
@@ -18,11 +18,11 @@ mod selection;
 use super::agents_overview_view::AgentsOverviewGroup;
 use super::agents_overview_view::AgentsOverviewRow;
 use super::agents_overview_view::AgentsOverviewView;
+use super::app_server_requests::BufferedServerRequest;
 use super::session_lifecycle::ThreadAttachPresentation;
 use super::*;
 use crate::app_event::AgentsOverviewThreadRefresh;
 use crate::bottom_pane::BottomPaneView;
-use crate::bottom_pane::SelectionDescriptionLayout;
 use crate::bottom_pane::SelectionItem;
 use crate::bottom_pane::SelectionViewParams;
 use crate::chatwidget::ThreadInputStateRestoreMode;
@@ -42,6 +42,7 @@ pub(super) struct AgentsOverviewState {
     pub(super) removed_threads: HashSet<ThreadId>,
     /// Local visibility only; activity and metadata refreshes never reveal hidden roots.
     pub(super) hidden_threads: HashSet<ThreadId>,
+    pub(super) unread: HashSet<ThreadId>,
     pub(super) last_messages: HashMap<ThreadId, String>,
     pub(super) usage: HashMap<ThreadId, super::agents_overview_usage::AgentsOverviewUsage>,
     pub(super) pending_usage: Option<(ThreadId, Uuid)>,
@@ -76,7 +77,7 @@ pub(super) struct AgentsOverviewState {
     pub(super) blank_sessions: HashMap<ThreadId, crate::app_server_session::AppServerStartedThread>,
     pub(super) input_states: HashMap<ThreadId, ThreadInputState>,
     pub(super) new_session_draft: Option<Box<StartupDraftPump>>,
-    pub(super) dispatched_requests: HashMap<ThreadId, Vec<ServerRequest>>,
+    pub(super) dispatched_requests: HashMap<ThreadId, Vec<BufferedServerRequest>>,
 }
 
 impl Drop for AgentsOverviewState {
@@ -89,54 +90,6 @@ impl Drop for AgentsOverviewState {
 
 impl App {
     pub(super) fn open_agents_overview(&mut self, app_server: &AppServerSession) {
-        if matches!(self.app_server_target, AppServerTarget::Embedded) {
-            let workload_identity_selected = codex_login::is_workload_identity_selected();
-            self.chat_widget.show_selection_view(SelectionViewParams {
-                title: Some("Shared agents unavailable".to_string()),
-                subtitle: Some(
-                    if workload_identity_selected {
-                        "The agents dashboard is unavailable while workload identity is active."
-                    } else if cfg!(any(unix, windows)) {
-                        "This session isn’t connected to a shared background server."
-                    } else {
-                        "Connect to a remote background server to use the agents dashboard."
-                    }
-                    .to_string(),
-                ),
-                footer_note: (cfg!(any(unix, windows)) && !workload_identity_selected).then(|| {
-                    Line::from(
-                        "Starting a background server will not interrupt or move this session."
-                            .dim(),
-                    )
-                }),
-                items: [
-                    #[cfg(any(unix, windows))]
-                    (!workload_identity_selected).then(|| SelectionItem {
-                        name: "Start background server".to_string(),
-                        description: Some(
-                            "Open `codex agents` in another terminal afterward".to_string(),
-                        ),
-                        actions: vec![Box::new(|tx| tx.send(AppEvent::StartAgentsDaemon))],
-                        dismiss_on_select: true,
-                        ..Default::default()
-                    }),
-                    Some(SelectionItem {
-                        name: "Return to this session".to_string(),
-                        dismiss_on_select: true,
-                        ..Default::default()
-                    }),
-                ]
-                .into_iter()
-                .flatten()
-                .collect(),
-                description_layout: SelectionDescriptionLayout::HideWhenNarrow {
-                    min_description_width: 28,
-                },
-                ..SelectionViewParams::picker()
-            });
-            return;
-        }
-
         let threads = self
             .agents_overview
             .threads
@@ -193,6 +146,9 @@ impl App {
         }
         match result {
             Ok(refresh) => {
+                for id in refresh.cleared_unread {
+                    self.agents_overview.unread.remove(&id);
+                }
                 if let Some(pinned_thread_ids) = refresh.pinned_thread_ids {
                     self.agents_overview.pinned_thread_ids = pinned_thread_ids;
                 }
@@ -217,7 +173,12 @@ impl App {
                     if self.agents_overview.removed_threads.contains(&thread_id) {
                         continue;
                     }
-                    if let Some(mut thread) = thread {
+                    if let Some((mut thread, unread)) = thread {
+                        if unread {
+                            self.agents_overview.unread.insert(thread_id);
+                        } else {
+                            self.agents_overview.unread.remove(&thread_id);
+                        }
                         if thread.ephemeral {
                             self.agents_overview.threads.remove(&thread_id);
                             self.agents_overview.last_messages.remove(&thread_id);
@@ -244,7 +205,7 @@ impl App {
                 }
             }
             Err(error) => {
-                tracing::warn!(%error, "failed to refresh shared agents");
+                tracing::warn!(%error, "failed to refresh agents overview");
             }
         }
         for notifications in
@@ -388,6 +349,7 @@ impl App {
                 continue;
             }
             rows.push(AgentsOverviewRow {
+                unread: self.agents_overview.unread.contains(&thread_id),
                 details: self.agents_overview_details(root, &children),
                 thread: root.clone(),
                 thread_id,
@@ -405,11 +367,10 @@ impl App {
         let mut view = AgentsOverviewView::new(
             rows,
             selected_thread_id,
-            self.config.features.enabled(Feature::Worktrees)
-                && !crate::uses_remote_workspace_or_environment(
-                    &self.app_server_target,
-                    self.environment_manager.as_ref(),
-                ),
+            !crate::uses_remote_workspace_or_environment(
+                &self.app_server_target,
+                self.environment_manager.as_ref(),
+            ),
             self.local_settings.tui.status_line_use_colors,
             self.app_event_tx.clone(),
             self.keymap.clone(),
@@ -468,6 +429,7 @@ impl App {
             loading::draw(tui)?;
         }
         let mut restored_blank_session = false;
+        let mut provider_resume_checked = false;
         if self.primary_thread_id != Some(root_thread_id) {
             let previous_displayed_thread_id = self.current_displayed_thread_id();
             if let Some(id) = previous_displayed_thread_id
@@ -501,7 +463,13 @@ impl App {
                             .input_states
                             .insert(*thread_id, input_state);
                     }
-                    let requests = store.pending_replay_requests();
+                    let requests: Vec<_> = store
+                        .pending_replay_requests()
+                        .into_iter()
+                        .filter_map(|request| {
+                            self.pending_app_server_requests.buffered_request(request)
+                        })
+                        .collect();
                     if !requests.is_empty() {
                         previous_pending_requests.push((*thread_id, requests));
                     }
@@ -545,13 +513,19 @@ impl App {
                 (config.clone(), self.local_settings.reloaded(config))
             } else if unloaded {
                 let target_session = SessionTarget {
+                    backend_id: app_server.backend_id(),
                     path: target_thread.path.clone(),
                     thread_id: root_thread_id,
                     cwd: Some(target_thread.cwd.to_path_buf()),
                     history_mode: Some(target_thread.history_mode),
                 };
                 match self
-                    .resume_config_for_target(tui, app_server, &target_session)
+                    .resume_config_for_target(
+                        tui,
+                        app_server,
+                        &target_session,
+                        super::resume_preparation::ResumeSource::Active,
+                    )
                     .await
                 {
                     Ok(config) => config,
@@ -565,7 +539,11 @@ impl App {
                 };
                 let current_cwd = self.config.cwd.to_path_buf();
                 match self
-                    .rebuild_config_for_resume_or_fallback(&current_cwd, config_cwd)
+                    .rebuild_config_for_resume_or_fallback(
+                        &current_cwd,
+                        config_cwd,
+                        (&self.config, &self.local_settings),
+                    )
                     .await
                 {
                     Ok(config) => config,
@@ -641,6 +619,7 @@ impl App {
                 }
             };
             let mut history_notice = None;
+            let mut provider_error = None;
             let presentation = if startup_draft.is_some() {
                 ThreadAttachPresentation::FreshWithDraft
             } else if started.is_some() {
@@ -670,8 +649,17 @@ impl App {
                     )
                     .await
                 {
-                    Ok(resumed) => (resumed, false),
-                    Err(error) if crate::app_server_session::is_active_writer_error(&error) => {
+                    Ok(resumed) => {
+                        provider_resume_checked = true;
+                        (resumed, false)
+                    }
+                    Err(error)
+                        if crate::app_server_session::is_active_writer_error(&error)
+                            || crate::app_server_session::model_provider_error(&error)
+                                .is_some() =>
+                    {
+                        provider_resume_checked = true;
+                        provider_error = crate::app_server_session::model_provider_error(&error);
                         match app_server
                             .read_thread_for_viewing(
                                 &resume_config,
@@ -784,14 +772,17 @@ impl App {
             if startup_draft.is_none() {
                 loading::draw(tui)?;
             }
-            if read_only {
+            if let Some(error) = provider_error {
+                self.chat_widget
+                    .show_provider_error(error, /*rejected_message_id*/ None);
+            } else if read_only {
                 self.ensure_thread_channel(root_thread_id)
                     .mark_external_writer();
                 self.chat_widget.show_external_writer_thread();
-                if let Some(notice) = history_notice {
-                    self.chat_widget
-                        .add_info_message(notice.to_string(), /*hint*/ None);
-                }
+            }
+            if let Some(notice) = history_notice {
+                self.chat_widget
+                    .add_info_message(notice.to_string(), /*hint*/ None);
             }
             let mut destination_config = self.chat_widget.config_ref().clone();
             if self.app_server_target.uses_remote_workspace() {
@@ -873,27 +864,16 @@ impl App {
         if self.current_displayed_thread_id() == Some(root_thread_id)
             && let Some(mut input_state) = self.agents_overview.input_states.remove(&root_thread_id)
         {
+            // A fresh server result supersedes the saved rejection, but not the draft.
+            if provider_resume_checked {
+                input_state.provider_error = None;
+            }
             // A saved draft includes model settings, so apply newer server settings after it.
             let pending_settings = restored_blank_session
                 .then(|| input_state.pending_thread_settings.take())
                 .flatten();
-            let preserve_in_flight_turn = !read_only
-                && self
-                    .active_turn_id_for_thread(root_thread_id)
-                    .await
-                    .is_some();
-            self.chat_widget.restore_thread_input_state(
-                Some(input_state),
-                ThreadInputStateRestoreMode {
-                    preserve_in_flight_turn,
-                },
-            );
-            if let Some(settings) = pending_settings {
-                self.chat_widget.on_thread_settings_updated(settings);
-            }
-            if !preserve_in_flight_turn {
-                self.chat_widget.maybe_send_next_queued_input();
-            }
+            self.restore_session_draft(root_thread_id, input_state, pending_settings)
+                .await;
         }
         if !read_only && !is_new_session && !self.chat_widget.fork_in_progress {
             self.maybe_prompt_resume_paused_goal_after_resume(app_server, root_thread_id)
@@ -901,6 +881,28 @@ impl App {
         }
 
         Ok(AppRunControl::Continue)
+    }
+
+    pub(super) async fn restore_session_draft(
+        &mut self,
+        thread_id: ThreadId,
+        input: ThreadInputState,
+        pending_settings: Option<codex_app_server_protocol::ThreadSettingsUpdatedNotification>,
+    ) {
+        let preserve_in_flight_turn = !self.chat_widget.is_external_writer_view()
+            && self.active_turn_id_for_thread(thread_id).await.is_some();
+        self.chat_widget.restore_thread_input_state(
+            Some(input),
+            ThreadInputStateRestoreMode {
+                preserve_in_flight_turn,
+            },
+        );
+        if let Some(settings) = pending_settings {
+            self.chat_widget.on_thread_settings_updated(settings);
+        }
+        if !preserve_in_flight_turn {
+            self.chat_widget.maybe_send_next_queued_input();
+        }
     }
 
     pub(super) async fn replay_agents_overview_requests(
@@ -915,11 +917,7 @@ impl App {
             .flat_map(|(_, requests)| requests)
             .collect::<Vec<_>>();
         for request in requests {
-            self.handle_app_server_event(
-                app_server,
-                codex_app_server_client::AppServerEvent::ServerRequest(Box::new(request)),
-            )
-            .await;
+            self.handle_server_request_event(app_server, request).await;
         }
     }
 
@@ -945,7 +943,6 @@ impl App {
             .as_ref()
             .filter(|_| remote)
             .map(AbsolutePathBuf::to_path_buf);
-        let preserve_service_tier = remote || cwd.is_none();
         let local_cwd = if remote {
             self.config.cwd.to_path_buf()
         } else {
@@ -967,9 +964,6 @@ impl App {
                 return None;
             }
         };
-        if preserve_service_tier {
-            config.service_tier = self.chat_widget.configured_service_tier();
-        }
         let trust_cwd = config.cwd.to_path_buf();
         if self
             .confirm_directory_trust(
@@ -1011,7 +1005,8 @@ impl App {
         }
         let defaults_cwd = match app_server.thread_params_mode() {
             crate::app_server_session::ThreadParamsMode::Embedded => config.cwd.as_path(),
-            crate::app_server_session::ThreadParamsMode::Remote => remote_cwd
+            crate::app_server_session::ThreadParamsMode::Remote
+            | crate::app_server_session::ThreadParamsMode::Cloud => remote_cwd
                 .as_deref()
                 .or_else(|| app_server.remote_cwd_override())
                 .unwrap_or(Path::new(".")),
@@ -1167,65 +1162,21 @@ impl App {
             self.refresh_agents_overview_threads(app_server);
         }
     }
-
-    #[cfg(any(unix, windows))]
-    pub(super) fn start_agents_daemon(&self) {
-        let app_event_tx = self.app_event_tx.clone();
-        tokio::spawn(async move {
-            let result = async {
-                let current_executable =
-                    std::env::current_exe().map_err(|error| error.to_string())?;
-                let executable = if current_executable
-                    .file_stem()
-                    .and_then(std::ffi::OsStr::to_str)
-                    .is_some_and(|name| {
-                        if cfg!(windows) {
-                            name.eq_ignore_ascii_case("codex-tui")
-                        } else {
-                            name == "codex-tui"
-                        }
-                    }) {
-                    current_executable.with_file_name(if cfg!(windows) {
-                        "codex.exe"
-                    } else {
-                        "codex"
-                    })
-                } else {
-                    current_executable
-                };
-                let output = tokio::process::Command::new(executable)
-                    .args(["app-server", "daemon", "start"])
-                    .output()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                if output.status.success() {
-                    Ok(())
-                } else {
-                    let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                    Err(if message.is_empty() {
-                        format!("daemon process exited with {}", output.status)
-                    } else {
-                        message
-                    })
-                }
-            }
-            .await;
-
-            app_event_tx.send(AppEvent::AgentsDaemonStarted { result });
-        });
-    }
 }
 
 #[cfg(test)]
 #[path = "agents_overview_tests.rs"]
-mod tests;
+pub(super) mod tests;
 
 fn agents_overview_group(
     thread: &Thread,
     children: &HashMap<String, Vec<&Thread>>,
 ) -> AgentsOverviewGroup {
-    children.get(&thread.id).into_iter().flatten().fold(
-        AgentsOverviewGroup::for_status(&thread.status),
-        |group, child| group.min(agents_overview_group(child, children)),
-    )
+    children
+        .get(&thread.id)
+        .into_iter()
+        .flatten()
+        .fold(AgentsOverviewGroup::for_thread(thread), |group, child| {
+            group.min(agents_overview_group(child, children))
+        })
 }

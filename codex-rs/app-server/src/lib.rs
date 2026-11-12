@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -53,6 +54,7 @@ use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::TextPosition as AppTextPosition;
 use codex_app_server_protocol::TextRange as AppTextRange;
+use codex_app_server_transport::WebSocketCompression;
 use codex_app_server_transport::daemon_recovery_file_path;
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigLoadError;
@@ -71,6 +73,7 @@ use codex_websocket_auth::WebsocketAuthSettings;
 use codex_websocket_auth::policy_from_settings;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
@@ -103,6 +106,10 @@ mod code_mode_host;
 mod codex_home_metrics;
 mod command_exec;
 mod config_layer;
+mod startup_config;
+pub use startup_config::StartupConfigArgs;
+pub use startup_config::print_startup_config;
+
 mod config_manager;
 mod config_manager_service;
 mod connection_cleanup;
@@ -130,13 +137,17 @@ mod model_catalog;
 mod models;
 mod models_refresh_worker;
 mod notification_media;
+mod otel_config;
 mod otel_reloader;
 mod outgoing_message;
 mod plugin_config_reload;
+mod provider_reservation;
 mod request_processors;
 mod request_serialization;
 mod server_request_error;
 mod skills_watcher;
+mod startup_warnings;
+mod thread_sample;
 mod thread_state;
 mod thread_status;
 mod transport;
@@ -153,6 +164,7 @@ pub use crate::transport::AppServerTransport;
 pub use crate::transport::RemoteControlStartupMode;
 pub use crate::transport::app_server_control_socket_path;
 pub use crate::transport::take_remote_control_disabled_env;
+pub use crate::transport::verified_local_daemon_socket;
 
 const LOG_FORMAT_ENV_VAR: &str = "LOG_FORMAT";
 const OTEL_SERVICE_NAME: &str = "codex-app-server";
@@ -200,18 +212,23 @@ enum OutboundControlEvent {
 struct ShutdownState {
     requested: bool,
     forced: bool,
+    maintenance: bool,
+    draining: bool,
+    maintenance_deadline: Option<tokio::time::Instant>,
+    maintenance_reply: Option<oneshot::Sender<&'static str>>,
+    maintenance_flushed: Option<oneshot::Receiver<()>>,
     last_logged_running_turn_count: Option<usize>,
 }
 
 enum ShutdownAction {
     Noop,
     Finish,
+    ResumeServing,
 }
 
 #[derive(Clone, Copy)]
 enum ShutdownSignal {
     Forceable,
-    #[cfg(unix)]
     GracefulOnly,
 }
 
@@ -252,6 +269,39 @@ impl ShutdownState {
         self.forced
     }
 
+    fn cancel_maintenance(&mut self, turn_admission: &turn_admission::TurnAdmission) {
+        turn_admission.cancel_drain();
+        if let Some(reply) = self.maintenance_reply.take() {
+            let _ = reply.send("deferred");
+        }
+        *self = Self::default();
+        warn!("maintenance handoff abandoned; continuing to serve without interrupting work");
+    }
+
+    fn on_maintenance_request(
+        &mut self,
+        expires_at: tokio::time::Instant,
+        reply: oneshot::Sender<&'static str>,
+        flushed: oneshot::Receiver<()>,
+        turn_admission: &turn_admission::TurnAdmission,
+    ) {
+        if reply.is_closed() || tokio::time::Instant::now() >= expires_at {
+            let _ = reply.send("deferred");
+        } else if self.requested() {
+            let _ = reply.send("alreadyPending");
+        } else {
+            turn_admission.defer_goal_continuations();
+            self.requested = true;
+            self.maintenance = true;
+            self.draining = false;
+            self.last_logged_running_turn_count = None;
+            self.maintenance_deadline = Some(expires_at);
+            info!("received bounded maintenance request; continuing to serve until idle");
+            self.maintenance_reply = Some(reply);
+            self.maintenance_flushed = Some(flushed);
+        }
+    }
+
     fn on_signal(
         &mut self,
         signal: ShutdownSignal,
@@ -261,29 +311,71 @@ impl ShutdownState {
     ) {
         if self.requested {
             if matches!(signal, ShutdownSignal::Forceable) {
-                self.forced = true;
+                if self.maintenance {
+                    if let Some(reply) = self.maintenance_reply.take() {
+                        let _ = reply.send("supersededByExplicitStop");
+                    }
+                    self.maintenance_flushed = None;
+                    self.maintenance = false;
+                    self.maintenance_deadline = None;
+                    self.draining = true;
+                    turn_admission.begin_drain();
+                } else {
+                    self.forced = true;
+                }
             }
             return;
         }
 
-        turn_admission.begin_drain();
+        self.maintenance = !matches!(signal, ShutdownSignal::Forceable);
+        self.draining = !self.maintenance;
+        if self.draining {
+            turn_admission.begin_drain();
+        }
         self.requested = true;
+        if self.maintenance {
+            turn_admission.defer_goal_continuations();
+            // A maintenance caller must have a bounded deferred outcome, not a
+            // permanent pending request that exits unexpectedly hours later.
+            self.maintenance_deadline =
+                Some(tokio::time::Instant::now() + std::time::Duration::from_secs(120));
+        }
         self.last_logged_running_turn_count = None;
         info!(
-            "received shutdown signal; entering graceful restart drain (connections={}, runningAssistantTurns={}, new client turns rejected)",
-            connection_count, running_turn_count,
+            "received shutdown signal (connections={}, runningAssistantTurns={}, maintenance={}, acceptingNewTurns={})",
+            connection_count, running_turn_count, self.maintenance, !self.draining,
         );
     }
 
     fn update(
         &mut self,
-        running_turn_count: usize,
+        running_turn_count_rx: &watch::Receiver<usize>,
         active_admissions: usize,
         connection_count: usize,
+        turn_admission: &turn_admission::TurnAdmission,
     ) -> ShutdownAction {
         if !self.requested {
             return ShutdownAction::Noop;
         }
+
+        if self
+            .maintenance_deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        {
+            self.cancel_maintenance(turn_admission);
+            return ShutdownAction::ResumeServing;
+        }
+
+        if self.maintenance && !self.draining {
+            if !turn_admission.begin_idle_drain(running_turn_count_rx) {
+                return ShutdownAction::Noop;
+            }
+            self.draining = true;
+            self.maintenance_deadline =
+                Some(tokio::time::Instant::now() + std::time::Duration::from_secs(5));
+        }
+
+        let running_turn_count = *running_turn_count_rx.borrow();
 
         if self.forced || (running_turn_count == 0 && active_admissions == 0) {
             if self.forced {
@@ -473,6 +565,8 @@ pub enum PluginStartupTasks {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppServerRuntimeOptions {
+    /// Optional host-owned frozen cloud skill catalog and resources, loaded once at startup.
+    pub cloud_skills_snapshot: Option<std::path::PathBuf>,
     pub code_mode_host_transport: CodeModeHostTransport,
     pub plugin_startup_tasks: PluginStartupTasks,
     pub remote_control_startup_mode: RemoteControlStartupMode,
@@ -483,6 +577,7 @@ pub struct AppServerRuntimeOptions {
 impl Default for AppServerRuntimeOptions {
     fn default() -> Self {
         Self {
+            cloud_skills_snapshot: None,
             code_mode_host_transport: CodeModeHostTransport::Local,
             plugin_startup_tasks: PluginStartupTasks::Start,
             remote_control_startup_mode: RemoteControlStartupMode::ResolvePersisted,
@@ -504,6 +599,18 @@ pub async fn run_main_with_transport_options(
     auth: WebsocketAuthSettings,
     runtime_options: AppServerRuntimeOptions,
 ) -> IoResult<AppServerExit> {
+    let cloud_skill_provider = match runtime_options.cloud_skills_snapshot {
+        Some(path) => {
+            let provider = tokio::task::spawn_blocking(move || {
+                codex_skills_extension::FrozenCloudSkillProvider::from_file(&path)
+            })
+            .await
+            .map_err(std::io::Error::other)?
+            .map_err(|err| std::io::Error::new(ErrorKind::InvalidInput, err))?;
+            Some(Arc::new(provider) as Arc<dyn codex_skills_extension::SkillProvider>)
+        }
+        None => None,
+    };
     #[cfg(target_os = "windows")]
     let _registered_core = codex_windows_sandbox::registered_core_requested();
     let managed_daemon = matches!(&transport, AppServerTransport::UnixSocket { .. })
@@ -544,21 +651,12 @@ pub async fn run_main_with_transport_options(
         arg0_paths.clone(),
         Arc::new(NoopThreadConfigLoader),
     );
-    let bootstrap_config = config_manager
-        .load_startup_config(startup_cwd.clone())
+    let startup = config_manager
+        .load_managed_startup_config(startup_cwd.clone())
         .await?;
-    let bootstrap_auth =
-        AuthManager::shared_from_config(&bootstrap_config, /*enable_codex_api_key_env*/ false)
-            .await
-            .map_err(std::io::Error::other)?;
-    config_manager.replace_cloud_config_bundle_loader(
-        bootstrap_auth,
-        bootstrap_config.chatgpt_base_url.clone(),
-        bootstrap_config.http_client_factory(),
-    );
     let mut config_warnings = Vec::new();
     let mut plugin_startup_config = PluginStartupConfig::Current;
-    let config = match config_manager.load_latest_config(startup_cwd).await {
+    let config = match startup.config {
         Ok(config) => config,
         Err(err) if is_unsupported_untrusted_approval_policy_error(&err) => {
             return Err(err);
@@ -585,11 +683,7 @@ pub async fn run_main_with_transport_options(
         AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false)
             .await
             .map_err(std::io::Error::other)?;
-    config_manager.replace_cloud_config_bundle_loader(
-        auth_manager.clone(),
-        config.chatgpt_base_url.clone(),
-        config.http_client_factory(),
-    );
+    config_manager.update_managed_config_loader(auth_manager.clone(), &config);
     config_manager
         .sync_default_client_residency_requirement()
         .await;
@@ -720,12 +814,12 @@ pub async fn run_main_with_transport_options(
     let stderr_fmt: StderrLogLayer = match log_format_from_env() {
         LogFormat::Json => tracing_subscriber::fmt::layer()
             .json()
-            .with_writer(std::io::stderr)
+            .with_writer(codex_app_server_daemon::stderr_writer)
             .with_span_events(stderr_span_events())
             .with_filter(EnvFilter::from_default_env())
             .boxed(),
         LogFormat::Default => tracing_subscriber::fmt::layer()
-            .with_writer(std::io::stderr)
+            .with_writer(codex_app_server_daemon::stderr_writer)
             .with_span_events(stderr_span_events())
             .with_filter(EnvFilter::from_default_env())
             .boxed(),
@@ -790,6 +884,14 @@ pub async fn run_main_with_transport_options(
     let remote_control_shutdown_token = transport_shutdown_token.child_token();
     let mut transport_accept_handles = Vec::<JoinHandle<()>>::new();
 
+    let websocket_compression = if config
+        .features
+        .enabled(Feature::AppServerWebSocketCompression)
+    {
+        WebSocketCompression::Zstd
+    } else {
+        WebSocketCompression::Plain
+    };
     let single_client_mode = matches!(&transport, AppServerTransport::Stdio);
     let graceful_signal_restart_enabled =
         runtime_options.install_shutdown_signal_handler && !single_client_mode;
@@ -817,9 +919,12 @@ pub async fn run_main_with_transport_options(
                         .is_some()
                 {
                     DaemonShutdownAccess::Managed
+                } else if managed_daemon {
+                    DaemonShutdownAccess::MaintenanceOnly
                 } else {
                     DaemonShutdownAccess::Disabled
                 },
+                websocket_compression,
             )
             .await?;
             transport_accept_handles.push(accept_handle);
@@ -830,6 +935,7 @@ pub async fn run_main_with_transport_options(
                 transport_event_tx.clone(),
                 transport_shutdown_token.clone(),
                 policy_from_settings(&auth)?,
+                websocket_compression,
             )
             .await?;
             transport_accept_handles.push(accept_handle);
@@ -983,17 +1089,21 @@ pub async fn run_main_with_transport_options(
         let auth_manager = Arc::clone(&auth_manager);
         let initialize_notification_sender = outgoing_message_sender.clone();
         let outbound_control_tx = outbound_control_tx;
+        let (startup_warnings_tx, mut startup_warnings_rx) = mpsc::unbounded_channel();
         let mut processor = MessageProcessor::new(MessageProcessorArgs {
+            cloud_skill_provider,
             outgoing: outgoing_message_sender,
             analytics_events_client,
             arg0_paths,
             config: Arc::new(config),
+            startup_cwd,
             config_manager,
             environment_manager,
             feedback: feedback.clone(),
             log_db,
             state_db: state_db.clone(),
             config_warnings,
+            startup_warnings_tx,
             session_source,
             user_verification: Arc::new(crate::user_verification::Service::new(Arc::clone(
                 &auth_manager,
@@ -1039,18 +1149,24 @@ pub async fn run_main_with_transport_options(
             };
             let mut listen_for_threads = true;
             // Keep force signals and daemon control events responsive while saving.
-            let mut snapshot = Box::pin(async {
+            let make_snapshot = |path, maintenance| {
                 let processor = Arc::clone(&processor);
-                let recovery_file = recovery_file.clone();
-                // Run independently: snapshot locks can require the event loop to make progress.
-                let task = tokio::spawn(async move {
-                    let saved = processor.daemon_recovery_snapshot().await;
-                    if let Err(err) = daemon_thread_recovery::snapshot(recovery_file, saved).await {
-                        warn!("failed to save threads during daemon shutdown: {err}");
-                    }
-                });
-                let _ = tokio_util::task::AbortOnDropHandle::new(task).await;
-            });
+                Box::pin(async move {
+                    // Run independently: snapshot locks can require the event loop to make progress.
+                    let task = tokio::spawn(async move {
+                        let saved = processor.daemon_recovery_snapshot(maintenance).await?;
+                        daemon_thread_recovery::snapshot(path, saved).await
+                    });
+                    tokio_util::task::AbortOnDropHandle::new(task)
+                        .await
+                        .map_err(std::io::Error::other)?
+                })
+            };
+            let mut snapshot = make_snapshot(recovery_file.clone(), false);
+            let mut snapshot_started = false;
+            let mut snapshot_is_maintenance = false;
+            let mut snapshot_attempt = 0_u64;
+            let mut snapshot_file = recovery_file.clone();
             let mut snapshot_finished = !managed_daemon;
             let mut clients_disconnected = false;
             let mut shutdown_state = ShutdownState::default();
@@ -1059,23 +1175,57 @@ pub async fn run_main_with_transport_options(
                 // Sample submissions first: one can publish a running turn before
                 // releasing its permit, and shutdown must observe that new turn.
                 let active_admissions = *active_admissions_rx.borrow_and_update();
-                let running_turn_count = *running_turn_count_rx.borrow_and_update();
-                let ready_to_exit = matches!(
-                    shutdown_state.update(running_turn_count, active_admissions, connections.len()),
-                    ShutdownAction::Finish
+                let _ = running_turn_count_rx.borrow_and_update();
+                let action = shutdown_state.update(
+                    &running_turn_count_rx,
+                    active_admissions,
+                    connections.len(),
+                    &processor.turn_admission,
                 );
+                if matches!(action, ShutdownAction::ResumeServing) {
+                    // Dropping the future aborts its async task. A late filesystem
+                    // writer can only touch this attempt's private staging file,
+                    // never publish an abandoned continuation for a later restart.
+                    snapshot = make_snapshot(recovery_file.clone(), false);
+                    snapshot_started = false;
+                }
+                let ready_to_exit = matches!(action, ShutdownAction::Finish);
+                if shutdown_state.draining && !snapshot_started {
+                    snapshot_attempt += 1;
+                    snapshot_is_maintenance = shutdown_state.maintenance;
+                    snapshot_file = if snapshot_is_maintenance {
+                        recovery_file.with_extension(format!(
+                            "maintenance-{}-{snapshot_attempt}",
+                            std::process::id()
+                        ))
+                    } else {
+                        recovery_file.clone()
+                    };
+                    snapshot = make_snapshot(snapshot_file.clone(), snapshot_is_maintenance);
+                    snapshot_started = true;
+                }
                 if ready_to_exit {
-                    if let Some(task) = &recovery_task {
-                        task.abort();
-                    }
                     let finished = snapshot_finished || shutdown_state.forced();
                     if finished {
+                        if let Some(reply) = shutdown_state.maintenance_reply.take() {
+                            let _ = reply.send("handoffReady");
+                            if let Some(flushed) = shutdown_state.maintenance_flushed.take() {
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_secs(2),
+                                    flushed,
+                                )
+                                .await;
+                            }
+                        }
+                        if let Some(task) = &recovery_task {
+                            task.abort();
+                        }
                         transport_shutdown_token.cancel();
                     }
                     if managed_daemon && shutdown_state.forced() {
                         break "forced_shutdown_requested";
                     }
-                    if !clients_disconnected {
+                    if !clients_disconnected && (finished || !shutdown_state.maintenance) {
                         let _ = outbound_control_tx
                             .send(OutboundControlEvent::DisconnectAll)
                             .await;
@@ -1087,8 +1237,36 @@ pub async fn run_main_with_transport_options(
                 }
 
                 tokio::select! {
-                    _ = &mut snapshot, if shutdown_state.requested() && active_admissions == 0 && !snapshot_finished => {
+                    result = &mut snapshot, if shutdown_state.draining && active_admissions == 0 && !snapshot_finished => {
+                        // A ready writer and timer can become runnable together.
+                        // Deadline expiry still wins before publishing recovery.
+                        if shutdown_state.maintenance && shutdown_state.maintenance_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                            shutdown_state.cancel_maintenance(&processor.turn_admission);
+                            snapshot = make_snapshot(recovery_file.clone(), false);
+                            snapshot_started = false;
+                            continue;
+                        }
+                        let result = result.and_then(|()| {
+                            if snapshot_is_maintenance {
+                                std::fs::rename(&snapshot_file, &recovery_file)
+                            } else {
+                                Ok(())
+                            }
+                        });
+                        if let Err(err) = result {
+                            warn!("failed to save threads during daemon shutdown: {err}");
+                            if shutdown_state.maintenance {
+                                shutdown_state.cancel_maintenance(&processor.turn_admission);
+                                snapshot = make_snapshot(recovery_file.clone(), false);
+                                snapshot_started = false;
+                                continue;
+                            }
+                        }
                         snapshot_finished = true;
+                        shutdown_state.maintenance_deadline = None;
+                    }
+                    _ = tokio::time::sleep_until(shutdown_state.maintenance_deadline.unwrap_or_else(tokio::time::Instant::now)), if shutdown_state.maintenance_deadline.is_some() && !snapshot_finished => {
+                        // The next update abandons the handoff and reopens admission.
                     }
                     shutdown_signal_result = &mut shutdown_signal_future, if graceful_signal_restart_enabled && !shutdown_state.forced() => {
                         shutdown_signal_future.set(shutdown_signal());
@@ -1116,13 +1294,16 @@ pub async fn run_main_with_transport_options(
                         let Some(event) = event else {
                             break "transport_channel_closed";
                         };
-                        if ready_to_exit && !matches!(event, TransportEvent::DaemonShutdown) {
+                        if ready_to_exit && !shutdown_state.maintenance && !matches!(event, TransportEvent::DaemonShutdown) {
                             if let TransportEvent::ConnectionOpened { disconnect_sender: Some(token), .. } = event {
                                 token.cancel();
                             }
                             continue;
                         }
                         match event {
+                            TransportEvent::DaemonMaintenance { expires_at, reply, flushed } => {
+                                shutdown_state.on_maintenance_request(expires_at, reply, flushed, &processor.turn_admission);
+                            }
                             TransportEvent::DaemonShutdown => {
                                 shutdown_state.on_signal(ShutdownSignal::Forceable, connections.len(), *running_turn_count_rx.borrow(), &processor.turn_admission);
                             }
@@ -1274,6 +1455,9 @@ pub async fn run_main_with_transport_options(
                                 }
                             }
                         }
+                    }
+                    Some(message) = startup_warnings_rx.recv(), if connections.values().any(|state| state.session.initialized()) => {
+                        startup_warnings::send_warning(&initialize_notification_sender, message).await;
                     }
                     _ = connection_cleanup_tasks.reap_next() => {}
                     result = thread_listener_tasks.join_next(), if !thread_listener_tasks.is_empty() => {
@@ -1496,10 +1680,8 @@ fn sqlite_recovery_notice(
 fn emit_state_db_backup_warning(message: &str) {
     warn!("{message}");
     if !tracing::dispatcher::has_been_set() {
-        #[allow(clippy::print_stderr)]
-        {
-            eprintln!("{message}");
-        }
+        let _ =
+            codex_app_server_daemon::stderr_writer().write_all(format!("{message}\n").as_bytes());
     }
 }
 
@@ -1550,87 +1732,5 @@ fn analytics_rpc_transport(transport: &AppServerTransport) -> AppServerRpcTransp
 }
 
 #[cfg(test)]
-#[path = "stderr_logging_tests.rs"]
-mod stderr_logging_tests;
-
-#[cfg(test)]
-mod tests {
-    use super::LogFormat;
-    use super::ShutdownAction;
-    use super::ShutdownSignal;
-    use super::ShutdownState;
-    #[cfg(debug_assertions)]
-    use super::loader_overrides_with_test_user_config_file;
-    use super::turn_admission::TurnAdmission;
-    #[cfg(debug_assertions)]
-    use codex_config::LoaderOverrides;
-    #[cfg(debug_assertions)]
-    use codex_utils_absolute_path::AbsolutePathBuf;
-    use pretty_assertions::assert_eq;
-
-    #[test]
-    fn shutdown_waits_for_admitted_requests_but_force_remains_available() {
-        let admission = TurnAdmission::default();
-        let active = admission.subscribe_active();
-        let in_flight = admission.admit().expect("request admitted");
-        let mut shutdown = ShutdownState::default();
-        let connection_count = 1;
-        let running_turn_count = 0;
-        shutdown.on_signal(
-            ShutdownSignal::Forceable,
-            connection_count,
-            running_turn_count,
-            &admission,
-        );
-        assert!(matches!(
-            shutdown.update(running_turn_count, *active.borrow(), connection_count),
-            ShutdownAction::Noop
-        ));
-        shutdown.on_signal(
-            ShutdownSignal::Forceable,
-            connection_count,
-            running_turn_count,
-            &admission,
-        );
-        assert!(shutdown.forced());
-        assert!(matches!(
-            shutdown.update(running_turn_count, *active.borrow(), connection_count),
-            ShutdownAction::Finish
-        ));
-        drop(in_flight);
-    }
-
-    #[test]
-    fn log_format_from_env_value_matches_json_values_case_insensitively() {
-        assert_eq!(LogFormat::from_env_value(Some("json")), LogFormat::Json);
-        assert_eq!(LogFormat::from_env_value(Some("JSON")), LogFormat::Json);
-        assert_eq!(LogFormat::from_env_value(Some("  Json  ")), LogFormat::Json);
-    }
-
-    #[test]
-    fn log_format_from_env_value_defaults_for_non_json_values() {
-        assert_eq!(
-            LogFormat::from_env_value(/*value*/ None),
-            LogFormat::Default
-        );
-        assert_eq!(LogFormat::from_env_value(Some("")), LogFormat::Default);
-        assert_eq!(LogFormat::from_env_value(Some("text")), LogFormat::Default);
-        assert_eq!(LogFormat::from_env_value(Some("jsonl")), LogFormat::Default);
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn debug_test_user_config_file_overrides_loader_path() {
-        let path = std::env::temp_dir().join("codex-app-server-test-config.toml");
-        let loader_overrides = loader_overrides_with_test_user_config_file(
-            LoaderOverrides::default(),
-            Some(path.clone()),
-        )
-        .expect("test config path should be valid");
-
-        assert_eq!(
-            loader_overrides.user_config_path,
-            Some(AbsolutePathBuf::from_absolute_path(path).expect("absolute test path"))
-        );
-    }
-}
+#[path = "lib_tests.rs"]
+mod tests;

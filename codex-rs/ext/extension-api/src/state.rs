@@ -24,6 +24,11 @@ impl ExtensionDataInit {
         Self::default()
     }
 
+    /// Whether this initializer has no opaque host-owned attachments.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Stores `value` as the initial attachment of type `T`.
     pub fn insert<T>(&mut self, value: T) -> Option<Arc<T>>
     where
@@ -32,6 +37,11 @@ impl ExtensionDataInit {
         self.entries
             .insert(TypeId::of::<T>(), Arc::new(value))
             .map(downcast_data)
+    }
+
+    /// Consumes a startup-only attachment before creating the live scope.
+    pub fn remove<T: Any + Send + Sync>(&mut self) -> Option<Arc<T>> {
+        self.entries.remove(&TypeId::of::<T>()).map(downcast_data)
     }
 
     /// Returns a host-supplied initial attachment without creating a mutable scope.
@@ -99,8 +109,16 @@ impl ExtensionData {
     where
         T: Any + Send + Sync,
     {
+        self.insert_arc(Arc::new(value))
+    }
+
+    /// Stores a shared attachment without cloning its contents.
+    pub fn insert_arc<T>(&self, value: Arc<T>) -> Option<Arc<T>>
+    where
+        T: Any + Send + Sync,
+    {
         self.entries()
-            .insert(TypeId::of::<T>(), Arc::new(value))
+            .insert(TypeId::of::<T>(), value)
             .map(downcast_data)
     }
 

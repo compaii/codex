@@ -76,7 +76,7 @@ pub(crate) async fn load_project_instructions(
             .permission_profile()
             .file_system_sandbox_policy()
             .has_full_disk_read_access())
-        .then(|| turn_environment.sandbox_context(/*additional_permissions*/ None));
+        .then(|| turn_environment.sandbox_context());
         match read_agents_md(
             config,
             filesystem.as_ref(),
@@ -300,10 +300,10 @@ fn candidate_filenames<'a>(config: &'a Config, cwd: &PathUri) -> Vec<&'a str> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LoadedAgentsMd {
     /// Account- or home-scoped instructions supplied by the host.
-    user_instructions: Option<Instructions>,
+    pub(crate) user_instructions: Option<Instructions>,
 
     /// Thread-scoped instructions supplied by the host.
-    thread_instructions: Option<Instructions>,
+    pub(crate) thread_instructions: Option<Instructions>,
 
     /// Ordered instructions and their provenance.
     entries: Vec<InstructionEntry>,

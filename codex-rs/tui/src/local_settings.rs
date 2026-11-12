@@ -7,7 +7,6 @@
 //! Effective animations also respect the TUI host's launch-time accessibility preference.
 //! The selected transcript ownership and alternate-screen restrictions survive local reloads.
 
-use crate::config_panel::ConfigToggle;
 use crate::legacy_core::config::Config;
 use crate::legacy_core::config::ConfigTomlLoadResult;
 use crate::legacy_core::config::TerminalResizeReflowConfig;
@@ -85,6 +84,7 @@ impl LocalSettings {
                 agents_overview_grouping: config.tui_agents_overview_grouping,
                 resume_cwd: config.tui_resume_cwd,
                 keymap: config.tui_keymap.clone(),
+                quick_dials: config.tui_quick_dials.clone(),
                 model_availability_nux: config.model_availability_nux.clone(),
                 terminal_resize_reflow_max_rows: match config.terminal_resize_reflow.max_rows {
                     TerminalResizeReflowMaxRows::Auto => None,
@@ -208,7 +208,13 @@ impl LocalSettings {
         let mut settings = Self::from(config);
         settings.transcript_mode = self.transcript_mode;
         settings.tui.alternate_screen = self.tui.alternate_screen;
-        ConfigToggle::preserve_restart_required(&mut settings.tui, &self.tui);
+        // Generic reloads do not update these values in the live UI. The config panel updates
+        // both copies when the user changes one.
+        settings.tui.animations = self.tui.animations;
+        settings.tui.auto_recap = self.tui.auto_recap;
+        settings.tui.effects.starfield = self.tui.effects.starfield;
+        settings.tui.disable_paste_burst = self.tui.disable_paste_burst;
+        settings.tui.show_tooltips = self.tui.show_tooltips;
         settings
     }
 
@@ -245,6 +251,7 @@ impl LocalSettings {
                         | TerminalName::Iterm2
                         | TerminalName::WarpTerminal
                         | TerminalName::WezTerm
+                        | TerminalName::Rex
                         | TerminalName::Alacritty
                         | TerminalName::Konsole
                         | TerminalName::GnomeTerminal

@@ -7,6 +7,8 @@ use app_test_support::create_mock_responses_server_sequence;
 use codex_app_server_protocol::ConfigBatchWriteParams;
 use codex_app_server_protocol::ConfigEdit;
 use codex_app_server_protocol::ConfigWriteResponse;
+use codex_app_server_protocol::HookEventName;
+use codex_app_server_protocol::HookSource;
 use codex_app_server_protocol::HooksListParams;
 use codex_app_server_protocol::HooksListResponse;
 use codex_app_server_protocol::MergeStrategy;
@@ -111,10 +113,17 @@ command_windows = """Write-Output '{"continue":false}'"""
         let list = mcp
             .send_hooks_list_request(HooksListParams {
                 cwds: vec![codex_home.path().to_path_buf()],
+                ..Default::default()
             })
             .await?;
         let HooksListResponse { data } = mcp.read_response(list).await?;
-        let hook = &data[0].hooks[0];
+        let hook = data[0]
+            .hooks
+            .iter()
+            .find(|hook| {
+                hook.source == HookSource::User && hook.event_name == HookEventName::PreCompact
+            })
+            .expect("user config should register the pre-compact hook");
         let trust = mcp
             .send_config_batch_write_request(ConfigBatchWriteParams {
                 edits: vec![ConfigEdit {
@@ -174,5 +183,117 @@ command_windows = """Write-Output '{"continue":false}'"""
     })
     .await??;
     server.verify().await;
+    Ok(())
+}
+
+/// A configured checkpoint leaves the native thread available without changing the goal.
+/// A direct human turn supersedes the waiting continuation; a later pause cancels its effect.
+#[test_case::test_case(false; "automatic_after_checkpoint")]
+#[test_case::test_case(true; "human_input_supersedes_checkpoint")]
+#[tokio::test]
+async fn goal_checkpoint_yields_without_pausing_or_blocking_human_input(human: bool) -> Result<()> {
+    let scripts = (1..=3)
+        .map(|i| {
+            responses::sse(vec![
+                responses::ev_response_created(&format!("checkpoint-{i}")),
+                responses::ev_assistant_message(&format!("progress-{i}"), "Useful progress saved"),
+                responses::ev_completed(&format!("checkpoint-{i}")),
+            ])
+        })
+        .collect();
+    let server = create_mock_responses_server_sequence(scripts).await;
+    let home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri())
+        .with_model("gpt-5.4")
+        .enable_feature(Feature::Goals)
+        .write(home.path())?;
+    let mut app = TestAppServer::builder()
+        .with_codex_home(home.path())
+        .without_managed_config()
+        .build_initialized()
+        .await?;
+    let request = app
+        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
+        .await?;
+    let ThreadStartResponse { thread, .. } = app.read_response(request).await?;
+    // Empty threads have no persisted rollout: seed one genuine mock turn first.
+    let request=app.send_raw_request("turn/start",Some(json!({"threadId":thread.id,"input":[{"type":"text","text":"Seed durable checkpoint fixture","text_elements":[]}]}))).await?;
+    let _: serde_json::Value = app.read_response(request).await?;
+    let _: TurnCompletedNotification = timeout(
+        Duration::from_secs(30),
+        app.read_notification("turn/completed"),
+    )
+    .await??;
+    app.shutdown_gracefully().await?;
+    MockResponsesConfig::new(&server.uri())
+        .with_model("gpt-5.4")
+        .enable_feature(Feature::Goals)
+        .with_extra_config(&format!(
+            "[goals.continuation_idle_seconds]\n\"{}\" = 3\n",
+            thread.id
+        ))
+        .write(home.path())?;
+    let mut app = TestAppServer::builder()
+        .with_codex_home(home.path())
+        .without_managed_config()
+        .build_initialized()
+        .await?;
+    let request = app
+        .send_raw_request("thread/resume", Some(json!({"threadId":thread.id})))
+        .await?;
+    let _: serde_json::Value = app.read_response(request).await?;
+    let request=app.send_raw_request("thread/goal/set",Some(json!({"threadId":thread.id,"objective":"Preserve the goal while yielding","tokenBudget":100000}))).await?;
+    let before: ThreadGoalSetResponse = app.read_response(request).await?;
+    let _: TurnCompletedNotification = timeout(
+        Duration::from_secs(30),
+        app.read_notification("turn/completed"),
+    )
+    .await??;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .expect("mock requests")
+            .len(),
+        2
+    );
+    if human {
+        let request=app.send_raw_request("turn/start",Some(json!({"threadId":thread.id,"input":[{"type":"text","text":"Direct human steering","text_elements":[]}]}))).await?;
+        let _: serde_json::Value =
+            timeout(Duration::from_secs(1), app.read_response(request)).await??;
+    }
+    let _: TurnCompletedNotification = timeout(
+        Duration::from_secs(30),
+        app.read_notification("turn/completed"),
+    )
+    .await??;
+    let request = app
+        .send_raw_request("thread/goal/snapshot", Some(json!({"threadId":thread.id})))
+        .await?;
+    let snapshot: codex_app_server_protocol::ThreadGoalSnapshotResponse =
+        app.read_response(request).await?;
+    let goal = snapshot.goal.expect("goal retained");
+    assert_eq!(goal.status, ThreadGoalStatus::Active);
+    assert_eq!(goal.objective, before.goal.objective);
+    assert_eq!(goal.token_budget, before.goal.token_budget);
+    assert_eq!(goal.created_at, before.goal.created_at);
+    let request = app
+        .send_raw_request(
+            "thread/goal/set",
+            Some(json!({"threadId":thread.id,"status":"paused","origin":"user"})),
+        )
+        .await?;
+    let _: ThreadGoalSetResponse = app.read_response(request).await?;
+    tokio::time::sleep(Duration::from_millis(3300)).await;
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .expect("mock requests")
+            .len(),
+        3
+    );
+    app.shutdown_gracefully().await?;
     Ok(())
 }

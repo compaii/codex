@@ -378,6 +378,55 @@ fn managed_mitm_ca_bundle_becomes_readable_for_restricted_sandbox() {
 }
 
 #[cfg(target_os = "linux")]
+#[test]
+fn filesystem_bootstrap_role_preserves_raw_and_legacy_launches() {
+    let cwd = AbsolutePathBuf::current_dir().expect("current dir");
+    let cwd_uri = PathUri::from_abs_path(&cwd);
+    for (helper, legacy) in [(false, false), (false, true), (true, false), (true, true)] {
+        let manager = if helper {
+            SandboxManager::for_file_system_helpers()
+        } else {
+            SandboxManager::new()
+        };
+        let request = manager
+            .transform(SandboxTransformRequest {
+                command: SandboxCommand {
+                    program: "true".into(),
+                    args: Vec::new(),
+                    cwd: cwd_uri.clone(),
+                    env: HashMap::new(),
+                    managed_network: None,
+                    additional_permissions: None,
+                },
+                permissions: &PermissionProfile::Disabled,
+                sandbox: SandboxType::LinuxSeccomp,
+                enforce_managed_network: false,
+                environment_id: None,
+                network: None,
+                sandbox_policy_cwd: &cwd_uri,
+                sandbox_exe: Some(std::path::Path::new("/tmp/codex-linux-sandbox")),
+                use_legacy_landlock: legacy,
+                windows_sandbox_level: WindowsSandboxLevel::Disabled,
+            })
+            .expect("transform");
+        assert_eq!(
+            request
+                .command
+                .iter()
+                .any(|arg| arg == "--trusted-file-system-helper"),
+            helper && !legacy,
+        );
+        assert_eq!(
+            request
+                .command
+                .iter()
+                .any(|arg| arg == "--use-legacy-landlock"),
+            legacy,
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn transform_linux_seccomp_request(
     codex_linux_sandbox_exe: &std::path::Path,
     mode: crate::LinuxSandboxPidNamespace,

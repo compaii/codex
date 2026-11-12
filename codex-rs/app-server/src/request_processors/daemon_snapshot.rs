@@ -12,7 +12,10 @@ impl ThreadRequestProcessor {
         clippy::await_holding_invalid_type,
         reason = "snapshot selection must be serialized against pending unloads"
     )]
-    pub(crate) async fn daemon_recovery_snapshot(&self) -> RecoverySnapshot {
+    pub(crate) async fn daemon_recovery_snapshot(
+        &self,
+        maintenance: bool,
+    ) -> std::io::Result<RecoverySnapshot> {
         let mut snapshot = RecoverySnapshot::default();
         for thread_id in self.thread_manager.list_thread_ids().await {
             let pending_unloads = self.pending_thread_unloads.lock().await;
@@ -28,11 +31,24 @@ impl ThreadRequestProcessor {
                 && !config.session_source.is_non_root_agent()
             {
                 let interrupted = thread.interrupted_turn().await;
+                // A Core lifecycle may have finished before its terminal event
+                // is durable. Maintenance abandons this attempt rather than
+                // manufacturing an interrupted continuation at an idle handoff.
+                if maintenance && interrupted.is_some() {
+                    return Err(std::io::Error::other(
+                        "maintenance root is not durably idle",
+                    ));
+                }
                 if let Err(err) = self
                     .thread_store
                     .persist_thread(thread_id, PersistContext::Standard)
                     .await
                 {
+                    if maintenance {
+                        return Err(std::io::Error::other(format!(
+                            "maintenance root persistence failed: {err}"
+                        )));
+                    }
                     warn!(%thread_id, %err, "skipping daemon restore for thread that could not be persisted");
                     continue;
                 }
@@ -51,6 +67,6 @@ impl ThreadRequestProcessor {
                 }
             }
         }
-        snapshot
+        Ok(snapshot)
     }
 }

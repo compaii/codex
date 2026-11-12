@@ -129,10 +129,11 @@ pub(crate) use super::approvals::ApprovalAction;
 pub(crate) struct PermissionRequestPayload {
     pub tool_name: HookToolName,
     pub tool_input: serde_json::Value,
+    pub tool_cwd: Option<PathUri>,
 }
 
 impl PermissionRequestPayload {
-    pub(crate) fn bash(command: String, description: Option<String>) -> Self {
+    pub(crate) fn bash(command: String, description: Option<String>, cwd: PathUri) -> Self {
         let mut tool_input = serde_json::Map::new();
         tool_input.insert("command".to_string(), serde_json::Value::String(command));
         if let Some(description) = description {
@@ -145,6 +146,7 @@ impl PermissionRequestPayload {
         Self {
             tool_name: HookToolName::bash(),
             tool_input: serde_json::Value::Object(tool_input),
+            tool_cwd: Some(cwd),
         }
     }
 }
@@ -168,6 +170,8 @@ pub(crate) enum ExecApprovalRequirement {
         /// See core/src/exec_policy.rs for more details on how proposed_execpolicy_amendment is determined.
         proposed_execpolicy_amendment: Option<ExecPolicyAmendment>,
     },
+    /// A fresh human decision is required for each execution attempt.
+    NeedsHumanApproval { reason: Option<String> },
     /// Execution forbidden for this tool call.
     Forbidden { reason: String },
 }
@@ -399,6 +403,7 @@ pub(crate) trait ToolRuntime<Req, Out>: Approvable<Req> + Sandboxable {
 }
 
 pub(crate) struct SandboxAttempt<'a> {
+    pub permission_ceiling: Option<&'a codex_protocol::models::PermissionProfile>,
     pub sandbox_override: SandboxOverride,
     pub sandbox: SandboxType,
     /// Whether policy requested sandboxing, independent of this host's concrete wrapper.
@@ -464,6 +469,23 @@ pub(crate) fn configured_windows_sandbox_selection(
 }
 
 impl<'a> SandboxAttempt<'a> {
+    pub(crate) fn cap_permissions(
+        &self,
+        effective: codex_protocol::models::PermissionProfile,
+    ) -> Result<codex_protocol::models::PermissionProfile, CodexErr> {
+        match self.permission_ceiling {
+            None => Ok(effective),
+            Some(ceiling) => codex_protocol::intersect_effective_permission_profiles(
+                ceiling,
+                &effective,
+                &self.sandbox_cwd.to_abs_path()?,
+            )
+            .map_err(|error| {
+                CodexErr::InvalidRequest(format!("cannot enforce host permission ceiling: {error}"))
+            }),
+        }
+    }
+
     /// Whether this attempt bypasses sandboxing required by its ambient policy.
     /// Use the requested policy, not the controller's wrapper, for remote executors.
     pub(crate) fn is_escalated(&self) -> bool {
@@ -479,8 +501,14 @@ impl<'a> SandboxAttempt<'a> {
         &'b self,
         fallback: Option<&'b NetworkProxy>,
     ) -> Option<&'b NetworkProxy> {
-        // Execution-only proxies need no fallback; offline attempts must not revive one.
-        if self.enforce_managed_network {
+        // Apply the host ceiling before credential/snapshot preparation, not only
+        // when the final sandbox request is built. Neither a retained execution
+        // proxy nor the thread fallback may restore an offline turn's broker.
+        if self.enforce_managed_network
+            && self
+                .permission_ceiling
+                .is_none_or(|ceiling| ceiling.network_sandbox_policy().is_enabled())
+        {
             self.network_proxy.or(fallback)
         } else {
             None
@@ -489,19 +517,45 @@ impl<'a> SandboxAttempt<'a> {
 
     pub async fn env_for(
         &self,
-        command: SandboxCommand,
+        mut command: SandboxCommand,
         options: ExecOptions,
         network: Option<&NetworkProxy>,
         environment_id: Option<&str>,
     ) -> Result<crate::sandboxing::ExecRequest, CodexErr> {
-        let network = self.network_proxy(network);
+        if self.permission_ceiling.is_some()
+            && (!self.sandbox_requested
+                || self.sandbox == SandboxType::None
+                || self.sandbox_override != SandboxOverride::NoOverride)
+        {
+            return Err(CodexErr::InvalidRequest(
+                "host permission ceiling requires a managed sandbox without override".into(),
+            ));
+        }
+        let network_allowed = self
+            .permission_ceiling
+            .is_none_or(|ceiling| ceiling.network_sandbox_policy().is_enabled());
+        let network = network_allowed
+            .then(|| self.network_proxy(network))
+            .flatten();
+        let permissions = self
+            .permission_ceiling
+            .map(|_| {
+                self.cap_permissions(effective_permission_profile(
+                    self.permissions,
+                    command.additional_permissions.as_ref(),
+                ))
+            })
+            .transpose()?;
+        if self.permission_ceiling.is_some() {
+            command.additional_permissions = None;
+        }
         let mut request = self
             .manager
             .transform(SandboxTransformRequest {
                 command,
-                permissions: self.permissions,
+                permissions: permissions.as_ref().unwrap_or(self.permissions),
                 sandbox: self.sandbox,
-                enforce_managed_network: self.enforce_managed_network,
+                enforce_managed_network: self.enforce_managed_network && network_allowed,
                 environment_id,
                 network,
                 sandbox_policy_cwd: self.sandbox_cwd,
@@ -522,14 +576,31 @@ impl<'a> SandboxAttempt<'a> {
 
     pub async fn env_for_exec_server(
         &self,
-        command: SandboxCommand,
+        mut command: SandboxCommand,
         options: ExecOptions,
     ) -> Result<crate::sandboxing::ExecRequest, CodexErr> {
+        if self.permission_ceiling.is_some()
+            && (!self.sandbox_requested || self.sandbox_override != SandboxOverride::NoOverride)
+        {
+            return Err(CodexErr::InvalidRequest(
+                "host permission ceiling requires executor sandbox enforcement without override"
+                    .into(),
+            ));
+        }
+        if self
+            .permission_ceiling
+            .is_some_and(|ceiling| !ceiling.network_sandbox_policy().is_enabled())
+        {
+            command.managed_network = None;
+        }
         let managed_network = command.managed_network.clone();
-        let exec_server_permissions = effective_permission_profile(
+        let exec_server_permissions = self.cap_permissions(effective_permission_profile(
             self.exec_server_permissions,
             command.additional_permissions.as_ref(),
-        );
+        ))?;
+        if self.permission_ceiling.is_some() {
+            command.additional_permissions = None;
+        }
         let mut request = self
             .manager
             .transform(SandboxTransformRequest {

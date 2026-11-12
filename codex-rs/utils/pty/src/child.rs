@@ -27,6 +27,17 @@ pub struct Child {
     pub stderr: Option<ChildStderr>,
 }
 
+impl From<tokio::process::Child> for Child {
+    fn from(mut child: tokio::process::Child) -> Self {
+        Self {
+            stdin: child.stdin.take(),
+            stdout: child.stdout.take(),
+            stderr: child.stderr.take(),
+            inner: ChildKind::Tokio(child),
+        }
+    }
+}
+
 pub(super) enum ChildKind {
     Tokio(tokio::process::Child),
     #[cfg(unix)]
@@ -99,6 +110,20 @@ impl Child {
             stdout: output,
             stderr: diagnostic,
         })
+    }
+
+    /// Signal the owned direct child without relinquishing reaping ownership.
+    pub fn start_kill(&mut self) -> io::Result<()> {
+        match &mut self.inner {
+            ChildKind::Tokio(child) => child.start_kill(),
+            #[cfg(unix)]
+            ChildKind::TokioReapOnly { child, .. } => child
+                .as_mut()
+                .ok_or_else(|| io::Error::other("child already transferred to reaper"))?
+                .start_kill(),
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            ChildKind::Native(child) => child.start_kill(),
+        }
     }
 
     /// Kill the direct child and reap it. Process-tree policy belongs to the caller.

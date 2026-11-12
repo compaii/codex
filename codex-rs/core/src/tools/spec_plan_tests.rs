@@ -430,6 +430,7 @@ fn mcp_runtime(
     RegisteredTool {
         runtime: handler,
         exposure,
+        native_review: Default::default(),
         model_spec: None,
     }
 }
@@ -601,6 +602,7 @@ async fn reviewer_tool_policy_exclude_optional_core_tools() {
         /*apps_enabled*/ false,
         &turn.extension_data,
         /*tool_suggest_candidates*/ None,
+        session.dynamic_tools().await.as_ref(),
     )
     .expect("build internal Guardian tool router");
 
@@ -653,6 +655,7 @@ async fn reviewer_tool_policy_respect_managed_shell_restrictions() {
             /*apps_enabled*/ false,
             &turn.extension_data,
             /*tool_suggest_candidates*/ None,
+            session.dynamic_tools().await.as_ref(),
         )
         .expect("build internal Guardian tool router");
 
@@ -689,6 +692,7 @@ async fn reviewer_tool_policy_preserve_code_mode() {
         /*apps_enabled*/ false,
         &turn.extension_data,
         /*tool_suggest_candidates*/ None,
+        session.dynamic_tools().await.as_ref(),
     )
     .expect("build internal Guardian tool router");
 
@@ -759,6 +763,7 @@ async fn reviewer_tool_policy_require_managed_secondary_environments() {
             /*apps_enabled*/ false,
             &turn.extension_data,
             /*tool_suggest_candidates*/ None,
+            session.dynamic_tools().await.as_ref(),
         )
         .expect("build internal Guardian tool router");
 
@@ -1731,6 +1736,7 @@ async fn strict_namespace_ownership_requires_tool_namespace_inventory_opt_in() {
             RegisteredTool {
                 runtime: Arc::new(McpHandler::new(tool).expect("MCP tool spec should build")),
                 exposure,
+                native_review: Default::default(),
                 model_spec: None,
             }
         })
@@ -2027,6 +2033,7 @@ async fn strict_tool_collisions_allow_multiple_tools_in_one_namespace() {
                         McpHandler::new(undocumented_tool).expect("MCP tool spec should build"),
                     ),
                     exposure: ToolExposure::Direct,
+                    native_review: Default::default(),
                     model_spec: None,
                 },
                 mcp_runtime("shared", "shared", "lookup", ToolExposure::Direct),
@@ -2060,6 +2067,8 @@ async fn relaxed_tool_collisions_preserve_first_nonempty_namespace_description()
             Some("Second namespace description."),
             "Second namespace description.",
         ),
+        (None, None, "Tools in the shared namespace."),
+        (Some(""), Some(" \t\n"), "Tools in the shared namespace."),
     ] {
         let runtime = |name, description: Option<&str>| {
             let mut tool = mcp_tool("shared", "shared", name);
@@ -2067,6 +2076,7 @@ async fn relaxed_tool_collisions_preserve_first_nonempty_namespace_description()
             RegisteredTool {
                 runtime: Arc::new(McpHandler::new(tool).expect("MCP tool spec should build")),
                 exposure: ToolExposure::Direct,
+                native_review: Default::default(),
                 model_spec: None,
             }
         };
@@ -2236,6 +2246,11 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
     let cache = ToolSearchHandlerCache::default();
 
     let (_session, mut first_turn) = make_session_and_context().await;
+    set_feature(
+        &mut first_turn,
+        Feature::DeferredToolWorldState,
+        /*enabled*/ false,
+    );
     update_turn_settings_for_test(&mut first_turn, |settings| {
         Arc::make_mut(&mut settings.model_info).supports_search_tool = true;
     });
@@ -2265,6 +2280,11 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
     let first_plan = ToolPlanProbe::from_router(first_router);
 
     let (_session, mut second_turn) = make_session_and_context().await;
+    set_feature(
+        &mut second_turn,
+        Feature::DeferredToolWorldState,
+        /*enabled*/ false,
+    );
     update_turn_settings_for_test(&mut second_turn, |settings| {
         Arc::make_mut(&mut settings.model_info).supports_search_tool = true;
     });
@@ -2931,6 +2951,11 @@ async fn tool_mode_selector_overrides_feature_flags() {
 #[tokio::test]
 async fn v1_multi_agent_tools_defer_when_tool_search_available() {
     let plan = probe(|turn| {
+        set_feature(
+            turn,
+            Feature::DeferredToolWorldState,
+            /*enabled*/ false,
+        );
         update_turn_settings_for_test(turn, |settings| {
             Arc::make_mut(&mut settings.model_info).supports_search_tool = true;
         });
@@ -3392,3 +3417,36 @@ async fn hosted_web_search_and_standalone_image_generation_follow_runtime_gates(
 
 #[path = "spec_plan_strict_third_party_tests.rs"]
 mod strict_third_party;
+
+#[tokio::test]
+async fn host_tool_ceiling_filters_actual_router_without_changing_session_policy() {
+    let (session, _) = make_session_and_context().await;
+    let turn = session
+        .new_turn_with_default_settings(
+            "empty-host-ceiling".into(),
+            crate::session::turn_context::NewTurnContextOptions {
+                tool_ceiling: Some(vec![]),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("build turn context");
+    let step = StepContext::for_test(Arc::clone(&turn));
+    let router = super::build_tool_router(
+        &session,
+        turn.as_ref(),
+        &step.settings.model_info,
+        &step.environments,
+        &step.mcp,
+        false,
+        &turn.extension_data,
+        None,
+        session.dynamic_tools().await.as_ref(),
+    )
+    .expect("restricted router");
+    let plan = ToolPlanProbe::from_router(router);
+    assert!(plan.registered_names.is_empty());
+    assert!(plan.visible_specs.is_empty());
+    assert!(plan.code_mode_tool_names.is_empty());
+    assert!(session.tool_policy.allowed_tools.is_none());
+}

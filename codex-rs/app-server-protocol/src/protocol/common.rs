@@ -148,9 +148,12 @@ macro_rules! serialization_scope_expr {
     ($actual_params:ident, global_shared_read($key:literal)) => {
         Some(ClientRequestSerializationScope::GlobalSharedRead($key))
     };
-    ($actual_params:ident, thread_id($params:ident . $field:ident)) => {
+    // Match one or more dot-separated fields, allowing both `params.thread_id`
+    // and nested paths like `params.start.thread_id`. The resolved ID selects
+    // the per-thread request queue, preserving ordering with other thread operations.
+    ($actual_params:ident, thread_id($params:ident . $($field:ident).+)) => {
         Some(ClientRequestSerializationScope::Thread {
-            thread_id: $actual_params.$field.clone(),
+            thread_id: $actual_params.$($field).+.clone(),
         })
     };
     ($actual_params:ident, optional_thread_id($params:ident . $field:ident)) => {
@@ -567,6 +570,19 @@ client_request_definitions! {
         serialization: thread_or_path(params.thread_id, params.path),
         response: v2::ThreadForkResponse,
     },
+    #[experimental("thread/sample")]
+    ThreadSample => "thread/sample" {
+        params: v2::ThreadSampleParams,
+        // Waiting for a sample must not block requests on its parent thread.
+        serialization: None,
+        response: v2::ThreadSampleResponse,
+    },
+    #[experimental("thread/sample/cancel")]
+    ThreadSampleCancel => "thread/sample/cancel" {
+        params: v2::ThreadSampleCancelParams,
+        serialization: None,
+        response: v2::ThreadSampleCancelResponse,
+    },
     ThreadArchive => "thread/archive" {
         params: v2::ThreadArchiveParams,
         serialization: thread_id(params.thread_id),
@@ -611,6 +627,26 @@ client_request_definitions! {
         params: v2::ThreadPredictionRequestParams,
         serialization: thread_id(params.thread_id),
         response: v2::ThreadPredictionRequestResponse,
+    },
+    ThreadGoalSnapshot => "thread/goal/snapshot" {
+        params: v2::ThreadGoalSnapshotParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadGoalSnapshotResponse,
+    },
+    ThreadGoalConditionalActivate => "thread/goal/conditionalActivate" {
+        params: v2::ThreadGoalConditionalActivateParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadGoalConditionalActivateResponse,
+    },
+    ThreadGoalConditionalSet => "thread/goal/conditionalSet" {
+        params: v2::ThreadGoalConditionalSetParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadGoalConditionalSetResponse,
+    },
+    ThreadGoalConditionalClear => "thread/goal/conditionalClear" {
+        params: v2::ThreadGoalConditionalClearParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadGoalConditionalClearResponse,
     },
     ThreadGoalSet => "thread/goal/set" {
         params: v2::ThreadGoalSetParams,
@@ -706,6 +742,12 @@ client_request_definitions! {
         params: v2::ThreadMemoryModeSetParams,
         serialization: thread_id(params.thread_id),
         response: v2::ThreadMemoryModeSetResponse,
+    },
+    #[experimental("thread/memory/read")]
+    ThreadMemoryRead => "thread/memory/read" {
+        params: v2::ThreadMemoryReadParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadMemoryReadResponse,
     },
     #[experimental("memory/status")]
     MemoryStatus => "memory/status" {
@@ -885,6 +927,13 @@ client_request_definitions! {
         serialization: None,
         response: v2::ThreadItemsReadResponse,
     },
+    #[experimental("thread/guardianReview")]
+    /// Review the idle thread's final injected exec_command without executing it.
+    ThreadGuardianReview => "thread/guardianReview" {
+        params: v2::ThreadGuardianReviewParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::ThreadGuardianReviewResponse,
+    },
     /// Append raw Responses API items to the thread history without starting a user turn.
     ThreadInjectItems => "thread/inject_items" {
         params: v2::ThreadInjectItemsParams,
@@ -1058,6 +1107,22 @@ client_request_definitions! {
         params: v2::TurnStartParams,
         inspect_params: true,
         serialization: thread_id(params.thread_id),
+        response: v2::TurnStartResponse,
+    },
+    /// Start a new turn only while idle; never steer or enqueue into another writer.
+    TurnStartIfIdle => "turn/startIfIdle" {
+        params: v2::TurnStartParams,
+        inspect_params: true,
+        serialization: thread_id(params.thread_id),
+        manual_payload_conversion: manual,
+        response: v2::TurnStartResponse,
+    },
+    /// Idle-only admission with mandatory physical-execution limits.
+    TurnStartBoundedIfIdle => "turn/startBoundedIfIdle" {
+        params: v2::TurnStartBoundedIfIdleParams,
+        inspect_params: true,
+        serialization: thread_id(params.turn.thread_id),
+        manual_payload_conversion: manual,
         response: v2::TurnStartResponse,
     },
     #[experimental("turn/settings/update")]
@@ -1319,6 +1384,13 @@ client_request_definitions! {
         response: v2::BedrockSetupResponse,
     },
 
+    #[experimental("account/gcp/setup")]
+    GcpSetup => "account/gcp/setup" {
+        params: v2::GcpSetupParams,
+        serialization: global("account-auth"),
+        response: v2::GcpSetupResponse,
+    },
+
     #[experimental("account/bedrock/checkGovCloudRequirements")]
     BedrockCheckGovCloudRequirements => "account/bedrock/checkGovCloudRequirements" {
         params: v2::BedrockCheckGovCloudRequirementsParams,
@@ -1330,6 +1402,22 @@ client_request_definitions! {
         params: v2::CancelLoginAccountParams,
         serialization: global("account-auth"),
         response: v2::CancelLoginAccountResponse,
+    },
+
+    #[experimental("accountSession/list")]
+    AccountSessionsList => "accountSession/list" {
+        params: v2::AccountSessionsListParams,
+        serialization: global("account-auth"),
+        manual_payload_conversion: manual,
+        response: v2::AccountSessionsResponse,
+    },
+
+    #[experimental("accountSession/switch")]
+    AccountSessionsSwitch => "accountSession/switch" {
+        params: v2::AccountSessionsSwitchParams,
+        serialization: global("account-auth"),
+        manual_payload_conversion: manual,
+        response: v2::AccountSessionsSwitchResponse,
     },
 
     LogoutAccount => "account/logout" {
@@ -1372,6 +1460,12 @@ client_request_definitions! {
         params: v2::FeedbackUploadParams,
         serialization: None,
         response: v2::FeedbackUploadResponse,
+    },
+
+    FeedbackSave => "feedback/save" {
+        params: v2::FeedbackSaveParams,
+        serialization: None,
+        response: v2::FeedbackSaveResponse,
     },
 
     /// Execute a standalone command (argv vector) under the server's sandbox.
@@ -1791,6 +1885,17 @@ impl TryFrom<JSONRPCRequest> for ServerRequest {
 }
 
 server_request_definitions! {
+    /// Account reservation for a bounded native physical attempt. Only the
+    /// initiating owner connection may answer; never replay to subscribers.
+    ProviderAttemptReservation => "turn/providerAttempt/reserve" {
+        params: v2::ProviderAttemptReservationParams,
+        response: v2::ProviderAttemptReservationResponse,
+    },
+    /// Exact usage observation for the initiating accounting owner only.
+    ProviderAttemptUsage => "turn/providerAttempt/usage" {
+        params: v2::ProviderAttemptUsageParams,
+        response: v2::ProviderAttemptUsageResponse,
+    },
     /// NEW APIs
     /// Sent when approval is requested for a specific command execution.
     /// This request is used for Turns started via turn/start.
@@ -1959,6 +2064,7 @@ server_notification_definitions! {
     ThreadReverted => "thread/reverted" (v2::ThreadRevertedNotification),
     SkillsChanged => "skills/changed" (v2::SkillsChangedNotification),
     ThreadNameUpdated => "thread/name/updated" (v2::ThreadNameUpdatedNotification),
+    ThreadSectionChanged => "thread/section/changed" (v2::ThreadSectionChangedNotification),
     ThreadAttachmentUpdated => "thread/attachment/updated" (v2::ThreadAttachmentUpdatedNotification),
     ThreadGoalUpdated => "thread/goal/updated" (v2::ThreadGoalUpdatedNotification),
     #[experimental("thread/prediction/updated")]
@@ -2296,6 +2402,102 @@ mod tests {
     }
 
     #[test]
+    fn idle_only_start_uses_existing_typed_params_and_thread_serialization() {
+        let value = serde_json::json!({"id":7,"method":"turn/startIfIdle","params":{"threadId":"selected-thread","input":[]}});
+        let request: ClientRequest = serde_json::from_value(value.clone()).unwrap();
+        assert!(matches!(&request, ClientRequest::TurnStartIfIdle { .. }));
+        assert_eq!(request.method_name(), "turn/startIfIdle");
+        assert_eq!(
+            request.serialization_scope(),
+            Some(ClientRequestSerializationScope::Thread {
+                thread_id: "selected-thread".into()
+            })
+        );
+        let roundtrip = serde_json::to_value(request).unwrap();
+        assert_eq!(roundtrip["method"], value["method"]);
+        assert_eq!(roundtrip["params"]["threadId"], value["params"]["threadId"]);
+    }
+
+    #[test]
+    fn bounded_idle_requires_limits_and_serializes_on_the_nested_thread() {
+        let mut value = serde_json::json!({"id":8,"method":"turn/startBoundedIfIdle","params":{
+            "turn":{"threadId":"selected-thread","input":[]},
+            "allowance":{"maxProviderAttempts":3,"maxRequestBytes":1024,"deadlineUnixMs":42}
+        }});
+        let request: ClientRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(request.method_name(), "turn/startBoundedIfIdle");
+        assert_eq!(
+            request.serialization_scope(),
+            Some(ClientRequestSerializationScope::Thread {
+                thread_id: "selected-thread".into()
+            })
+        );
+        value["params"].as_object_mut().unwrap().remove("allowance");
+        assert!(serde_json::from_value::<ClientRequest>(value).is_err());
+    }
+
+    #[test]
+    fn provider_reservation_selection_is_rejected_by_older_bounded_readers() {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct OldBoundedParams {
+            #[serde(rename = "turn")]
+            _turn: v2::TurnStartParams,
+            #[serde(rename = "allowance")]
+            _allowance: codex_protocol::turn_input::TurnInferenceAllowance,
+        }
+        let mut params = serde_json::json!({
+            "turn":{"threadId":"selected-thread","input":[]},
+            "allowance":{"maxProviderAttempts":3,"maxRequestBytes":1024,"deadlineUnixMs":42}
+        });
+        assert!(serde_json::from_value::<OldBoundedParams>(params.clone()).is_ok());
+        params["providerReservationCycleId"] = "caa11c1d-b05b-4f56-99ab-167878e86126".into();
+        assert!(serde_json::from_value::<OldBoundedParams>(params.clone()).is_err());
+        let current: v2::TurnStartBoundedIfIdleParams =
+            serde_json::from_value(params.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(current).unwrap()["providerReservationCycleId"],
+            params["providerReservationCycleId"]
+        );
+        assert!(
+            serde_json::from_value::<v2::ProviderAttemptReservationResponse>(
+                serde_json::json!({"authorized":true})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bounded_host_restrictions_require_complete_closed_selection() {
+        let mut params = serde_json::json!({
+            "turn":{"threadId":"selected-thread","input":[]},
+            "allowance":{"maxProviderAttempts":1,"maxRequestBytes":4096,"deadlineUnixMs":42},
+            "hostRestrictions":{
+                "permissions":":read-only",
+                "tools":[{"name":"exec_command","namespace":"functions"}],
+                "environment":{"PATH":"/usr/bin:/bin"},
+                "codeModeLimits":{"maxHeapSizeBytes":33554432,"maxYieldTimeMs":1000}
+            }
+        });
+        let current: v2::TurnStartBoundedIfIdleParams =
+            serde_json::from_value(params.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(current).unwrap()["hostRestrictions"],
+            params["hostRestrictions"]
+        );
+        for field in ["permissions", "tools", "environment", "codeModeLimits"] {
+            let mut missing = params.clone();
+            missing["hostRestrictions"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(serde_json::from_value::<v2::TurnStartBoundedIfIdleParams>(missing).is_err());
+        }
+        params["hostRestrictions"]["inherit"] = "all".into();
+        assert!(serde_json::from_value::<v2::TurnStartBoundedIfIdleParams>(params).is_err());
+    }
+
+    #[test]
     fn client_request_serialization_scope_covers_keyed_families() {
         let thread_id = "thread-1".to_string();
         let thread_resume = ClientRequest::ThreadResume {
@@ -2422,7 +2624,7 @@ mod tests {
 
         let hooks_list = ClientRequest::HooksList {
             request_id: request_id(),
-            params: v2::HooksListParams { cwds: Vec::new() },
+            params: v2::HooksListParams::default(),
         };
         assert_eq!(
             hooks_list.serialization_scope(),
@@ -2784,6 +2986,7 @@ mod tests {
                     version: "0.1.0".to_string(),
                 },
                 capabilities: Some(v1::InitializeCapabilities {
+                    required_human_approval: false,
                     explicit_gateway_oauth: false,
                     experimental_api: true,
                     request_attestation: true,
@@ -2872,6 +3075,7 @@ mod tests {
                         version: "0.1.0".to_string(),
                     },
                     capabilities: Some(v1::InitializeCapabilities {
+                        required_human_approval: false,
                         explicit_gateway_oauth: false,
                         experimental_api: true,
                         request_attestation: true,
@@ -3629,12 +3833,14 @@ mod tests {
         let chatgpt = v2::Account::Chatgpt {
             email: Some("user@example.com".to_string()),
             plan_type: PlanType::Plus,
+            workspace_name: None,
         };
         assert_eq!(
             json!({
                 "type": "chatgpt",
                 "email": "user@example.com",
                 "planType": "plus",
+                "workspaceName": null,
             }),
             serde_json::to_value(&chatgpt)?,
         );
@@ -3642,12 +3848,14 @@ mod tests {
         let chatgpt_without_email = v2::Account::Chatgpt {
             email: None,
             plan_type: PlanType::Pro,
+            workspace_name: None,
         };
         assert_eq!(
             json!({
                 "type": "chatgpt",
                 "email": null,
                 "planType": "pro",
+                "workspaceName": null,
             }),
             serde_json::to_value(&chatgpt_without_email)?,
         );
@@ -4083,6 +4291,7 @@ mod tests {
                 realtime_end_instructions: Some("Resume normal text responses.".to_string()),
                 prompt: Some(Some("You are on a call".to_string())),
                 realtime_session_id: Some("sess_456".to_string()),
+                voice_session_id: Some("voice_789".to_string()),
                 transport: None,
                 version: Some(RealtimeConversationVersion::V3),
                 voice: Some(RealtimeVoice::Marin),
@@ -4122,6 +4331,7 @@ mod tests {
                     "realtimeEndInstructions": "Resume normal text responses.",
                     "prompt": "You are on a call",
                     "realtimeSessionId": "sess_456",
+                    "voiceSessionId": "voice_789",
                     "transport": null,
                     "version": "v3",
                     "voice": "marin"
@@ -4154,6 +4364,7 @@ mod tests {
                 realtime_end_instructions: None,
                 prompt: None,
                 realtime_session_id: None,
+                voice_session_id: None,
                 transport: None,
                 version: None,
                 voice: None,
@@ -4179,6 +4390,7 @@ mod tests {
                     "realtimeStartInstructions": null,
                     "realtimeEndInstructions": null,
                     "realtimeSessionId": null,
+                    "voiceSessionId": null,
                     "transport": null,
                     "version": null,
                     "voice": null
@@ -4207,6 +4419,7 @@ mod tests {
                 realtime_end_instructions: None,
                 prompt: Some(None),
                 realtime_session_id: None,
+                voice_session_id: None,
                 transport: None,
                 version: None,
                 voice: None,
@@ -4233,6 +4446,7 @@ mod tests {
                     "realtimeEndInstructions": null,
                     "prompt": null,
                     "realtimeSessionId": null,
+                    "voiceSessionId": null,
                     "transport": null,
                     "version": null,
                     "voice": null
@@ -4389,16 +4603,6 @@ mod tests {
     }
 
     #[test]
-    fn mock_experimental_method_is_marked_experimental() {
-        let request = ClientRequest::MockExperimentalMethod {
-            request_id: RequestId::Integer(1),
-            params: v2::MockExperimentalMethodParams::default(),
-        };
-        let reason = crate::experimental_api::ExperimentalApi::experimental_reason(&request);
-        assert_eq!(reason, Some("mock/experimentalMethod"));
-    }
-
-    #[test]
     fn environment_add_is_marked_experimental() {
         let request = ClientRequest::EnvironmentAdd {
             request_id: RequestId::Integer(1),
@@ -4439,37 +4643,6 @@ mod tests {
 
         let reason = crate::experimental_api::ExperimentalApi::experimental_reason(&request);
         assert_eq!(reason, Some("command/exec.permissionProfile"));
-    }
-
-    #[test]
-    fn thread_realtime_start_is_marked_experimental() {
-        let request = ClientRequest::ThreadRealtimeStart {
-            request_id: RequestId::Integer(1),
-            params: v2::ThreadRealtimeStartParams {
-                client_managed_handoffs: None,
-                delegation_ack_filler: None,
-                flush_transcript_tail_on_session_end: None,
-                codex_responses_as_items: None,
-                codex_response_item_prefix: None,
-                codex_response_handoff_mode: None,
-                backend_reasoning_status: false,
-                codex_response_handoff_channel_prefixes: None,
-                thread_id: "thr_123".to_string(),
-                model: None,
-                output_modality: RealtimeOutputModality::Audio,
-                include_startup_context: None,
-                initial_items: None,
-                realtime_start_instructions: None,
-                realtime_end_instructions: None,
-                prompt: Some(Some("You are on a call".to_string())),
-                realtime_session_id: None,
-                transport: None,
-                version: None,
-                voice: None,
-            },
-        };
-        let reason = crate::experimental_api::ExperimentalApi::experimental_reason(&request);
-        assert_eq!(reason, Some("thread/realtime/start"));
     }
 
     #[test]

@@ -1,0 +1,37 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ThreadGoalMutationOrigin": {
+      "description": "Distinguishes explicit user actions from automatic goal lifecycle mutations.",
+      "enum": [
+        "user",
+        "automatic"
+      ],
+      "type": "string"
+    }
+  },
+  "properties": {
+    "expectedRevision": {
+      "type": "string"
+    },
+    "origin": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ThreadGoalMutationOrigin"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "threadId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "expectedRevision",
+    "threadId"
+  ],
+  "title": "ThreadGoalConditionalClearParams",
+  "type": "object"
+}

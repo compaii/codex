@@ -108,6 +108,7 @@ async fn installed_goal_tools_apply_maximum_token_budget() -> anyhow::Result<()>
     harness.thread_store.insert(GoalExtensionConfig {
         enabled: true,
         max_goal_token_budget: Some(100),
+        continuation_idle_seconds: Default::default(),
     });
     let tools = harness.tools();
     let create_tool = tool_by_name(&tools, "create_goal");
@@ -1665,6 +1666,7 @@ async fn installed_tools_with_start(
         |_| GoalExtensionConfig {
             enabled: true,
             max_goal_token_budget: None,
+            continuation_idle_seconds: Default::default(),
         },
     );
     let registry = builder.build();
@@ -1722,6 +1724,7 @@ impl GoalExtensionHarness {
             |_| GoalExtensionConfig {
                 enabled: true,
                 max_goal_token_budget: None,
+                continuation_idle_seconds: Default::default(),
             },
         );
         let registry = Arc::new(builder.build());
@@ -1852,6 +1855,7 @@ impl GoalExtensionHarness {
         let turn_store = ExtensionData::new(turn_id);
         let token_usage = TokenUsageInfo {
             total_token_usage: usage.clone(),
+            last_usage_includes_reasoning: None,
             last_token_usage: last_usage.clone(),
             model_context_window: None,
         };
@@ -1968,6 +1972,8 @@ fn tool_call(tool_name: &str, call_id: &str, arguments: serde_json::Value) -> To
         source: ToolCallSource::Direct,
         conversation_history: codex_extension_api::ConversationHistory::default(),
         turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+        attachment_store: codex_core::passthrough_image_store(),
+        ephemeral: false,
         environments: Vec::new(),
         payload: ToolPayload::Function {
             arguments: arguments.to_string(),
@@ -2098,4 +2104,81 @@ fn protocol_status(status: codex_state::ThreadGoalStatus) -> ThreadGoalStatus {
         codex_state::ThreadGoalStatus::BudgetLimited => ThreadGoalStatus::BudgetLimited,
         codex_state::ThreadGoalStatus::Complete => ThreadGoalStatus::Complete,
     }
+}
+
+#[tokio::test]
+async fn bounded_turn_lifecycle_preserves_existing_goal_and_accounting() -> anyhow::Result<()> {
+    let runtime = test_runtime().await?;
+    let thread_id = test_thread_id()?;
+    seed_thread_metadata(runtime.as_ref(), thread_id).await?;
+    let harness = GoalExtensionHarness::new(runtime.clone(), thread_id).await?;
+    let tools = harness.tools();
+    tool_by_name(&tools, "create_goal")
+        .handle(tool_call(
+            "create_goal",
+            "create-existing",
+            json!({"objective":"preserve original goal", "token_budget":1000}),
+        ))
+        .await?;
+    let before = runtime
+        .thread_goals()
+        .get_thread_goal(thread_id)
+        .await?
+        .unwrap();
+    let turn_store = ExtensionData::new("bounded-attention");
+    turn_store.insert(codex_protocol::turn_input::TurnInferenceAllowance {
+        max_provider_attempts: 1,
+        max_request_bytes: 1024,
+        deadline_unix_ms: 42,
+    });
+    let mode = default_collaboration_mode();
+    for contributor in harness.registry.turn_lifecycle_contributors() {
+        contributor
+            .on_turn_start(TurnStartInput {
+                turn_id: "bounded-attention",
+                collaboration_mode: &mode,
+                token_usage_at_turn_start: Some(&TokenUsage::default()),
+                session_store: &harness.session_store,
+                thread_store: &harness.thread_store,
+                turn_store: &turn_store,
+            })
+            .await;
+    }
+    let usage = TokenUsageInfo {
+        total_token_usage: token_usage(100, 0, 50, 0, 150),
+        last_token_usage: token_usage(100, 0, 50, 0, 150),
+        model_context_window: None,
+        last_usage_includes_reasoning: None,
+    };
+    for contributor in harness.registry.token_usage_contributors() {
+        contributor
+            .on_token_usage(
+                &harness.session_store,
+                &harness.thread_store,
+                &turn_store,
+                &usage,
+            )
+            .await;
+    }
+    for contributor in harness.registry.turn_lifecycle_contributors() {
+        contributor
+            .on_turn_stop(TurnStopInput {
+                session_store: &harness.session_store,
+                thread_store: &harness.thread_store,
+                turn_store: &turn_store,
+            })
+            .await;
+    }
+    let after = runtime
+        .thread_goals()
+        .get_thread_goal(thread_id)
+        .await?
+        .unwrap();
+    assert_eq!(before.goal_id, after.goal_id);
+    assert_eq!(before.tokens_used, after.tokens_used);
+    assert_eq!(
+        protocol_status(before.status),
+        protocol_status(after.status)
+    );
+    Ok(())
 }

@@ -9,6 +9,7 @@ use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::models::AudioReference as CoreAudioReference;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ImageReference as CoreImageReference;
@@ -116,6 +117,9 @@ pub enum AdditionalContextKind {
 pub struct AdditionalContextEntry {
     pub value: String,
     pub kind: AdditionalContextKind,
+    /// Optional name for untrusted context, used to label its tool output.
+    #[ts(optional = nullable)]
+    pub name: Option<String>,
 }
 
 /// Requested cyber treatment for an OpenAI model turn.
@@ -198,6 +202,7 @@ pub struct TurnStartParams {
     #[ts(optional = nullable)]
     pub tool_output: Option<Box<TurnToolOutput>>,
     /// Optional metadata to enrich Codex's ResponsesAPI turn metadata.
+    /// Replaces unprotected client-provided entries when supplied; an empty map clears them.
     ///
     /// Entries are flattened into the JSON string sent as
     /// `client_metadata["x-codex-turn-metadata"]` on ResponsesAPI HTTP and websocket requests.
@@ -207,6 +212,11 @@ pub struct TurnStartParams {
     #[experimental("turn/start.responsesapiClientMetadata")]
     #[ts(optional = nullable)]
     pub responsesapi_client_metadata: Option<HashMap<String, String>>,
+    /// Merge entries into the ResponsesAPI turn metadata without removing existing entries.
+    /// Applied after `responsesapiClientMetadata` if both are provided; reserved keys remain protected.
+    #[experimental("turn/start.responsesapiClientMetadataPatch")]
+    #[ts(optional = nullable)]
+    pub responsesapi_client_metadata_patch: Option<HashMap<String, String>>,
     /// Optional client-provided context fragments keyed by an opaque source identifier.
     #[experimental("turn/start.additionalContext")]
     #[ts(optional = nullable)]
@@ -296,6 +306,104 @@ pub struct TurnStartParams {
     pub cyber_access_program: Option<CyberAccessProgram>,
 }
 
+/// Mandatory bounded idle-only admission. An older server must reject this
+/// method rather than ignore an optional field on ordinary turn/start.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, ExperimentalApi)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct TurnStartBoundedIfIdleParams {
+    /// Additional execution-local ceilings, resolved by the host. Requires no
+    /// persistent thread configuration change and never grants permissions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub host_restrictions: Option<BoundedTurnHostRestrictions>,
+    #[experimental(nested)]
+    pub turn: TurnStartParams,
+    pub allowance: codex_protocol::turn_input::TurnInferenceAllowance,
+    /// Owner journal cycle whose exact physical attempts require a reservation
+    /// response from this initiating connection. This is not a budget grant.
+    /// Older bounded-start servers reject this field rather than ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub provider_reservation_cycle_id: Option<String>,
+    /// Opt in to owner-only completion observations. Older closed readers
+    /// reject this field; legacy reservation-only clients omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub provider_usage_observations: Option<bool>,
+    /// Owner-selected output ceiling, applied at HTTP/WS request construction.
+    /// Requires the same reservation cycle; older closed readers reject it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub provider_max_output_tokens: Option<u32>,
+}
+
+/// A complete narrowing selection for one bounded idle start. Existing named
+/// permissions are resolved by the server; raw permission profiles are not input.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct BoundedTurnHostRestrictions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub process_limits: Option<codex_protocol::turn_input::TurnProcessLimits>,
+    pub permissions: String,
+    pub tools: Vec<codex_protocol::ToolName>,
+    /// Explicit environment only: the server disables inheritance and profiles.
+    pub environment: HashMap<String, String>,
+    pub code_mode_limits: codex_protocol::turn_input::TurnCodeModeLimits,
+}
+
+/// Host accounting request, never a model tool or human approval ceremony.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct ProviderAttemptReservationParams {
+    pub thread_id: String,
+    pub cycle_id: String,
+    pub attempt_id: String,
+    pub ordinal: u32,
+    pub max_request_bytes: u32,
+    pub deadline_unix_ms: i64,
+}
+
+/// Exact physical response evidence, not a financial settlement or grant.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct ProviderAttemptUsageParams {
+    pub thread_id: String,
+    pub cycle_id: String,
+    pub attempt_id: String,
+    pub ordinal: u32,
+    pub response_id: String,
+    pub model: Option<String>,
+    pub token_usage: Option<super::TokenUsageBreakdown>,
+    pub usage_metadata: Option<super::ResponseUsageMetadata>,
+}
+
+/// True acknowledges retained evidence only. A missing/false acknowledgment
+/// never proves absence or authorizes releasing conservative exposure.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct ProviderAttemptUsageResponse {
+    pub cycle_id: String,
+    pub attempt_id: String,
+    pub recorded: bool,
+}
+
+/// Authorizes only the exact retained journal operation. A lost response must
+/// retain exposure; repeating this request must never mint a replacement call.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(export_to = "v2/")]
+pub struct ProviderAttemptReservationResponse {
+    pub cycle_id: String,
+    pub attempt_id: String,
+    pub authorized: bool,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
@@ -314,6 +422,7 @@ pub struct TurnSteerParams {
     pub client_user_message_id: Option<String>,
     pub input: Vec<UserInput>,
     /// Optional metadata to enrich Codex's ResponsesAPI turn metadata.
+    /// Replaces unprotected client-provided entries when supplied; an empty map clears them.
     ///
     /// Entries are flattened into the JSON string sent as
     /// `client_metadata["x-codex-turn-metadata"]` on ResponsesAPI HTTP and websocket requests.
@@ -323,6 +432,11 @@ pub struct TurnSteerParams {
     #[experimental("turn/steer.responsesapiClientMetadata")]
     #[ts(optional = nullable)]
     pub responsesapi_client_metadata: Option<HashMap<String, String>>,
+    /// Merge entries into the ResponsesAPI turn metadata without removing existing entries.
+    /// Applied after `responsesapiClientMetadata` if both are provided; reserved keys remain protected.
+    #[experimental("turn/steer.responsesapiClientMetadataPatch")]
+    #[ts(optional = nullable)]
+    pub responsesapi_client_metadata_patch: Option<HashMap<String, String>>,
     /// Optional client-provided context fragments keyed by an opaque source identifier.
     #[experimental("turn/steer.additionalContext")]
     #[ts(optional = nullable)]
@@ -437,6 +551,21 @@ pub enum ImageReference {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
+#[serde(untagged)]
+#[ts(untagged)]
+#[ts(export_to = "v2/")]
+pub enum AudioReference {
+    Inline {
+        url: String,
+    },
+    File {
+        #[serde(rename = "fileId")]
+        #[ts(rename = "fileId")]
+        file_id: String,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "camelCase")]
 #[ts(tag = "type")]
 #[ts(export_to = "v2/")]
@@ -461,7 +590,8 @@ pub enum UserInput {
         path: PathBuf,
     },
     Audio {
-        url: String,
+        #[serde(flatten)]
+        audio: AudioReference,
     },
     LocalAudio {
         path: PathBuf,
@@ -494,7 +624,12 @@ impl UserInput {
                 detail,
             },
             UserInput::LocalImage { path, detail } => CoreUserInput::LocalImage { path, detail },
-            UserInput::Audio { url } => CoreUserInput::Audio { audio_url: url },
+            UserInput::Audio { audio } => CoreUserInput::Audio {
+                audio: match audio {
+                    AudioReference::Inline { url } => CoreAudioReference::Inline { audio_url: url },
+                    AudioReference::File { file_id } => CoreAudioReference::File { file_id },
+                },
+            },
             UserInput::LocalAudio { path } => CoreUserInput::LocalAudio { path },
             UserInput::Skill { name, path } => CoreUserInput::Skill { name, path },
             UserInput::Mention { name, path } => CoreUserInput::Mention { name, path },
@@ -522,7 +657,14 @@ impl From<CoreUserInput> for UserInput {
                 detail,
             },
             CoreUserInput::LocalImage { path, detail } => UserInput::LocalImage { path, detail },
-            CoreUserInput::Audio { audio_url } => UserInput::Audio { url: audio_url },
+            CoreUserInput::Audio { audio } => UserInput::Audio {
+                audio: match audio {
+                    CoreAudioReference::Inline { audio_url } => {
+                        AudioReference::Inline { url: audio_url }
+                    }
+                    CoreAudioReference::File { file_id } => AudioReference::File { file_id },
+                },
+            },
             CoreUserInput::LocalAudio { path } => UserInput::LocalAudio { path },
             CoreUserInput::Skill { name, path } => UserInput::Skill { name, path },
             CoreUserInput::Mention { name, path } => UserInput::Mention { name, path },

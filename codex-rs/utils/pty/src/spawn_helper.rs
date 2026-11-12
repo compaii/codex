@@ -18,12 +18,12 @@ use std::sync::atomic::Ordering;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
-use crate::child_command::ChildDropPolicy;
-
 /// Setup that needs a fresh, single-threaded image before target exec.
 pub(crate) enum Setup {
     /// Detach from the terminal and terminate when the parent dies.
     Pipe,
+    /// Mandatory admission also requires descriptor cleanup before target exec.
+    AdmittedPipe,
     /// Establish a controlling terminal and reset interactive signal state.
     Pty,
 }
@@ -75,6 +75,38 @@ pub(crate) async fn spawn(
     target: &crate::Command,
     setup: Setup,
 ) -> io::Result<Option<crate::Child>> {
+    spawn_inner(
+        target,
+        setup,
+        None::<fn(u32) -> std::future::Ready<io::Result<()>>>,
+    )
+    .await
+}
+
+/// Admit an owned helper before transferring the target environment or executing it.
+/// Missing helper support is an error: an ungated fallback would bypass admission.
+pub(crate) async fn spawn_with_admission<F, Fut>(
+    target: &crate::Command,
+    admit: F,
+) -> io::Result<crate::Child>
+where
+    F: FnOnce(u32) -> Fut,
+    Fut: std::future::Future<Output = io::Result<()>>,
+{
+    spawn_inner(target, Setup::AdmittedPipe, Some(admit))
+        .await?
+        .ok_or_else(|| io::Error::other("required process admission helper unavailable"))
+}
+
+async fn spawn_inner<F, Fut>(
+    target: &crate::Command,
+    setup: Setup,
+    admit: Option<F>,
+) -> io::Result<Option<crate::Child>>
+where
+    F: FnOnce(u32) -> Fut,
+    Fut: std::future::Future<Output = io::Result<()>>,
+{
     target.validate()?;
     if !is_available() {
         return Ok(None);
@@ -105,6 +137,7 @@ pub(crate) async fn spawn(
             .arg(std::process::id().to_string())
             .arg(match setup {
                 Setup::Pipe => "pipe",
+                Setup::AdmittedPipe => "admitted-pipe",
                 Setup::Pty => "pty",
             })
             .arg(
@@ -119,7 +152,7 @@ pub(crate) async fn spawn(
             .arg(settings.get_program())
             .arg(target.arg0.as_deref().unwrap_or(settings.get_program()))
             .args(settings.get_args())
-            .drop_policy(ChildDropPolicy::ReapOnly)
+            .drop_policy(target.drop_policy)
             .stdin(match &target.stdin {
                 crate::ChildStdin::Piped => crate::ChildStdin::Piped,
                 crate::ChildStdin::Null => crate::ChildStdin::Null,
@@ -154,6 +187,16 @@ pub(crate) async fn spawn(
     // All inherited descriptors were passed to the helper synchronously, before
     // the first suspension. The caller can now close its copies safely.
     let mut starting = StartingChild(Some(child));
+    if let Some(admit) = admit {
+        let pid = starting
+            .0
+            .as_ref()
+            .and_then(crate::Child::id)
+            .ok_or_else(|| io::Error::other("missing admission helper pid"))?;
+        // The fresh helper blocks on this private socket. No target environment
+        // has crossed it yet. StartingChild kills and reaps on refusal/cancellation.
+        admit(pid).await?;
+    }
     let sent = async {
         control
             .write_all(&(environment.len() as u32).to_le_bytes())

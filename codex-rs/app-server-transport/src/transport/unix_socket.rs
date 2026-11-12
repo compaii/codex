@@ -7,6 +7,9 @@ use std::path::Path;
 
 use super::TransportEvent;
 use crate::transport::websocket::run_websocket_connection;
+use crate::websocket_compression::WEBSOCKET_COMPRESSION_HEADER;
+use crate::websocket_compression::WebSocketCompression;
+use crate::websocket_compression::ZSTD_STREAM_PROTOCOL;
 use codex_uds::UnixListener;
 use codex_uds::UnixStream;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -37,6 +40,8 @@ const MAX_UNFRAGMENTED_MESSAGE_BYTES_HEADER: &str =
 #[derive(Clone, Copy)]
 pub enum DaemonShutdownAccess {
     Disabled,
+    /// A managed receiver with nonblocking maintenance, without socket shutdown.
+    MaintenanceOnly,
     Managed,
 }
 
@@ -45,7 +50,30 @@ pub async fn start_control_socket_acceptor(
     transport_event_tx: mpsc::Sender<TransportEvent>,
     shutdown_token: CancellationToken,
     daemon_shutdown_access: DaemonShutdownAccess,
+    compression: WebSocketCompression,
 ) -> IoResult<JoinHandle<()>> {
+    let (listener, socket_guard) = bind_private_daemon_socket(socket_path.as_path()).await?;
+    info!(
+        socket_path = %socket_guard.socket_path.display(),
+        "app-server control socket listening"
+    );
+
+    Ok(tokio::spawn(run_control_socket_acceptor(
+        listener,
+        transport_event_tx,
+        shutdown_token,
+        socket_guard,
+        daemon_shutdown_access,
+        compression,
+    )))
+}
+
+/// Binds a private daemon socket, retaining its advertised path as a rendezvous
+/// alias on Unix. Keep the guard alive for as long as the listener is in use.
+pub async fn bind_private_daemon_socket(
+    socket_path: &Path,
+) -> IoResult<(UnixListener, DaemonSocketFileGuard)> {
+    let socket_path = AbsolutePathBuf::from_absolute_path(socket_path)?;
     #[cfg(unix)]
     let (socket_path, rendezvous_path, mut startup_lock) = {
         use std::os::unix::fs::MetadataExt;
@@ -99,7 +127,7 @@ pub async fn start_control_socket_acceptor(
     {
         startup_lock.remove_on_drop = true;
     }
-    let socket_guard = ControlSocketFileGuard {
+    let socket_guard = DaemonSocketFileGuard {
         socket_path,
         #[cfg(unix)]
         rendezvous_path,
@@ -116,26 +144,16 @@ pub async fn start_control_socket_acceptor(
     )?;
     #[cfg(unix)]
     socket_guard._startup_lock._file.unlock()?;
-    info!(
-        socket_path = %socket_guard.socket_path.display(),
-        "app-server control socket listening"
-    );
-
-    Ok(tokio::spawn(run_control_socket_acceptor(
-        listener,
-        transport_event_tx,
-        shutdown_token,
-        socket_guard,
-        daemon_shutdown_access,
-    )))
+    Ok((listener, socket_guard))
 }
 
 async fn run_control_socket_acceptor(
     mut listener: UnixListener,
     transport_event_tx: mpsc::Sender<TransportEvent>,
     shutdown_token: CancellationToken,
-    socket_guard: ControlSocketFileGuard,
+    socket_guard: DaemonSocketFileGuard,
     daemon_shutdown_access: DaemonShutdownAccess,
+    compression: WebSocketCompression,
 ) {
     let _socket_guard = socket_guard;
     loop {
@@ -165,6 +183,8 @@ async fn run_control_socket_acceptor(
         let transport_event_tx = transport_event_tx.clone();
         tokio::spawn(async move {
             let mut shutdown_request = false;
+            let mut maintenance_request = false;
+            let mut negotiated_compression = WebSocketCompression::Plain;
             let websocket_config = WebSocketConfig::default();
             let max_unfragmented_message_bytes = [
                 websocket_config.max_frame_size,
@@ -177,6 +197,26 @@ async fn run_control_socket_acceptor(
                 stream,
                 |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
                  mut response: HandshakeResponse| {
+                    if request.uri().path() == "/daemon/maintenance" {
+                        if matches!(daemon_shutdown_access, DaemonShutdownAccess::Disabled) {
+                            let mut rejection = Response::new(Some("unmanaged server".to_string()));
+                            *rejection.status_mut() = StatusCode::FORBIDDEN;
+                            return Err(rejection);
+                        }
+                        let capability =
+                            HeaderValue::from_str(&format!("v1:{}", std::process::id())).map_err(
+                                |_| {
+                                    let mut rejection =
+                                        Response::new(Some("maintenance unavailable".to_string()));
+                                    *rejection.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                                    rejection
+                                },
+                            )?;
+                        maintenance_request = true;
+                        response
+                            .headers_mut()
+                            .insert(crate::DAEMON_MAINTENANCE_CAPABILITY_HEADER, capability);
+                    }
                     if request.uri().path() == "/daemon/shutdown" {
                         if !matches!(daemon_shutdown_access, DaemonShutdownAccess::Managed) {
                             let mut rejection = Response::new(Some("unmanaged server".to_string()));
@@ -184,6 +224,17 @@ async fn run_control_socket_acceptor(
                             return Err(rejection);
                         }
                         shutdown_request = true;
+                    } else if compression == WebSocketCompression::Zstd
+                        && request
+                            .headers()
+                            .get(WEBSOCKET_COMPRESSION_HEADER)
+                            .is_some_and(|value| value == ZSTD_STREAM_PROTOCOL)
+                    {
+                        negotiated_compression = WebSocketCompression::Zstd;
+                        response.headers_mut().insert(
+                            WEBSOCKET_COMPRESSION_HEADER,
+                            HeaderValue::from_static(ZSTD_STREAM_PROTOCOL),
+                        );
                     }
                     if let Some(max_bytes) = max_unfragmented_message_bytes {
                         response.headers_mut().insert(
@@ -203,15 +254,66 @@ async fn run_control_socket_acceptor(
                     return;
                 }
             };
+            if maintenance_request {
+                run_daemon_maintenance(websocket_stream, transport_event_tx).await;
+                return;
+            }
             if shutdown_request {
                 run_daemon_shutdown(websocket_stream, transport_event_tx).await;
                 return;
             }
             let (websocket_writer, websocket_reader) = websocket_stream.split();
-            run_websocket_connection(websocket_writer, websocket_reader, transport_event_tx).await;
+            run_websocket_connection(
+                websocket_writer,
+                websocket_reader,
+                transport_event_tx,
+                negotiated_compression,
+            )
+            .await;
         });
     }
     info!("control socket acceptor shutting down");
+}
+
+async fn run_daemon_maintenance(
+    mut websocket: tokio_tungstenite::WebSocketStream<UnixStream>,
+    transport_event_tx: mpsc::Sender<TransportEvent>,
+) {
+    let pid = std::process::id().to_string();
+    let request = tokio::time::timeout(Duration::from_secs(2), websocket.next()).await;
+    if !matches!(request, Ok(Some(Ok(Message::Text(request)))) if request == pid) {
+        return;
+    }
+    // The lease begins at socket receipt, not after a possibly stalled queue.
+    let expires_at = tokio::time::Instant::now() + Duration::from_secs(120);
+    let (reply, outcome) = tokio::sync::oneshot::channel();
+    let (flushed, flush_complete) = tokio::sync::oneshot::channel();
+    if !matches!(
+        tokio::time::timeout_at(
+            expires_at,
+            transport_event_tx.send(TransportEvent::DaemonMaintenance {
+                expires_at,
+                reply,
+                flushed: flush_complete
+            })
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
+        return;
+    }
+    if let Ok(Ok(outcome)) =
+        tokio::time::timeout_at(expires_at + Duration::from_secs(7), outcome).await
+    {
+        let payload = serde_json::json!({"pid":std::process::id(),"outcome":outcome});
+        if websocket
+            .send(Message::Text(payload.to_string().into()))
+            .await
+            .is_ok()
+        {
+            let _ = flushed.send(());
+        }
+    }
 }
 
 async fn run_daemon_shutdown(
@@ -284,6 +386,36 @@ async fn prepare_control_socket_path(socket_path: &Path) -> IoResult<()> {
         ));
     }
     tokio::fs::remove_file(socket_path).await
+}
+
+/// Return a verified local socket endpoint, independent of the advertised Unix alias.
+/// A socket bound directly at the advertised path (e.g. SSH forwarding) is not ours on Unix.
+pub fn verified_local_daemon_socket(socket_path: &Path) -> IoResult<Option<AbsolutePathBuf>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let protected = protected_socket_path(socket_path)?;
+        if std::fs::read_link(socket_path).ok().as_deref() != Some(protected.as_path()) {
+            return Ok(None);
+        }
+        let directory = std::fs::symlink_metadata(codex_uds::shared_daemon_socket_directory()?)?;
+        // Match the daemon's bind-time check without creating or repairing the directory.
+        if directory.is_dir()
+            && directory.uid() == unsafe { libc::geteuid() }
+            && directory.mode() & 0o777 == 0o700
+        {
+            return AbsolutePathBuf::from_absolute_path(protected).map(Some);
+        }
+        Ok(None)
+    }
+    #[cfg(windows)]
+    {
+        // The TUI revalidates this directory and verifies the peer at connection time,
+        // using the same connect_local_daemon path as implicit startup.
+        let (path, _directory) = codex_uds::validate_private_socket_path(socket_path)?;
+        AbsolutePathBuf::from_absolute_path_checked(path).map(Some)
+    }
 }
 
 #[cfg(unix)]
@@ -445,7 +577,8 @@ async fn set_control_socket_permissions(_socket_path: &Path) -> IoResult<()> {
     Ok(())
 }
 
-struct ControlSocketFileGuard {
+/// Owns the socket files and startup lock until the listener is shut down.
+pub struct DaemonSocketFileGuard {
     socket_path: AbsolutePathBuf,
     #[cfg(unix)]
     rendezvous_path: AbsolutePathBuf,
@@ -456,7 +589,7 @@ struct ControlSocketFileGuard {
     _directory_guard: std::os::windows::io::OwnedHandle,
 }
 
-impl Drop for ControlSocketFileGuard {
+impl Drop for DaemonSocketFileGuard {
     fn drop(&mut self) {
         #[cfg(unix)]
         if std::fs::read_link(self.rendezvous_path.as_path())

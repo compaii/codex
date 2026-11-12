@@ -189,6 +189,7 @@ fn parse_environment_toml(
             }
             let cwd = normalize_stdio_cwd(&id, cwd, config_dir)?;
             ExecServerTransportParams::StdioCommand {
+                process_launcher: None,
                 command: StdioExecServerCommand {
                     program,
                     args: args.unwrap_or_default(),
@@ -655,6 +656,7 @@ mod tests {
         .expect("provider");
 
         let ExecServerTransportParams::StdioCommand {
+            process_launcher: None,
             command,
             initialize_timeout,
         } = &provider.environments[0].transport
@@ -713,6 +715,7 @@ mod tests {
         assert_eq!(*initialize_timeout, Duration::from_secs(34));
 
         let ExecServerTransportParams::StdioCommand {
+            process_launcher: None,
             command,
             initialize_timeout,
         } = &provider.environments[1].transport

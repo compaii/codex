@@ -37,6 +37,7 @@ pub(crate) struct TransportClient {
     pub(crate) inner: reqwest::Client,
     pub(crate) request_logging: RequestLogging,
     default_headers: Arc<HeaderMap>,
+    pub(crate) single_attempt: bool,
 }
 
 impl std::fmt::Debug for TransportClient {
@@ -50,12 +51,18 @@ impl std::fmt::Debug for TransportClient {
 
 impl HttpClient {
     pub fn new(inner: reqwest::Client) -> Self {
-        Self::from_parts(inner, RequestLogging::Enabled, HeaderMap::new())
+        Self {
+            backend: HttpClientBackend::Direct(TransportClient::new(
+                inner,
+                RequestLogging::Enabled,
+                HeaderMap::new(),
+            )),
+        }
     }
 
     /// Suppresses diagnostics for endpoints whose URLs or headers may contain credentials.
     pub fn new_without_request_logging(inner: reqwest::Client) -> Self {
-        Self::from_parts(inner, RequestLogging::Disabled, HeaderMap::new())
+        Self::new(inner).without_request_logging()
     }
 
     /// Suppresses URL and response-header diagnostics while preserving this client's routing.
@@ -80,6 +87,20 @@ impl HttpClient {
                 request_logging,
                 default_headers,
             )),
+        }
+    }
+
+    pub(crate) fn with_single_attempt(mut self, single_attempt: bool) -> Self {
+        if let HttpClientBackend::Direct(client) = &mut self.backend {
+            client.single_attempt = single_attempt;
+        }
+        self
+    }
+
+    pub(crate) fn supports_single_attempt(&self) -> bool {
+        match &self.backend {
+            HttpClientBackend::Direct(client) => client.single_attempt,
+            HttpClientBackend::Routed(pool) => pool.supports_single_attempt(),
         }
     }
 
@@ -129,6 +150,11 @@ pub(crate) fn apply_default_headers(headers: &mut HeaderMap, defaults: &HeaderMa
 }
 
 impl TransportClient {
+    pub(crate) fn with_single_attempt(mut self, single_attempt: bool) -> Self {
+        self.single_attempt = single_attempt;
+        self
+    }
+
     pub(crate) fn new(
         inner: reqwest::Client,
         request_logging: RequestLogging,
@@ -138,6 +164,7 @@ impl TransportClient {
             inner,
             request_logging,
             default_headers: Arc::new(default_headers),
+            single_attempt: false,
         }
     }
 
@@ -148,7 +175,8 @@ impl TransportClient {
         let method = request.method().clone();
         let url = request.url().to_string();
 
-        match self.execute_without_request_logging(request).await {
+        let result = self.execute_without_request_logging(request).await;
+        match result {
             Ok(response) => {
                 self.log_response(&method, &url, &response);
                 Ok(response)

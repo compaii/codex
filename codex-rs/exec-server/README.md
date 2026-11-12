@@ -1,18 +1,33 @@
 # codex-exec-server
 
-`codex-exec-server` is the library backing `codex exec-server`, a small
+`codex-exec-server` is the library backing `codex exec-server` and the standalone
+`codex-exec-server` executable, a small
 JSON-RPC server for spawning and controlling subprocesses through
 `codex-utils-pty`.
 
 It provides:
 
-- a CLI entrypoint: `codex exec-server`
+- CLI entrypoints: `codex exec-server` and `codex-exec-server`
 - a Rust client: `ExecServerClient`
 - a small protocol module with shared request/response types
 
 This crate owns the transport, protocol, and filesystem/process handlers. The
-top-level `codex` binary owns hidden helper dispatch for sandboxed
-filesystem operations and `codex-linux-sandbox`.
+`codex-exec-server-cli` crate shares startup between the two executables. Both
+use `codex-arg0` for hidden filesystem, process, and platform sandbox dispatch.
+The standalone executable accepts the same executor arguments and `-c` config
+overrides, including `--listen stdio`. Build it with
+`cargo build -p codex-exec-server-cli --bin codex-exec-server`.
+Canonical packages place it in `bin/` beside the entrypoint, with platform
+sandbox resources in `codex-resources/`.
+
+For Linux bubblewrap execution, the launcher pins its running executable and,
+only for the host-selected filesystem-helper role, the exact helper invocation
+from that executable or its non-symlink package sibling. Individual read-only
+descriptor mounts under the sealed namespace-local `/dev/codex-runtime` keep
+bootstrap working when the native home is denied. They expose no package directory
+and do not rewrite raw actor programs or widen their filesystem permissions.
+The existing legacy-bubblewrap descriptor verification remains responsible for
+authenticating and closing fallback mount descriptors before actor execution.
 
 ## Command metadata
 
@@ -44,6 +59,32 @@ The CLI entrypoint supports:
 - `ws://IP:PORT` (default)
 - `--remote URL --environment-id ID [--name NAME]`
 - `forward --connect ws://HOST:PORT --remote URL --environment-id ID`
+
+## Execution-owned local stdio
+
+Trusted Rust hosts can use `Environment::owned_stdio` with an existing
+`ProcessLauncher`. This lazy, private environment reuses the stdio protocol,
+process supervisor and remote filesystem/process clients. It does not select a
+configured human environment or expose a launcher through JSON, TOML or RPC.
+The command and working directory must be absolute, the target receives only
+the explicitly supplied environment, and admitted launch closes non-selected
+descriptors before exec. Initialization or connection loss never reconnects this
+private environment or falls back to an unowned executor.
+
+On qualified Linux hosts, `LinuxProcessResourceGroup` can supply the launcher
+for both this actual local executor and a private Code Mode host. Its kernel
+limits cover their descendants together. Finished transient units are collected
+also after forced stop or expiry. A local SSH front does not establish
+remote containment. The caller still owns the turn's deadline, cancellation,
+sandbox permissions, resource authorization and cleanup; this constructor does
+not bind an ordinary turn or grant access to account credentials.
+
+The opted-in `owned_stdio` integration test uses a separately built standalone
+executor and the local user manager. Set `CODEX_TEST_EXEC_SERVER_BIN` to that
+exact binary and run `cargo test -p codex-exec-server --test owned_stdio --
+--ignored`. It checks the actual executor and tool child's group membership,
+sandbox and descriptor separation, useful execution, group closure and refusal
+to restart/repeat effects. It makes no model or provider calls.
 
 ## Authentication
 

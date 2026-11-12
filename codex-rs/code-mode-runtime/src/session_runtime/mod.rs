@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+pub(crate) use codex_code_mode_protocol::FunctionCallOutputContentItem as OutputItem;
 use opentelemetry::context::FutureExt;
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex;
@@ -17,11 +18,9 @@ pub(crate) use self::types::CellEvent;
 pub(crate) use self::types::CellId;
 pub(crate) use self::types::CreateCellRequest;
 pub(crate) use self::types::Error;
-pub(crate) use self::types::ImageDetail;
 pub(crate) use self::types::NestedToolCall;
 pub(crate) use self::types::Observation;
 pub(crate) use self::types::ObserveMode;
-pub(crate) use self::types::OutputItem;
 pub(crate) use self::types::SessionRuntimeDelegate;
 pub(crate) use self::types::ToolDefinition;
 pub(crate) use self::types::ToolKind;
@@ -52,15 +51,25 @@ struct Inner {
     shutdown_token: CancellationToken,
     task_failure_handler: Option<TaskFailureHandler>,
     next_cell_id: AtomicU64,
+    max_heap_size_bytes: Option<usize>,
 }
 
 impl SessionRuntime {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::new_with_task_failure_handler(/*task_failure_handler*/ None)
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_task_failure_handler(
         task_failure_handler: Option<TaskFailureHandler>,
+    ) -> Self {
+        Self::new_with_cell_heap_limit(task_failure_handler, None)
+    }
+
+    pub(crate) fn new_with_cell_heap_limit(
+        task_failure_handler: Option<TaskFailureHandler>,
+        max_heap_size_bytes: Option<usize>,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -70,6 +79,7 @@ impl SessionRuntime {
                 shutdown_token: CancellationToken::new(),
                 task_failure_handler,
                 next_cell_id: AtomicU64::new(1),
+                max_heap_size_bytes,
             }),
         }
     }
@@ -189,6 +199,7 @@ impl SessionRuntime {
             initial_observation,
             cell_state,
             self.inner.task_failure_handler.clone(),
+            self.inner.max_heap_size_bytes,
         )
         .map_err(Error::Runtime)?;
         cells.insert(cell_id.clone(), handle);
@@ -286,20 +297,20 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
     async fn commit_completion(
         &self,
         stored_value_writes: HashMap<String, Arc<JsonValue>>,
-        event: CellEvent,
-        pending_initial_yield_items: Option<Vec<OutputItem>>,
+        event: impl FnOnce() -> CellEvent + Send,
         cell_state: Arc<CellState>,
     ) -> CompletionCommit {
         let cancellation_token = cell_state.cancellation_token();
         let mut stored_values = tokio::select! {
             biased;
             _ = cancellation_token.cancelled() => {
-                return CompletionCommit::Rejected(event);
+                return CompletionCommit::Rejected;
             }
             stored_values = self.inner.stored_values.lock() => stored_values,
         };
-        cell_state.commit_completion(event, pending_initial_yield_items, || {
+        cell_state.commit_completion(event, || {
             stored_values.extend(stored_value_writes);
+            drop(stored_values);
         })
     }
 

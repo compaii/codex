@@ -4,6 +4,8 @@ use super::*;
 use crate::config_panel::ConfigPreference;
 use crate::config_panel::ConfigToggle;
 use crate::config_update::format_config_error;
+use crate::legacy_core::config::load_config_toml_with_layer_stack;
+use crate::local_settings::LocalSettings;
 
 impl App {
     pub(super) async fn save_config_preference(
@@ -34,8 +36,26 @@ impl App {
         } else {
             self.chat_widget.config_ref().cwd.to_path_buf()
         };
-        let resolved = match self.rebuild_config_for_cwd(config_cwd).await {
-            Ok(config) => crate::local_settings::LocalSettings::from(&config),
+        let resolved = match async {
+            let cwd = AbsolutePathBuf::relative_to_current_dir(&config_cwd)?;
+            let bootstrap = load_config_toml_with_layer_stack(
+                self.local_settings.codex_home.as_path(),
+                Some(&cwd),
+                self.cli_kv_overrides.clone(),
+                codex_config::ConfigLoadOptions {
+                    loader_overrides: self.loader_overrides.clone(),
+                    cloud_config_bundle: self.cloud_config_bundle.clone(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            LocalSettings::from_bootstrap(&bootstrap, self.local_settings.codex_home.clone())
+                .map_err(std::io::Error::other)
+        }
+        .await
+        .wrap_err_with(|| format!("Failed to rebuild config for cwd {}", config_cwd.display()))
+        {
+            Ok(settings) => settings,
             Err(error) => {
                 self.chat_widget
                     .refresh_config_panel(
@@ -45,14 +65,9 @@ impl App {
             }
         };
 
-        let requires_restart = matches!(
-            preference,
-            ConfigPreference::Toggle { setting, .. } if setting.requires_restart()
-        );
-        if !requires_restart {
-            preference.adopt(&mut self.local_settings.tui, &resolved.tui);
-            preference.adopt(&mut self.chat_widget.local_settings.tui, &resolved.tui);
-        }
+        preference.adopt(&mut self.local_settings.tui, &resolved.tui);
+        self.chat_widget
+            .apply_config_preference(preference, &resolved.tui);
         if matches!(
             preference,
             ConfigPreference::Toggle {
@@ -67,7 +82,7 @@ impl App {
         self.local_settings.custom_notification_filters = resolved.custom_notification_filters;
         self.chat_widget.local_settings.custom_notification_filters =
             resolved.custom_notification_filters;
-        self.chat_widget.config_panel_tui = resolved.tui.clone();
+        preference.adopt(&mut self.chat_widget.config_panel_tui, &resolved.tui);
         if matches!(
             preference,
             ConfigPreference::Toggle {
@@ -95,9 +110,7 @@ impl App {
             ConfigPreference::ResumeDirectory(mode) => resolved.tui.resume_cwd == mode,
         };
         let notice = if !effective {
-            "Saved · another config layer or system preference overrides this value"
-        } else if requires_restart {
-            "Saved · restart Codex to apply"
+            Some("Saved · overridden by config or system setting")
         } else if matches!(
             preference,
             ConfigPreference::Toggle {
@@ -105,12 +118,17 @@ impl App {
                 ..
             }
         ) {
-            "Saved · applies to new composers"
+            Some("Saved · applies to new composers")
         } else {
-            "Saved"
+            None
         };
-        self.chat_widget
-            .refresh_config_panel(/*notice*/ Some(notice.to_string()));
+        let notice = notice.map(str::to_string);
+        if effective {
+            self.chat_widget
+                .refresh_config_panel_after_effective_save(notice, preference);
+        } else {
+            self.chat_widget.refresh_config_panel(notice);
+        }
         tui.frame_requester().schedule_frame();
     }
 }
@@ -119,7 +137,7 @@ impl App {
     pub(super) fn schedule_config_notification_test(&mut self) {
         if self.config_notification_test_pending.is_some() {
             self.chat_widget.refresh_config_panel(/*notice*/ Some(
-                "A test is already scheduled · switch to another app".into(),
+                "Test already scheduled · switch apps".into(),
             ));
             return;
         }
@@ -128,9 +146,9 @@ impl App {
             .wrapping_add(/*rhs*/ 1);
         let generation = self.config_notification_test_generation;
         self.config_notification_test_pending = Some(generation);
-        self.chat_widget.refresh_config_panel(/*notice*/ Some(
-            "Test scheduled in 5 seconds · switch to another app".into(),
-        ));
+        self.chat_widget.refresh_config_panel(
+            /*notice*/ Some("Test scheduled in 5s · switch apps".into()),
+        );
         let tx = self.app_event_tx.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(/*secs*/ 5)).await;
@@ -144,14 +162,14 @@ impl App {
         }
         self.config_notification_test_pending = None;
         let notice = if !tui.notify_test("Codex notification test") {
-            "Could not send the notification test · check the terminal connection"
+            "Could not send test · check terminal connection"
         } else if codex_terminal_detection::terminal_info().name
             == codex_terminal_detection::TerminalName::Ghostty
             && tui.is_terminal_focused()
         {
-            "Test sent to terminal · Ghostty hides banners while focused; switch apps and retry"
+            "Test sent · Ghostty hides banners while focused"
         } else {
-            "Test sent to terminal · delivery depends on terminal and system settings"
+            "Test sent · check terminal/system settings"
         };
         if !self
             .chat_widget

@@ -53,6 +53,20 @@ pub struct ApplyPatchRequest {
     pub permissions_preapproved: bool,
 }
 
+impl ApplyPatchRequest {
+    pub(crate) fn approval_action(&self, call_id: &str) -> ApprovalAction {
+        ApprovalAction::ApplyPatch {
+            id: call_id.to_string(),
+            environment_id: self.turn_environment.selection.environment_id.clone(),
+            cwd: self.action.cwd.clone(),
+            files: self.file_paths.clone(),
+            patch: self.action.patch.clone(),
+            changes: Arc::clone(&self.changes),
+            permissions_preapproved: self.permissions_preapproved,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct ApplyPatchRuntime {
     committed_delta: AppliedPatchDelta,
@@ -73,31 +87,30 @@ impl ApplyPatchRuntime {
         &self.committed_delta
     }
 
-    fn build_approval_action(req: &ApplyPatchRequest, call_id: &str) -> ApprovalAction {
-        ApprovalAction::ApplyPatch {
-            id: call_id.to_string(),
-            environment_id: req.turn_environment.selection.environment_id.clone(),
-            cwd: req.action.cwd.clone(),
-            files: req.file_paths.clone(),
-            patch: req.action.patch.clone(),
-            changes: Arc::clone(&req.changes),
-            permissions_preapproved: req.permissions_preapproved,
-        }
-    }
-
     fn file_system_sandbox_context_for_attempt(
         req: &ApplyPatchRequest,
         attempt: &SandboxAttempt<'_>,
-    ) -> Option<FileSystemSandboxContext> {
+    ) -> Result<Option<FileSystemSandboxContext>, ToolError> {
+        if attempt.permission_ceiling.is_some()
+            && (!attempt.sandbox_requested
+                || attempt.sandbox_override != codex_protocol::sandbox::SandboxOverride::NoOverride)
+        {
+            return Err(ToolError::Rejected(
+                "host permission ceiling requires filesystem sandbox enforcement without override"
+                    .into(),
+            ));
+        }
         if !attempt.sandbox_requested {
-            return None;
+            return Ok(None);
         }
 
-        let permissions = effective_permission_profile(
-            attempt.exec_server_permissions,
-            req.additional_permissions.as_ref(),
-        );
-        Some(FileSystemSandboxContext {
+        let permissions = attempt
+            .cap_permissions(effective_permission_profile(
+                attempt.exec_server_permissions,
+                req.additional_permissions.as_ref(),
+            ))
+            .map_err(ToolError::Codex)?;
+        Ok(Some(FileSystemSandboxContext {
             sandbox_override: attempt.sandbox_override,
             permissions,
             cwd: attempt.sandbox_cwd.clone(),
@@ -111,7 +124,7 @@ impl ApplyPatchRuntime {
             ),
             windows_sandbox_proxy_settings_mode: None,
             use_legacy_landlock: attempt.use_legacy_landlock,
-        })
+        }))
     }
 }
 
@@ -130,7 +143,7 @@ impl Approvable<ApplyPatchRequest> for ApplyPatchRuntime {
         req: &ApplyPatchRequest,
         call_id: &str,
     ) -> std::io::Result<ApprovalAction> {
-        Ok(ApplyPatchRuntime::build_approval_action(req, call_id))
+        Ok(req.approval_action(call_id))
     }
 
     fn wants_no_sandbox_approval(&self, policy: AskForApproval) -> bool {
@@ -175,7 +188,7 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
     ) -> Result<ApplyPatchRuntimeOutput, ToolError> {
         let started_at = Instant::now();
         let fs = req.turn_environment.environment.get_filesystem();
-        let sandbox = Self::file_system_sandbox_context_for_attempt(req, attempt);
+        let sandbox = Self::file_system_sandbox_context_for_attempt(req, attempt)?;
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let result = codex_apply_patch::apply_patch_with_options(
