@@ -36,27 +36,28 @@ fn bounded_turn_executor_journey(runtime_under_private_home: bool) -> anyhow::Re
         } else {
             tempfile::tempdir()?
         };
-        let packaged_executor = package.path().join("codex-exec-server");
-        if runtime_under_private_home {
-            // Preserve the actual managed layout: the executable itself, not
-            // merely a symlink to an unprotected file, is inside native HOME.
-            if let Err(error) = std::fs::hard_link(&binary, &packaged_executor) {
+        let runner = std::env::current_exe()?;
+        anyhow::ensure!(
+            std::fs::metadata(&runner)?.len() + std::fs::metadata(&binary)?.len()
+                <= 768 * 1024 * 1024,
+            "test runtime package exceeds temporary copy bound"
+        );
+        // Both layouts use one real package, not symlinks to unrelated binaries.
+        // Same-filesystem hard links cost no executable copy. EXDEV copies live
+        // only for this fixture and are bounded together above.
+        for (source, name) in [(&binary, "codex-exec-server"), (&runner, "codex")] {
+            let destination = package.path().join(name);
+            if let Err(error) = std::fs::hard_link(source, &destination) {
                 if error.raw_os_error() != Some(libc::EXDEV) {
                     return Err(error.into());
                 }
-                anyhow::ensure!(
-                    std::fs::metadata(&binary)?.len() <= 256 * 1024 * 1024,
-                    "cross-filesystem test executable exceeds temporary copy bound"
-                );
-                std::fs::copy(&binary, &packaged_executor)?;
+                std::fs::copy(source, destination)?;
             }
-        } else {
-            std::os::unix::fs::symlink(&binary, &packaged_executor)?;
         }
         let credential = native_home.path().join("fake-provider-credential");
         std::fs::write(&credential, "test-only-provider-secret")?;
         let native_alias = native_home.path().join("codex-linux-sandbox");
-        std::os::unix::fs::symlink(std::env::current_exe()?, &native_alias)?;
+        std::os::unix::fs::symlink(package.path().join("codex"), &native_alias)?;
         let recorder = CodeModeHostRecorder::new()?;
         let program = recorder.program();
         let workspace = program.parent().context("recorder workspace")?;
@@ -181,6 +182,22 @@ fn bounded_turn_executor_journey(runtime_under_private_home: bool) -> anyhow::Re
         let script = format!(
             r#"import os, socket, time
 assert os.environ['HOME'] != os.environ['CODEX_HOME']
+runtime = '/dev/codex-runtime'
+assert os.listdir(runtime) == ['codex-linux-sandbox']
+for action in [
+    lambda: os.open(runtime + '/codex-linux-sandbox', os.O_WRONLY),
+    lambda: os.unlink(runtime + '/codex-linux-sandbox'),
+    lambda: os.rename(runtime, runtime + '-moved'),
+    lambda: os.chmod(runtime, 0o777),
+]:
+    try: action()
+    except OSError: pass
+    else: raise AssertionError('runtime bootstrap mount mutable')
+for descriptor in os.listdir('/proc/self/fd'):
+    if int(descriptor) <= 2: continue
+    try: target = os.readlink('/proc/self/fd/' + descriptor)
+    except OSError: continue
+    assert not target.endswith(('/codex', '/codex-exec-server', '/codex-linux-sandbox')), target
 with open(os.path.join(os.environ['HOME'], 'actor-cache'), 'x') as cache: cache.write('owned')
 try: os.listdir(os.environ['CODEX_HOME'])
 except OSError: pass

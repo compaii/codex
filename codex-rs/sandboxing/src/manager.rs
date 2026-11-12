@@ -271,6 +271,7 @@ impl std::error::Error for SandboxTransformError {
 #[derive(Clone, Default)]
 pub struct SandboxManager {
     linux_sandbox_pid_namespace: LinuxSandboxPidNamespace,
+    file_system_helper: bool,
     #[cfg(target_os = "macos")]
     seatbelt_profile: MacosSeatbeltProfile,
     #[cfg(target_os = "macos")]
@@ -286,6 +287,7 @@ impl SandboxManager {
     pub fn for_file_system_helpers() -> Self {
         Self {
             linux_sandbox_pid_namespace: LinuxSandboxPidNamespace::default(),
+            file_system_helper: true,
             #[cfg(target_os = "macos")]
             seatbelt_profile: MacosSeatbeltProfile::FileSystemHelper,
             #[cfg(target_os = "macos")]
@@ -512,6 +514,9 @@ impl SandboxManager {
                     use_legacy_landlock,
                     managed_network.as_ref(),
                 );
+                if self.file_system_helper && (!use_legacy_landlock || managed_network.is_some()) {
+                    args.insert(0, "--trusted-file-system-helper".to_string());
+                }
                 // Keep default invocations compatible with older helpers. Only the
                 // startup opt-in requires a helper that understands PID inheritance.
                 if self.linux_sandbox_pid_namespace == LinuxSandboxPidNamespace::Inherit {

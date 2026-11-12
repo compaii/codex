@@ -109,6 +109,11 @@ pub struct LinuxSandboxCommand {
     #[arg(long = "verify-fd-mount", hide = true)]
     pub verify_fd_mounts: Vec<String>,
 
+    /// Host-selected filesystem helper role. The command is separately authenticated
+    /// against this executable or its exact packaged executor sibling.
+    #[arg(long = "trusted-file-system-helper", hide = true)]
+    pub trusted_file_system_helper: bool,
+
     /// When set, skip mounting a fresh `/proc` even though PID isolation is
     /// still enabled. This is primarily intended for restrictive container
     /// environments that deny `--proc /proc`.
@@ -142,9 +147,10 @@ pub fn run_main() -> ! {
         managed_network,
         proxy_route_spec,
         verify_fd_mounts,
+        trusted_file_system_helper,
         no_proc,
         inherit_pid_namespace,
-        command,
+        mut command,
     } = LinuxSandboxCommand::parse();
     let allow_network_for_proxy = managed_network.is_some();
 
@@ -153,6 +159,9 @@ pub fn run_main() -> ! {
     }
     if !apply_seccomp_then_exec && !verify_fd_mounts.is_empty() {
         panic!("--verify-fd-mount is only supported in the inner sandbox stage");
+    }
+    if trusted_file_system_helper && (apply_seccomp_then_exec || use_legacy_landlock) {
+        panic!("trusted filesystem bootstrap requires the outer bubblewrap stage");
     }
     ensure_inner_stage_mode_is_valid(apply_seccomp_then_exec, use_legacy_landlock);
     let EffectivePermissions {
@@ -297,7 +306,12 @@ pub fn run_main() -> ! {
             crate::wslg::ensure_supported_path(&executable)
                 .unwrap_or_else(|err| exit_with_bwrap_build_error(err));
         }
-        let inner = build_inner_seccomp_command(InnerSeccompCommandArgs {
+        let bootstrap = crate::runtime_bootstrap::RuntimeBootstrap::prepare(
+            &mut command,
+            trusted_file_system_helper,
+        )
+        .unwrap_or_else(|err| panic!("failed to prepare trusted runtime bootstrap: {err}"));
+        let mut inner = build_inner_seccomp_command(InnerSeccompCommandArgs {
             sandbox_policy_cwd: &sandbox_policy_cwd,
             command_cwd: command_cwd.as_deref(),
             permission_profile: &permission_profile,
@@ -305,6 +319,7 @@ pub fn run_main() -> ! {
             proxy_route_spec,
             command,
         });
+        inner[0] = crate::runtime_bootstrap::RUNNER_ALIAS.to_string();
         run_bwrap_with_proc_fallback(
             &sandbox_policy_cwd,
             command_cwd.as_deref(),
@@ -312,6 +327,7 @@ pub fn run_main() -> ! {
             options,
             inner,
             proxy_controls,
+            bootstrap,
         );
     }
 
@@ -393,6 +409,7 @@ fn run_bwrap_with_proc_fallback(
     mut options: BwrapOptions,
     inner: Vec<String>,
     proxy_controls: Vec<File>,
+    bootstrap: crate::runtime_bootstrap::RuntimeBootstrap,
 ) -> ! {
     let command_cwd = command_cwd.unwrap_or(sandbox_policy_cwd);
 
@@ -417,7 +434,14 @@ fn run_bwrap_with_proc_fallback(
     )
     .unwrap_or_else(|err| exit_with_bwrap_build_error(err));
     bwrap_args.preserved_files.extend(proxy_controls);
-    apply_inner_command_argv0(&mut bwrap_args.args);
+    bootstrap
+        .install(&mut bwrap_args)
+        .unwrap_or_else(|err| panic!("failed to install trusted runtime bootstrap: {err}"));
+    apply_inner_command_argv0_for_launcher(
+        &mut bwrap_args.args,
+        preferred_bwrap_supports_argv0(),
+        crate::runtime_bootstrap::RUNNER_ALIAS.to_string(),
+    );
     run_or_exec_bwrap(bwrap_args);
 }
 
@@ -463,14 +487,6 @@ fn exit_with_bwrap_build_error(err: codex_protocol::error::CodexErr) -> ! {
     std::process::exit(1);
 }
 
-fn apply_inner_command_argv0(argv: &mut Vec<String>) {
-    apply_inner_command_argv0_for_launcher(
-        argv,
-        preferred_bwrap_supports_argv0(),
-        current_process_argv0(),
-    );
-}
-
 fn apply_inner_command_argv0_for_launcher(
     argv: &mut Vec<String>,
     supports_argv0: bool,
@@ -494,13 +510,6 @@ fn apply_inner_command_argv0_for_launcher(
         panic!("bubblewrap argv is missing inner command after '--'");
     };
     *command = argv0_fallback_command;
-}
-
-fn current_process_argv0() -> String {
-    match std::env::args_os().next() {
-        Some(argv0) => argv0.to_string_lossy().into_owned(),
-        None => panic!("failed to resolve current process argv[0]"),
-    }
 }
 
 fn preflight_proc_mount_support(options: BwrapOptions) -> CodexResult<bool> {
