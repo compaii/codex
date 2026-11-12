@@ -28,7 +28,7 @@ fn bounded_turn_bootstraps_packaged_executor_under_denied_native_home() -> anyho
 }
 
 fn bounded_turn_executor_journey(runtime_under_private_home: bool) -> anyhow::Result<()> {
-    core_test_support::test_codex::run_test_with_large_stack("owned-turn", || async {
+    core_test_support::test_codex::run_test_with_large_stack("owned-turn", move || async move {
         let binary = std::fs::canonicalize(std::env::var("CODEX_TEST_EXEC_SERVER_BIN")?)?;
         let native_home = tempfile::tempdir()?;
         let package = if runtime_under_private_home {
@@ -44,6 +44,10 @@ fn bounded_turn_executor_journey(runtime_under_private_home: bool) -> anyhow::Re
                 if error.raw_os_error() != Some(libc::EXDEV) {
                     return Err(error.into());
                 }
+                anyhow::ensure!(
+                    std::fs::metadata(&binary)?.len() <= 256 * 1024 * 1024,
+                    "cross-filesystem test executable exceeds temporary copy bound"
+                );
                 std::fs::copy(&binary, &packaged_executor)?;
             }
         } else {
