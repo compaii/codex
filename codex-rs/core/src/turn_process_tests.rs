@@ -207,7 +207,7 @@ fn bounded_turn_executor_journey(
         assert!(control_home.exists());
         let uid = unsafe { libc::geteuid() };
         let script = format!(
-            r#"import os, socket, time
+            r#"import os, socket, subprocess, time
 assert os.environ['HOME'] != os.environ['CODEX_HOME']
 runtime = '/dev/codex-runtime'
 assert os.listdir(runtime) == ['codex-linux-sandbox']
@@ -230,6 +230,11 @@ try: os.listdir(os.environ['CODEX_HOME'])
 except OSError: pass
 else: raise AssertionError('executor control home readable')
 native_home = os.path.dirname(os.environ['FAKE_PROVIDER'])
+try:
+    subprocess.run([os.path.join(native_home, 'codex-linux-sandbox'), '--version'],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+except OSError: pass
+else: raise AssertionError('raw actor executed private runtime alias')
 try: os.unlink(os.path.join(native_home, 'codex-linux-sandbox'))
 except OSError: pass
 else: raise AssertionError('trusted helper alias replaced')
