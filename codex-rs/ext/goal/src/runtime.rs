@@ -685,6 +685,7 @@ impl GoalRuntimeHandle {
     fn resume_after_maintenance(
         runtime: Weak<GoalRuntimeInner>,
         revision: String,
+        expected_previous_turn_id: Option<String>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         Box::pin(async move {
             let Some(inner) = runtime.upgrade() else {
@@ -692,7 +693,7 @@ impl GoalRuntimeHandle {
             };
             let runtime = Self { inner };
             if let Err(error) = runtime
-                .continue_if_idle_matching(Some(&revision), None)
+                .continue_if_idle_matching(Some(&revision), expected_previous_turn_id)
                 .await
             {
                 tracing::warn!(%error, "failed to revalidate withheld goal continuation");
@@ -753,8 +754,11 @@ impl GoalRuntimeHandle {
         }
         let runtime = Arc::downgrade(&self.inner);
         let revision = snapshot.revision;
+        let checkpoint = expected_previous_turn_id.clone();
         let Some(_admission) = thread.admit_goal_continuation(Box::new(move || {
-            tokio::spawn(Self::resume_after_maintenance(runtime, revision));
+            tokio::spawn(Self::resume_after_maintenance(
+                runtime, revision, checkpoint,
+            ));
         })) else {
             return Ok(());
         };

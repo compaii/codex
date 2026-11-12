@@ -216,6 +216,119 @@ async fn managed_maintenance_retry_respects_later_goal_control(change: &str) -> 
 
 // Actual goal extension + Core + managed maintenance, using loopback SSE only.
 #[cfg(unix)]
+#[tokio::test]
+async fn managed_maintenance_preserves_superseded_idle_checkpoint() -> Result<()> {
+    let home = TempDir::new()?;
+    let (release_goal, goal_gate) = oneshot::channel();
+    let (release_blocker, blocker_gate) = oneshot::channel();
+    let (release_human, human_gate) = oneshot::channel();
+    let (mock, _) = start_streaming_sse_server(vec![
+        vec![stream_chunk(Some(goal_gate), "Original goal progress")?],
+        vec![stream_chunk(Some(blocker_gate), "Other admitted work")?],
+        vec![stream_chunk(Some(human_gate), "Human steering completed")?],
+    ])
+    .await;
+    create_config_toml(home.path(), mock.uri(), "never")?;
+    let goal = app_test_support::create_fake_rollout_with_source(
+        home.path(),
+        "2026-09-01T12-00-00",
+        "2026-09-01T12:00:00Z",
+        "Saved checkpoint fixture",
+        Some("mock_provider"),
+        None,
+        codex_protocol::protocol::SessionSource::Cli,
+    )?;
+    let config = home.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "{}\n[features]\ngoals = true\n[goals.continuation_idle_seconds]\n\"{goal}\" = 3\n",
+            std::fs::read_to_string(&config)?
+        ),
+    )?;
+    let socket = home.path().join("control/server.sock");
+    let mut server = spawn_server(home.path(), &socket)?;
+    let mut client = connect_daemon_client(
+        &socket,
+        InitializeCapabilities {
+            experimental_api: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    request(&mut client, 2, "thread/resume", json!({"threadId":goal})).await?;
+    let before = request(
+        &mut client,
+        3,
+        "thread/goal/set",
+        json!({"threadId":goal,"objective":"Preserve checkpoint priority","tokenBudget":100000}),
+    )
+    .await?;
+    wait_for_requests(&mock, 1).await?;
+    let blocker = start_thread(&mut client, 4, json!({})).await?.thread.id;
+    start_turn(&mut client, 5, &blocker).await?;
+    wait_for_requests(&mock, 2).await?;
+    let recovery = daemon_recovery_file_path(home.path());
+    std::fs::create_dir_all(&recovery)?;
+    let mut maintenance = begin_maintenance(&socket).await?;
+    assert_still_running(&mut server, "both admitted turns remain available").await;
+    release_goal
+        .send(())
+        .expect("original goal response waiting");
+    wait_for_checkpoint_turn_completed(&mut client, &goal).await?;
+    // The old checkpoint expires while other work prevents final idle drain.
+    sleep(Duration::from_millis(3300)).await;
+    assert_eq!(mock.requests().await.len(), 2);
+    start_turn(&mut client, 6, &goal).await?;
+    wait_for_requests(&mock, 3).await?;
+    release_human.send(()).expect("human response waiting");
+    wait_for_checkpoint_turn_completed(&mut client, &goal).await?;
+    // Snapshot failure now releases the OLD withheld callback, before the new gap.
+    release_blocker.send(()).expect("other response waiting");
+    assert_eq!(maintenance_outcome(&mut maintenance).await?, "deferred");
+    sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        mock.requests().await.len(),
+        3,
+        "old maintenance callback must not bypass the new physical checkpoint"
+    );
+    let after = request(&mut client, 7, "thread/goal/get", json!({"threadId":goal})).await?;
+    for field in ["objective", "status", "tokenBudget", "createdAt"] {
+        assert_eq!(before["goal"][field], after["goal"][field]);
+    }
+    request(
+        &mut client,
+        8,
+        "thread/goal/set",
+        json!({"threadId":goal,"status":"paused"}),
+    )
+    .await?;
+    std::fs::remove_dir(&recovery)?;
+    request_shutdown(&server, &socket).await?;
+    wait_success(&mut server).await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn wait_for_checkpoint_turn_completed(
+    client: &mut WebSocketStream<UnixStream>,
+    thread: &str,
+) -> Result<()> {
+    timeout(DEFAULT_READ_TIMEOUT, async {
+        loop {
+            let Message::Text(text) = client.next().await.context("socket closed")?? else {
+                continue;
+            };
+            let message: serde_json::Value = serde_json::from_str(&text)?;
+            if message["method"] == "turn/completed" && message["params"]["threadId"] == thread {
+                return Ok::<(), anyhow::Error>(());
+            }
+        }
+    })
+    .await?
+}
+
+#[cfg(unix)]
 #[test_case::test_case(false; "handoff")]
 #[test_case::test_case(true; "snapshot_failure_resumes_once")]
 #[tokio::test]

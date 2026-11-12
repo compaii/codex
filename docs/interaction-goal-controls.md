@@ -128,6 +128,8 @@ accounting alone does not change, and an exact physical native checkpoint. Fresh
 internal automatic admission atomically rejects a newer started turn even if it
 already completed. It uses ordinary automatic-input and Plan restrictions; it is
 not recovery of the predecessor and inherits no reserved inference allocation.
+If maintenance withholds admission, its resumption callback retains that same
+physical checkpoint; defer cannot revive an older callback after human work.
 Bounded recovery still requires fresh reserved admission. No user original is
 manufactured and an active ordinary turn is never steered.
 
