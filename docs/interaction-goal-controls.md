@@ -106,10 +106,14 @@ below are placeholders, not routing or activation authority:
 
 ```toml
 [goals.continuation_idle_seconds]
-"019d1000-0000-7000-8000-000000000001" = 90
+"019d1000-0000-7000-8000-000000000001" = 45
 ```
 
-At most 128 entries are accepted, with 0 through 300 seconds each. The gap leaves
+At most 128 entries are accepted, with 0 through 300 seconds each. For an
+unsubscribed runtime that must keep continuing, select a gap shorter than its
+existing `thread_unload_delay_secs`: the default retention is 60 seconds, so the
+example uses 45. Unloading is teardown and cancels the callback. Do not extend
+unrelated retention settings to manufacture an idle test. The gap leaves
 an active goal and its full objective, identity, token budget and cumulative
 accounting unchanged. Explicit activation and human input retain immediate
 admission. The ordinary queue runs before goal continuation. This is a checkpoint
