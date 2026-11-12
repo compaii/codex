@@ -20,6 +20,15 @@ overrides, including `--listen stdio`. Build it with
 Canonical packages place it in `bin/` beside the entrypoint, with platform
 sandbox resources in `codex-resources/`.
 
+For Linux bubblewrap execution, the launcher pins its running executable and,
+only for the host-selected filesystem-helper role, the exact helper invocation
+from that executable or its non-symlink package sibling. Individual read-only
+descriptor mounts under the sealed namespace-local `/dev/codex-runtime` keep
+bootstrap working when the native home is denied. They expose no package directory
+and do not rewrite raw actor programs or widen their filesystem permissions.
+The existing legacy-bubblewrap descriptor verification remains responsible for
+authenticating and closing fallback mount descriptors before actor execution.
+
 ## Command metadata
 
 Launches expose `metadata.threadId` as `CODEX_THREAD_ID` and `metadata.toolCallId`

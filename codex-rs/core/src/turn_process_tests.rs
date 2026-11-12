@@ -18,18 +18,114 @@ use std::time::Duration;
 #[test]
 #[ignore = "requires the standalone executor/V8 binaries and an explicitly selected own user manager"]
 fn bounded_turn_shares_actual_executors_and_closes_retained_steps() -> anyhow::Result<()> {
-    core_test_support::test_codex::run_test_with_large_stack("owned-turn", || async {
+    bounded_turn_executor_journey(false, false)
+}
+
+#[test]
+#[ignore = "requires the standalone executor/V8 binaries and an explicitly selected own user manager"]
+fn bounded_turn_bootstraps_packaged_executor_under_denied_native_home() -> anyhow::Result<()> {
+    bounded_turn_executor_journey(true, false)
+}
+
+#[test]
+#[ignore = "requires the standalone executor/V8 binaries, system bwrap, cc and an explicitly selected own user manager"]
+fn bounded_turn_bootstraps_denied_runtime_with_legacy_bwrap_mounts() -> anyhow::Result<()> {
+    bounded_turn_executor_journey(true, true)
+}
+
+fn bounded_turn_executor_journey(
+    runtime_under_private_home: bool,
+    legacy_bwrap: bool,
+) -> anyhow::Result<()> {
+    core_test_support::test_codex::run_test_with_large_stack("owned-turn", move || async move {
         let binary = std::fs::canonicalize(std::env::var("CODEX_TEST_EXEC_SERVER_BIN")?)?;
-        let package = tempfile::tempdir()?;
-        std::os::unix::fs::symlink(binary, package.path().join("codex-exec-server"))?;
         let native_home = tempfile::tempdir()?;
+        let package = if runtime_under_private_home {
+            tempfile::tempdir_in(native_home.path())?
+        } else {
+            tempfile::tempdir()?
+        };
+        let runner = std::env::current_exe()?;
+        anyhow::ensure!(
+            std::fs::metadata(&runner)?.len() + std::fs::metadata(&binary)?.len()
+                <= 768 * 1024 * 1024,
+            "test runtime package exceeds temporary copy bound"
+        );
+        // Both layouts use one real package, not symlinks to unrelated binaries.
+        // Same-filesystem hard links cost no executable copy. EXDEV copies live
+        // only for this fixture and are bounded together above.
+        for (source, name) in [(&binary, "codex-exec-server"), (&runner, "codex")] {
+            let destination = package.path().join(name);
+            if let Err(error) = std::fs::hard_link(source, &destination) {
+                if error.raw_os_error() != Some(libc::EXDEV) {
+                    return Err(error.into());
+                }
+                std::fs::copy(source, destination)?;
+            }
+        }
         let credential = native_home.path().join("fake-provider-credential");
         std::fs::write(&credential, "test-only-provider-secret")?;
         let native_alias = native_home.path().join("codex-linux-sandbox");
-        std::os::unix::fs::symlink(std::env::current_exe()?, &native_alias)?;
+        std::os::unix::fs::symlink(package.path().join("codex"), &native_alias)?;
         let recorder = CodeModeHostRecorder::new()?;
         let program = recorder.program();
         let workspace = program.parent().context("recorder workspace")?;
+        let path = if legacy_bwrap {
+            // Pre-sandbox executable discovery correctly rejects actor-writable
+            // PATH entries. Keep this host-owned test wrapper in the denied
+            // runtime package, outside the actor cwd and writable workspace.
+            let wrapper = package.path().join("bwrap");
+            let marker = workspace.join("legacy-bwrap-used");
+            let actual_bwrap = std::fs::canonicalize("/usr/bin/bwrap")?;
+            let source = package.path().join("legacy-bwrap.c");
+            std::fs::write(
+                &source,
+                format!(
+                    r#"#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+int main(int argc, char **argv) {{
+    if (argc == 2 && strcmp(argv[1], "--help") == 0) {{
+        puts("--perms --as-pid-1");
+        return 0;
+    }}
+    int verified = 0;
+    for (int i = 1; i < argc; i++) {{
+        if (!strcmp(argv[i], "--argv0") || !strcmp(argv[i], "--ro-bind-fd")) return 112;
+        if (!strcmp(argv[i], "--verify-fd-mount")) verified = 1;
+    }}
+    int marker = open({marker:?}, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    const char *record = verified ? "verified\n" : "preflight\n";
+    if (marker < 0 || write(marker, record, strlen(record)) != strlen(record)) return 110;
+    close(marker);
+    argv[0] = {actual_bwrap:?};
+    execv(argv[0], argv);
+    return 111;
+}}
+"#,
+                    marker = marker.to_string_lossy(),
+                    actual_bwrap = actual_bwrap.to_string_lossy(),
+                ),
+            )?;
+            // Match a native system bwrap, including its mandatory capability
+            // probe. The wrapper rejects modern flags and records the actual
+            // inherited-FD verification route, so fallback cannot pass silently.
+            let compile = std::process::Command::new("/usr/bin/cc")
+                .args([
+                    source.as_os_str(),
+                    std::ffi::OsStr::new("-o"),
+                    wrapper.as_os_str(),
+                ])
+                .output()?;
+            anyhow::ensure!(
+                compile.status.success(),
+                "legacy bwrap fixture compile failed"
+            );
+            format!("{}:/usr/bin:/bin", package.path().display())
+        } else {
+            "/usr/bin:/bin".to_string()
+        };
         let (session, _, _events) =
             crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
                 codex_login::CodexAuth::from_api_key("Test API Key"),
@@ -101,7 +197,7 @@ fn bounded_turn_shares_actual_executors_and_closes_retained_steps() -> anyhow::R
                     command_environment_policy: Some(ShellEnvironmentPolicy {
                         inherit: ShellEnvironmentPolicyInherit::None,
                         r#set: HashMap::from([
-                            ("PATH".into(), "/usr/bin:/bin".into()),
+                            ("PATH".into(), path.clone()),
                             (
                                 "CODEX_TEST_CODE_MODE_RECORDER".into(),
                                 workspace.to_string_lossy().into_owned(),
@@ -149,13 +245,34 @@ fn bounded_turn_shares_actual_executors_and_closes_retained_steps() -> anyhow::R
         assert!(control_home.exists());
         let uid = unsafe { libc::geteuid() };
         let script = format!(
-            r#"import os, socket, time
+            r#"import os, socket, subprocess, time
 assert os.environ['HOME'] != os.environ['CODEX_HOME']
+runtime = '/dev/codex-runtime'
+assert os.listdir(runtime) == ['codex-linux-sandbox']
+for action in [
+    lambda: os.open(runtime + '/codex-linux-sandbox', os.O_WRONLY),
+    lambda: os.unlink(runtime + '/codex-linux-sandbox'),
+    lambda: os.rename(runtime, runtime + '-moved'),
+    lambda: os.chmod(runtime, 0o777),
+]:
+    try: action()
+    except OSError: pass
+    else: raise AssertionError('runtime bootstrap mount mutable')
+for descriptor in os.listdir('/proc/self/fd'):
+    if int(descriptor) <= 2: continue
+    try: target = os.readlink('/proc/self/fd/' + descriptor)
+    except OSError: continue
+    assert not target.endswith(('/codex', '/codex-exec-server', '/codex-linux-sandbox')), target
 with open(os.path.join(os.environ['HOME'], 'actor-cache'), 'x') as cache: cache.write('owned')
 try: os.listdir(os.environ['CODEX_HOME'])
 except OSError: pass
 else: raise AssertionError('executor control home readable')
 native_home = os.path.dirname(os.environ['FAKE_PROVIDER'])
+try:
+    subprocess.run([os.path.join(native_home, 'codex-linux-sandbox'), '--version'],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+except OSError: pass
+else: raise AssertionError('raw actor executed private runtime alias')
 try: os.unlink(os.path.join(native_home, 'codex-linux-sandbox'))
 except OSError: pass
 else: raise AssertionError('trusted helper alias replaced')
@@ -317,6 +434,13 @@ time.sleep(120)
         assert!(!cgroup.exists());
         assert!(backend.start(parameters("after-finish")).await.is_err());
         assert_eq!(std::fs::read_to_string(workspace.join("effect"))?, "once\n");
+        if legacy_bwrap {
+            assert!(
+                std::fs::read_to_string(workspace.join("legacy-bwrap-used"))
+                    .context("legacy bubblewrap wrapper must have been selected")?
+                    .contains("verified")
+            );
+        }
         let (ordinary, _) = session
             .new_turn_with_sub_id(
                 "ordinary-after-process-owner".into(),
