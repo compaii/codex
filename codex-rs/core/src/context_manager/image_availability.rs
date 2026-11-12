@@ -432,7 +432,7 @@ mod bounded_preview_tests {
         assert!(text_before == text_after, "retained text changed");
         assert!(before > 8 * 1024 * 1024);
         assert!(after < 4 * 1024 * 1024);
-        println!(
+        tracing::debug!(
             "Selected retained input projected: before_bytes={before}, after_bytes={after}; original file read-only; zero provider requests"
         );
     }

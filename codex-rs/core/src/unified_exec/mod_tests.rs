@@ -317,7 +317,7 @@ async fn write_stdin(
     yield_time_ms: u64,
 ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
     let manager = &session.services.unified_exec_manager;
-    let terminal = manager.resolve_terminal(process_id, &turn).await?;
+    let terminal = manager.resolve_terminal(process_id, turn).await?;
     manager
         .write_stdin(
             &UnifiedExecContext::new(

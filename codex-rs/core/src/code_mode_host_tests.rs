@@ -139,7 +139,9 @@ async fn grpc_stdio_host_exits_when_stdin_closes() -> Result<()> {
         &codex_utils_cargo_bin::cargo_bin("codex-code-mode-host")?,
         None,
         None,
-    )?;
+        None,
+    )
+    .await?;
     let mut child = connection.child.take().context("host process")?;
     drop(connection);
     let status = timeout(TEST_TIMEOUT, child.wait())
@@ -215,5 +217,136 @@ async fn hung_grpc_stdio_host_is_reaped_and_the_session_recovers() -> Result<()>
         "the session must reconnect to a fresh gRPC host"
     );
     session.shutdown().await.map_err(anyhow::Error::msg)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires an explicitly selected local user-manager resource qualification"]
+async fn resource_owned_grpc_host_keeps_sandbox_and_stops_with_group() -> Result<()> {
+    use codex_protocol::permissions::{
+        FileSystemAccessMode, FileSystemSandboxEntry, FileSystemSandboxPolicy, NetworkSandboxPolicy,
+    };
+    use codex_utils_absolute_path::AbsolutePathBuf;
+    use codex_utils_pty::linux_resources::{LinuxProcessLimits, LinuxProcessResourceGroup};
+    let recorder = CodeModeHostRecorder::new()?;
+    recorder.enable_inheritable_descriptor_probe().await?;
+    let program = recorder.program();
+    let root = program.parent().context("recorder directory")?;
+    let alias_dir = tempfile::tempdir()?;
+    let alias = alias_dir.path().join("codex-linux-sandbox");
+    std::os::unix::fs::symlink(std::env::current_exe()?, &alias)?;
+    let mut policy = FileSystemSandboxPolicy::read_only();
+    for (path, mode) in [
+        (root.to_path_buf(), FileSystemAccessMode::Write),
+        (root.join("blocked credential"), FileSystemAccessMode::Deny),
+        (
+            std::path::PathBuf::from("/sys/fs/cgroup"),
+            FileSystemAccessMode::Deny,
+        ),
+        (
+            std::path::PathBuf::from(format!("/run/user/{}", unsafe { libc::geteuid() })),
+            FileSystemAccessMode::Deny,
+        ),
+    ] {
+        policy.entries.push(FileSystemSandboxEntry::new(
+            AbsolutePathBuf::from_absolute_path(path)?.into(),
+            mode,
+        ));
+    }
+    let group = Arc::new(
+        LinuxProcessResourceGroup::start(
+            LinuxProcessLimits {
+                memory_bytes: 512 * 1024 * 1024,
+                cpu_percent: 50,
+                tasks: 128,
+            },
+            Duration::from_secs(30),
+        )
+        .await?,
+    );
+    let guarded_program = root.join("resource guard wrapper");
+    codex_utils_cargo_bin::write_executable(
+        &guarded_program,
+        &format!(
+            r#"#!/bin/sh
+/usr/bin/python3 - <<'PY_RESOURCE_GUARD'
+import errno, os, socket
+try:
+    os.listdir('/sys/fs/cgroup')
+except OSError as e:
+    assert e.errno in (errno.EPERM, errno.EACCES, errno.ENOENT), e
+else:
+    raise AssertionError('resource cgroup path exposed')
+s = None
+try:
+    s = socket.socket(socket.AF_UNIX)
+    s.connect('/run/user/{uid}/bus')
+except OSError as e:
+    assert e.errno in (errno.EPERM, errno.EACCES, errno.ENOENT), e
+else:
+    raise AssertionError('resource manager bus connected')
+finally:
+    if s is not None: s.close()
+PY_RESOURCE_GUARD
+[ "$?" -eq 0 ] || exit 1
+exec {recorder_program} "$@"
+"#,
+            uid = unsafe { libc::geteuid() },
+            recorder_program = shlex::try_quote(program.to_str().context("host path")?)?
+        ),
+    )?;
+    let provider = ProcessOwnedGrpcCodeModeSessionProvider::with_host_program(guarded_program);
+    let session = provider
+        .create_isolated_session_with_options(
+            codex_code_mode::CodeModeSessionOptions {
+                cell_execution_limits: codex_code_mode::CodeModeSessionCellExecutionLimits {
+                    max_yield_time_ms: Some(1000),
+                    max_heap_size_bytes: Some(32 * 1024 * 1024),
+                },
+                ..Default::default()
+            },
+            codex_code_mode::CodeModeHostOptions {
+                environment: Some(std::collections::HashMap::from([
+                    ("PATH".into(), "/usr/bin:/bin".into()),
+                    (
+                        "CODEX_TEST_CODE_MODE_RECORDER".into(),
+                        root.to_string_lossy().into_owned(),
+                    ),
+                ])),
+                sandbox: Some(codex_code_mode::CodeModeHostSandbox {
+                    permissions:
+                        codex_protocol::models::PermissionProfile::from_runtime_permissions(
+                            &policy,
+                            NetworkSandboxPolicy::Restricted,
+                        ),
+                    cwd: root.to_path_buf(),
+                    linux_sandbox_exe: alias,
+                }),
+                process_launcher: Some(group.clone()),
+            },
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(
+        execute(&session, "text('resource-owned');").await?,
+        vec![FunctionCallOutputContentItem::InputText {
+            text: "resource-owned".into()
+        }]
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("guard result"))?,
+        "guarded"
+    );
+    let pid = recorder.pid()?;
+    let membership = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))?;
+    assert!(membership.trim().ends_with(group.identity().0));
+    group.close().await?;
+    assert!(
+        execute(&session, "text('must not restart');")
+            .await
+            .is_err()
+    );
+    assert_eq!(recorder.invocations()?.len(), 1);
     Ok(())
 }

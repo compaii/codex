@@ -159,6 +159,7 @@ impl CodeModeService {
         let host_options = codex_code_mode::CodeModeHostOptions {
             environment: host_environment,
             sandbox,
+            process_launcher: None,
         };
         state.session.get_or_try_init(|| async {
             let inner = tokio::select! {

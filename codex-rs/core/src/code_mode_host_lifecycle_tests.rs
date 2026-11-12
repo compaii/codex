@@ -72,6 +72,8 @@ async fn child_exit_after_channel_selection_does_not_replay_execution() -> Resul
     let transport = Arc::new(HostTransport {
         host_environment: None,
         host_sandbox: None,
+        process_launcher: None,
+        spawn_lock: tokio::sync::Semaphore::new(1),
         closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         host_program: recorder.program(),
         current: Arc::new(Mutex::new(None)),
@@ -91,7 +93,7 @@ async fn child_exit_after_channel_selection_does_not_replay_execution() -> Resul
             async move {
                 // Exercise the production selector, pausing exactly between
                 // selecting a live generation and dispatching to that channel.
-                let channel = transport.channel(request.uri().path())?;
+                let channel = transport.channel(request.uri().path()).await?;
                 if request.uri().path() == "/codex.code_mode.v1.CodeModeHost/Execute"
                     && armed.swap(false, Ordering::SeqCst)
                 {

@@ -1904,9 +1904,7 @@ async fn host_permission_ceiling_enforces_real_files_after_old_and_new_grants_wi
             config.codex_self_exe = Some(executable);
             config.codex_linux_sandbox_exe = sandbox_alias;
             config.cwd = selected_root.clone();
-            config
-                .permissions
-                .set_workspace_roots(vec![selected_root.clone()]);
+            config.permissions.set_workspace_roots(vec![selected_root]);
             config
                 .permissions
                 .set_permission_profile(PermissionProfile::Disabled)

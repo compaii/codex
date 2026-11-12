@@ -59,6 +59,8 @@ pub enum CodeModeOutputTruncation {
 pub struct CodeModeHostOptions {
     pub environment: Option<HashMap<String, String>>,
     pub sandbox: Option<CodeModeHostSandbox>,
+    /// Trusted execution-owned launcher; never serialized or selected by a cell.
+    pub process_launcher: Option<Arc<dyn codex_utils_pty::ProcessLauncher>>,
 }
 
 /// An already resolved local permission snapshot. The host engine stays offline;
