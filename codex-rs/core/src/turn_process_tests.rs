@@ -18,11 +18,37 @@ use std::time::Duration;
 #[test]
 #[ignore = "requires the standalone executor/V8 binaries and an explicitly selected own user manager"]
 fn bounded_turn_shares_actual_executors_and_closes_retained_steps() -> anyhow::Result<()> {
+    bounded_turn_executor_journey(false)
+}
+
+#[test]
+#[ignore = "requires the standalone executor/V8 binaries and an explicitly selected own user manager"]
+fn bounded_turn_bootstraps_packaged_executor_under_denied_native_home() -> anyhow::Result<()> {
+    bounded_turn_executor_journey(true)
+}
+
+fn bounded_turn_executor_journey(runtime_under_private_home: bool) -> anyhow::Result<()> {
     core_test_support::test_codex::run_test_with_large_stack("owned-turn", || async {
         let binary = std::fs::canonicalize(std::env::var("CODEX_TEST_EXEC_SERVER_BIN")?)?;
-        let package = tempfile::tempdir()?;
-        std::os::unix::fs::symlink(binary, package.path().join("codex-exec-server"))?;
         let native_home = tempfile::tempdir()?;
+        let package = if runtime_under_private_home {
+            tempfile::tempdir_in(native_home.path())?
+        } else {
+            tempfile::tempdir()?
+        };
+        let packaged_executor = package.path().join("codex-exec-server");
+        if runtime_under_private_home {
+            // Preserve the actual managed layout: the executable itself, not
+            // merely a symlink to an unprotected file, is inside native HOME.
+            if let Err(error) = std::fs::hard_link(&binary, &packaged_executor) {
+                if error.raw_os_error() != Some(libc::EXDEV) {
+                    return Err(error.into());
+                }
+                std::fs::copy(&binary, &packaged_executor)?;
+            }
+        } else {
+            std::os::unix::fs::symlink(&binary, &packaged_executor)?;
+        }
         let credential = native_home.path().join("fake-provider-credential");
         std::fs::write(&credential, "test-only-provider-secret")?;
         let native_alias = native_home.path().join("codex-linux-sandbox");
