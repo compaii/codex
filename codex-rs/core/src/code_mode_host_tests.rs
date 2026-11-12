@@ -224,11 +224,13 @@ async fn hung_grpc_stdio_host_is_reaped_and_the_session_recovers() -> Result<()>
 #[tokio::test]
 #[ignore = "requires an explicitly selected local user-manager resource qualification"]
 async fn resource_owned_grpc_host_keeps_sandbox_and_stops_with_group() -> Result<()> {
-    use codex_protocol::permissions::{
-        FileSystemAccessMode, FileSystemSandboxEntry, FileSystemSandboxPolicy, NetworkSandboxPolicy,
-    };
+    use codex_protocol::permissions::FileSystemAccessMode;
+    use codex_protocol::permissions::FileSystemSandboxEntry;
+    use codex_protocol::permissions::FileSystemSandboxPolicy;
+    use codex_protocol::permissions::NetworkSandboxPolicy;
     use codex_utils_absolute_path::AbsolutePathBuf;
-    use codex_utils_pty::linux_resources::{LinuxProcessLimits, LinuxProcessResourceGroup};
+    use codex_utils_pty::linux_resources::LinuxProcessLimits;
+    use codex_utils_pty::linux_resources::LinuxProcessResourceGroup;
     let recorder = CodeModeHostRecorder::new()?;
     recorder.enable_inheritable_descriptor_probe().await?;
     let program = recorder.program();
