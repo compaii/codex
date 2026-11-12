@@ -111,6 +111,17 @@ impl PreparedTurnInputSettings {
         thread_settings: impl Into<WithTurnExtensionData<ThreadSettingsOverrides>>,
         start_options: TurnStartOptions,
     ) -> CodexResult<Self> {
+        if let Some(limits) = &start_options.code_mode_limits
+            && (limits.max_heap_size_bytes == 0
+                || usize::try_from(limits.max_heap_size_bytes).is_err()
+                || limits.max_yield_time_ms == 0
+                || start_options.command_environment_policy.is_none()
+                || start_options.permission_ceiling.is_none())
+        {
+            return Err(CodexErr::InvalidRequest(
+                "Code Mode limits require positive platform-sized values and explicit host permission/environment ceilings".into(),
+            ));
+        }
         if start_options.provider_attempt_gate.is_some()
             && start_options.inference_allowance.is_none()
         {
@@ -203,6 +214,7 @@ impl PreparedTurnInputSettings {
         kind: TurnStartKind,
     ) -> CodexResult<Option<Arc<TurnContext>>> {
         let TurnStartOptions {
+            code_mode_limits,
             command_environment_policy,
             permission_ceiling,
             tool_ceiling,
@@ -226,6 +238,7 @@ impl PreparedTurnInputSettings {
         updates.service_tier_for_turn = service_tier;
 
         let options = NewTurnContextOptions {
+            code_mode_limits,
             command_environment_policy,
             permission_ceiling,
             tool_ceiling,
@@ -354,7 +367,8 @@ pub(super) async fn handle(
         .values()
         .try_for_each(AdditionalContextEntry::validate)
         .map_err(|message| CodexErr::InvalidRequest(message.to_owned()))?;
-    if (request.request.start.tool_ceiling.is_some()
+    if (request.request.start.code_mode_limits.is_some()
+        || request.request.start.tool_ceiling.is_some()
         || request.request.start.permission_ceiling.is_some()
         || request.request.start.command_environment_policy.is_some())
         && !matches!(mode, TurnInputMode::StartIfIdle)

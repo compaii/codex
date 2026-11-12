@@ -226,6 +226,14 @@ pub struct TurnInferenceAllowance {
     pub deadline_unix_ms: i64,
 }
 
+/// Explicit per-execution Code Mode limits, captured without changing thread data.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TurnCodeModeLimits {
+    pub max_heap_size_bytes: u64,
+    pub max_yield_time_ms: u64,
+}
+
 /// Options for the new-turn branch of a submission.
 ///
 /// Core only records these options when input starts a turn. When input steers,
@@ -234,6 +242,8 @@ pub struct TurnInferenceAllowance {
 /// child input, Core also compares root lineage to detect ambiguity.
 #[derive(Clone, Debug, Default)]
 pub struct TurnStartOptions {
+    /// Transient host selection; never replaces inherited thread extension data.
+    pub code_mode_limits: Option<TurnCodeModeLimits>,
     /// Host-only explicit shell policy for this bounded execution, not thread state.
     /// Requires a permission ceiling; parent inheritance and login profiles are disabled.
     pub command_environment_policy: Option<crate::config_types::ShellEnvironmentPolicy>,

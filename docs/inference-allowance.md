@@ -260,7 +260,7 @@ account, provider selection, model call or runtime activation follows here.
 An embedding host can additionally set `TurnStartOptions.tool_ceiling` to an
 explicit list of `ToolName` values. `None` preserves ordinary selection; an empty
 list exposes no tools. This option requires a finite inference allowance and
-idle-only admission. It is not currently an app-server JSON option.
+idle-only admission. The bounded app-server adapter below selects this ceiling as part of one complete host restriction; ordinary turn methods expose no independent tool-ceiling setting.
 
 Core captures the list in a private turn attachment, intersects it with the
 startup `ToolPolicy`, and uses that intersection before constructing core,
@@ -304,7 +304,7 @@ not a process-containment or complete financial-isolation claim.
 A host can also set `TurnStartOptions.permission_ceiling` to an already resolved
 `PermissionProfile` (including a profile resolved from the existing named-profile
 configuration). This requires managed restrictive permissions, explicit tools and
-a finite allowance. It remains host-only; app-server starts leave it unset.
+a finite allowance. It is host input; the bounded app-server adapter resolves the existing named permissions configuration into this ceiling without persisting it.
 
 The ceiling intersects the captured local environment's original permissions,
 then is captured privately with the turn. Each new step and resolved tool
@@ -341,7 +341,7 @@ Selecting this policy, a host tool ceiling or a permission ceiling makes positiv
 heap and observation limits mandatory for Code Mode. Ordinary turns and legacy
 allowance-only attention retain their existing thread session; the legacy path
 is not qualified for monetary isolation and must migrate before funded rollout.
-This is not a model-selected option or a public bounded-start JSON field.
+This embedding API remains available. The bounded app-server adapter below uses transient start-only limits instead of replacing inherited thread extension data.
 
 Host-restricted bounded turns use the provider's process-isolated session operation. Unsupported
 providers refuse before opening an ordinary/shared session. Core's local gRPC
@@ -426,7 +426,7 @@ existing `ShellEnvironmentPolicy` for one bounded execution. It requires the
 existing permission ceiling (and therefore its finite allowance, explicit tools
 and idle-only admission), `inherit = None`, `use_profile = false`, and at most256
 explicit values totaling64KiB of names/values. It is not a model tool argument or
-new app-server JSON option. The host supplies an appropriate explicit PATH when
+ordinary turn JSON option. The host supplies an appropriate explicit PATH when
 its launcher needs system tools; Core does not guess a receiving PATH.
 
 Core copies the policy into private turn state, applies it to the initial local
@@ -508,3 +508,35 @@ This implements and exercises the host kernel boundary, not every receiving
 private path or the complete economic profile. Total RSS/external buffers,
 trusted startup, full tool/provider exposure, real accounting authority
 and composed receiving selection remain required.
+
+### Complete bounded native host restriction selection
+
+`turn/startBoundedIfIdle` accepts optional `hostRestrictions` alongside the
+existing required allowance and optional owner reservation cycle. Its four
+required fields are `permissions` (an existing named permissions profile),
+`tools` (explicit name/namespace identifiers), `environment` (explicit values
+only), and `codeModeLimits` (`maxHeapSizeBytes`, `maxYieldTimeMs`). Unknown or
+partial selections are refused. Older closed bounded readers reject the field;
+a caller must never retry without it. Omission preserves legacy behavior.
+
+The server resolves the named profile using the current thread, requested cwd
+and existing managed requirements. A disallowed selection is rejected rather
+than accepted through a startup fallback. This is an additional ceiling over
+each environment and later grants, not a new permission grant or a replacement
+for ordinary thread permissions. No parallel profile registry is introduced.
+
+The adapter supplies the existing start-only tool/permission/environment
+primitives, disabling environment inheritance and login profiles. Core validates
+positive, platform-sized Code Mode limits together with the finite allowance and
+complete host selection before accepting settings. It captures those limits in
+private per-turn session state with server output truncation. Neither the named
+permission choice nor Code Mode limits replace saved thread extension data. A busy
+refusal leaves no queued input; an independent ordinary follow-up retains its
+original permissions, environment, tools and Code Mode session selection.
+
+This selects the implemented native isolation primitives together; it does not
+qualify a particular receiving profile, total RSS/external-buffer/stored-state
+bounds, trusted startup, all allowed tool/provider routes, prices or monetary
+authority. The owner still reserves and retains the exact original allocation
+and uncertain effects through the existing accounting path. No default budget,
+provider, receiving configuration, lane or model execution is selected here.

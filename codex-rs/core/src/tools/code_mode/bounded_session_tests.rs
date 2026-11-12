@@ -35,6 +35,44 @@ async fn sandbox_session() -> (
     .await
 }
 
+#[tokio::test]
+async fn start_only_code_mode_limits_do_not_change_thread_extension_data() -> anyhow::Result<()> {
+    let (session, _, _events) = sandbox_session().await;
+    let (bounded, _) = session
+        .new_turn_with_sub_id(
+            "transient-code-mode".into(),
+            Default::default(),
+            crate::session::turn_context::NewTurnContextOptions {
+                code_mode_limits: Some(codex_protocol::turn_input::TurnCodeModeLimits {
+                    max_heap_size_bytes: 32 * 1024 * 1024,
+                    max_yield_time_ms: 1000,
+                }),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(
+        bounded
+            .extension_data
+            .get::<BoundedSessionState>()
+            .is_some()
+    );
+    let (ordinary, _) = session
+        .new_turn_with_sub_id(
+            "ordinary-after-transient-code-mode".into(),
+            Default::default(),
+            Default::default(),
+        )
+        .await?;
+    assert!(
+        ordinary
+            .extension_data
+            .get::<BoundedSessionState>()
+            .is_none()
+    );
+    Ok(())
+}
+
 async fn context(
     session: &Arc<Session>,
     name: &str,
@@ -65,10 +103,12 @@ async fn context(
         );
     }
     let mut init = ExtensionDataInit::new();
+    // The new start-only selection must override a broader inherited host
+    // policy. The native heap probe fits this 1 GiB policy but not its own 32 MiB.
     init.insert(BoundedCodeModeOptions(CodeModeSessionOptions {
         cell_execution_limits: CodeModeSessionCellExecutionLimits {
-            max_yield_time_ms: Some(1000),
-            max_heap_size_bytes: Some(32 * 1024 * 1024),
+            max_yield_time_ms: Some(10_000),
+            max_heap_size_bytes: Some(1024 * 1024 * 1024),
         },
         output_truncation: CodeModeOutputTruncation::Server,
     }));
@@ -80,6 +120,10 @@ async fn context(
                 ..Default::default()
             },
             crate::session::turn_context::NewTurnContextOptions {
+                code_mode_limits: Some(codex_protocol::turn_input::TurnCodeModeLimits {
+                    max_heap_size_bytes: 32 * 1024 * 1024,
+                    max_yield_time_ms: 1000,
+                }),
                 permission_ceiling: Some(
                     codex_protocol::models::PermissionProfile::from_runtime_permissions(
                         &file_system,

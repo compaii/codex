@@ -1728,6 +1728,64 @@ async fn host_tool_ceiling_is_transient_and_requires_finite_allowance() {
 }
 
 #[tokio::test]
+async fn code_mode_limits_require_the_complete_bounded_host_selection() {
+    use codex_protocol::config_types::ShellEnvironmentPolicy;
+    use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
+    use codex_protocol::models::PermissionProfile;
+    use codex_protocol::turn_input::TurnCodeModeLimits;
+    let (session, _, _rx) = make_session_and_context_with_rx().await;
+    let valid = TurnStartOptions {
+        code_mode_limits: Some(TurnCodeModeLimits {
+            max_heap_size_bytes: 32 * 1024 * 1024,
+            max_yield_time_ms: 1000,
+        }),
+        command_environment_policy: Some(ShellEnvironmentPolicy {
+            inherit: ShellEnvironmentPolicyInherit::None,
+            ..Default::default()
+        }),
+        permission_ceiling: Some(PermissionProfile::read_only()),
+        tool_ceiling: Some(vec![]),
+        inference_allowance: Some(codex_protocol::turn_input::TurnInferenceAllowance {
+            max_provider_attempts: 1,
+            max_request_bytes: 4096,
+            deadline_unix_ms: chrono::Utc::now().timestamp_millis() + 30_000,
+        }),
+        ..Default::default()
+    };
+    for mutation in 0..6 {
+        let mut invalid = valid.clone();
+        match mutation {
+            0 => {
+                invalid
+                    .code_mode_limits
+                    .as_mut()
+                    .unwrap()
+                    .max_heap_size_bytes = 0
+            }
+            1 => invalid.code_mode_limits.as_mut().unwrap().max_yield_time_ms = 0,
+            2 => invalid.command_environment_policy = None,
+            3 => invalid.permission_ceiling = None,
+            4 => invalid.tool_ceiling = None,
+            _ => invalid.inference_allowance = None,
+        }
+        assert!(
+            PreparedTurnInputSettings::prepare(
+                &session,
+                ThreadSettingsOverrides::default(),
+                invalid
+            )
+            .await
+            .is_err()
+        );
+    }
+    assert!(
+        PreparedTurnInputSettings::prepare(&session, ThreadSettingsOverrides::default(), valid)
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
 async fn host_tool_ceiling_cannot_be_discarded_by_steering() {
     let (session, _, _rx) = make_session_and_context_with_rx().await;
     for mode in [

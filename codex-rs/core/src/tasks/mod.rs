@@ -557,6 +557,7 @@ impl Session {
                 .and_then(|context| context.cyber_access_program);
         }
         let options = NewTurnContextOptions {
+            code_mode_limits: start_options.code_mode_limits,
             command_environment_policy: start_options.command_environment_policy,
             permission_ceiling: start_options.permission_ceiling,
             tool_ceiling: start_options.tool_ceiling,

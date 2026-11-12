@@ -6713,6 +6713,23 @@ class ToolExposureSurface(Enum):
     direct = "direct"
 
 
+class ToolName(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    name: str
+    namespace: str | None = None
+
+
+class TurnCodeModeLimits(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+    )
+    max_heap_size_bytes: Annotated[int, Field(alias="maxHeapSizeBytes", ge=0)]
+    max_yield_time_ms: Annotated[int, Field(alias="maxYieldTimeMs", ge=0)]
+
+
 class TurnDiffUpdatedNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -7248,6 +7265,22 @@ class AppsReadResponse(BaseModel):
     )
     apps: list[ConnectorMetadata]
     missing_app_ids: Annotated[list[str], Field(alias="missingAppIds")]
+
+
+class BoundedTurnHostRestrictions(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+    )
+    code_mode_limits: Annotated[TurnCodeModeLimits, Field(alias="codeModeLimits")]
+    environment: Annotated[
+        dict[str, str],
+        Field(
+            description="Explicit environment only: the server disables inheritance and profiles."
+        ),
+    ]
+    permissions: str
+    tools: list[ToolName]
 
 
 class BrowserUseConfig(BaseModel):
@@ -13833,6 +13866,13 @@ class TurnStartBoundedIfIdleParams(BaseModel):
         populate_by_name=True,
     )
     allowance: TurnInferenceAllowance
+    host_restrictions: Annotated[
+        BoundedTurnHostRestrictions | None,
+        Field(
+            alias="hostRestrictions",
+            description="Additional execution-local ceilings, resolved by the host. Requires no persistent thread configuration change and never grants permissions.",
+        ),
+    ] = None
     provider_max_output_tokens: Annotated[
         int | None,
         Field(
