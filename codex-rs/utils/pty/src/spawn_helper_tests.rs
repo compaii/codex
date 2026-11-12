@@ -233,6 +233,41 @@ async fn admitted_helper_bootstrap_failure_has_no_fallback() -> anyhow::Result<(
     Ok(())
 }
 
+#[tokio::test]
+async fn admitted_helper_preserves_target_kill_on_drop() -> anyhow::Result<()> {
+    use tokio::io::AsyncBufReadExt;
+    let mut command = crate::Command::new("/bin/sh");
+    command
+        .args(["-c", "printf 'ready\\n'; read line"])
+        .process_mode(crate::ProcessMode::NewSession)
+        .descriptor_policy(crate::DescriptorPolicy::Explicit);
+    let mut child = command
+        .spawn_with_admission(|_| std::future::ready(Ok(())))
+        .await?;
+    let mut output = tokio::io::BufReader::new(child.stdout.take().expect("child stdout")).lines();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), output.next_line())
+            .await??
+            .as_deref(),
+        Some("ready")
+    );
+    // Keep stdin open independently: EOF must not disguise a missing kill.
+    let stdin = child.stdin.take().expect("child stdin");
+    let pid = tokio::io::unix::AsyncFd::new(open_pidfd(child.id().expect("owned child") as _)?)?;
+    drop(child);
+    let exited = matches!(
+        tokio::time::timeout(Duration::from_secs(1), pid.readable()).await,
+        Ok(Ok(_))
+    );
+    drop(stdin);
+    let _ready = tokio::time::timeout(Duration::from_secs(5), pid.readable()).await??;
+    assert!(
+        exited,
+        "admitted child ignored its target kill-on-drop policy"
+    );
+    Ok(())
+}
+
 /// Run only with a fresh, owned delegated user service supplied by the operator.
 /// The holder owns resource limits, expiry and cleanup; no service is created here.
 #[tokio::test]

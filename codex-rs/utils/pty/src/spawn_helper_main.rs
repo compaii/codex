@@ -36,6 +36,7 @@ pub(super) fn dispatch(mut args: impl Iterator<Item = std::ffi::OsString>) -> ! 
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
         let setup = match setup.to_str() {
             Some("pipe") => crate::spawn_helper::Setup::Pipe,
+            Some("admitted-pipe") => crate::spawn_helper::Setup::AdmittedPipe,
             Some("pty") => crate::spawn_helper::Setup::Pty,
             _ => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
         };
@@ -66,7 +67,7 @@ pub(super) fn dispatch(mut args: impl Iterator<Item = std::ffi::OsString>) -> ! 
             return Err(io::Error::last_os_error());
         }
         match setup {
-            crate::spawn_helper::Setup::Pipe => {
+            crate::spawn_helper::Setup::Pipe | crate::spawn_helper::Setup::AdmittedPipe => {
                 crate::process_group::detach_from_tty()?;
                 crate::process_group::set_parent_death_signal(parent_pid)?;
             }
@@ -74,7 +75,12 @@ pub(super) fn dispatch(mut args: impl Iterator<Item = std::ffi::OsString>) -> ! 
         }
         // Allocation is safe in this fresh, single-threaded image. CLOEXEC
         // leaves the report socket open until the target actually execs.
-        crate::pty::close_inherited_fds_except(&inherited_fds);
+        if matches!(setup, crate::spawn_helper::Setup::AdmittedPipe) {
+            crate::require_explicit_descriptors()?;
+            crate::pty::make_fds_inheritable(&inherited_fds)?;
+        } else {
+            crate::pty::close_inherited_fds_except(&inherited_fds);
+        }
         #[cfg(test)]
         crate::spawn_helper_tests::pause_handshake("environment")?;
         let mut size = [0; 4];

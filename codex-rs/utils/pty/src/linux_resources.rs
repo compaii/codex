@@ -5,6 +5,10 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Mutex;
+use std::sync::PoisonError;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -30,7 +34,8 @@ pub struct LinuxProcessResourceGroup {
     cgroup: PathBuf,
     limits: LinuxProcessLimits,
     deadline: Instant,
-    holder: Child,
+    holder: Mutex<Option<Child>>,
+    closed: AtomicBool,
 }
 
 const MANAGER_TIMEOUT: Duration = Duration::from_secs(4);
@@ -130,28 +135,35 @@ impl LinuxProcessResourceGroup {
             cgroup: PathBuf::new(),
             limits,
             deadline,
-            holder,
+            holder: Mutex::new(Some(holder)),
+            closed: AtomicBool::new(false),
         };
         // The fixed holder echoes a private readiness marker. No poll loop or
         // inferred readiness from a merely running relay process is needed.
         let ready = async {
-            owner
-                .holder
-                .stdin
-                .as_mut()
-                .ok_or_else(|| io::Error::other("holder stdin unavailable"))?
-                .write_all(b"ready\n")
-                .await?;
-            let mut marker = [0; 6];
-            owner
-                .holder
-                .stdout
-                .take()
-                .ok_or_else(|| io::Error::other("holder stdout unavailable"))?
-                .read_exact(&mut marker)
-                .await?;
-            if &marker != b"ready\n" {
-                return Err(io::Error::other("invalid holder readiness"));
+            {
+                let holder = owner
+                    .holder
+                    .get_mut()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("holder unavailable"))?;
+                holder
+                    .stdin
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("holder stdin unavailable"))?
+                    .write_all(b"ready\n")
+                    .await?;
+                let mut marker = [0; 6];
+                holder
+                    .stdout
+                    .take()
+                    .ok_or_else(|| io::Error::other("holder stdout unavailable"))?
+                    .read_exact(&mut marker)
+                    .await?;
+                if &marker != b"ready\n" {
+                    return Err(io::Error::other("invalid holder readiness"));
+                }
             }
             let props = owner.properties().await?;
             owner.invocation = props.get("InvocationID").cloned().unwrap_or_default();
@@ -243,7 +255,7 @@ impl LinuxProcessResourceGroup {
     pub async fn spawn(&self, command: crate::Command) -> io::Result<crate::Child> {
         command
             .spawn_with_admission(|pid| async move {
-                if Instant::now() >= self.deadline {
+                if self.closed.load(Ordering::Acquire) || Instant::now() >= self.deadline {
                     return Err(io::Error::other("resource group expired"));
                 }
                 let props = self.properties().await?;
@@ -280,7 +292,10 @@ impl LinuxProcessResourceGroup {
                         .map_err(io::Error::other)?
                         .display()
                 );
-                if actual != expected || Instant::now() >= self.deadline {
+                if actual != expected
+                    || self.closed.load(Ordering::Acquire)
+                    || Instant::now() >= self.deadline
+                {
                     return Err(io::Error::other(
                         "resource membership unavailable or expired",
                     ));
@@ -292,9 +307,19 @@ impl LinuxProcessResourceGroup {
 
     /// Close this exact group's holder. Failure is retained, never retried as a
     /// different stop operation; kernel expiry remains the last cleanup bound.
-    pub async fn close(mut self) -> io::Result<()> {
-        self.holder.stdin.take();
-        let exit = tokio::time::timeout(MANAGER_TIMEOUT, self.holder.wait())
+    pub async fn close(&self) -> io::Result<()> {
+        self.closed.store(true, Ordering::Release);
+        let mut holder = {
+            self.holder
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+                .ok_or_else(|| {
+                    io::Error::other("resource close already requested; inspect the original unit")
+                })?
+        };
+        holder.stdin.take();
+        let exit = tokio::time::timeout(MANAGER_TIMEOUT, holder.wait())
             .await
             .map_err(io::Error::other)??;
         if !exit.success() || self.cgroup.exists() {
@@ -306,7 +331,34 @@ impl LinuxProcessResourceGroup {
 
 impl Drop for LinuxProcessResourceGroup {
     fn drop(&mut self) {
-        self.holder.stdin.take();
+        self.closed.store(true, Ordering::Release);
+        if let Some(holder) = self
+            .holder
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            holder.stdin.take();
+        }
+    }
+}
+
+impl std::fmt::Debug for LinuxProcessResourceGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinuxProcessResourceGroup")
+            .field("unit", &self.unit)
+            .field("invocation", &self.invocation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl crate::ProcessLauncher for LinuxProcessResourceGroup {
+    fn spawn<'a>(
+        &'a self,
+        command: crate::Command,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<crate::Child>> + Send + 'a>>
+    {
+        Box::pin(self.spawn(command))
     }
 }
 
@@ -423,7 +475,14 @@ mod tests {
         .await?;
         let path = group.cgroup.clone();
         let relay = tokio::io::unix::AsyncFd::new(crate::spawn_helper_tests::open_pidfd(
-            group.holder.id().unwrap() as _,
+            group
+                .holder
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+                .unwrap()
+                .id()
+                .unwrap() as _,
         )?)?;
         let mut child = group.spawn(workload()).await?;
         drop(group);

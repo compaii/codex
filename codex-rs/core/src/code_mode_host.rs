@@ -100,6 +100,7 @@ pub struct ProcessOwnedGrpcCodeModeSessionProvider {
     host_program: PathBuf,
     host_environment: Option<Arc<HashMap<String, String>>>,
     host_sandbox: Option<Arc<CodeModeHostSandbox>>,
+    process_launcher: Option<Arc<dyn codex_utils_pty::ProcessLauncher>>,
     provider: OnceLock<GrpcCodeModeSessionProvider>,
     closed: Arc<AtomicBool>,
     current: Arc<Mutex<Option<HostChannel>>>,
@@ -111,6 +112,7 @@ impl ProcessOwnedGrpcCodeModeSessionProvider {
             host_program,
             host_environment: None,
             host_sandbox: None,
+            process_launcher: None,
             provider: OnceLock::new(),
             closed: Arc::new(AtomicBool::new(false)),
             current: Arc::new(Mutex::new(None)),
@@ -157,6 +159,7 @@ impl CodeModeSessionProvider for ProcessOwnedGrpcCodeModeSessionProvider {
             let mut owner = Self::with_host_program(self.host_program.clone());
             owner.host_environment = host_options.environment.map(Arc::new);
             owner.host_sandbox = host_options.sandbox.map(Arc::new);
+            owner.process_launcher = host_options.process_launcher;
             let owner = Arc::new(owner);
             let inner = owner.create_session_with_options(options).await?;
             Ok(Arc::new(IsolatedSession { inner, owner })
@@ -185,6 +188,8 @@ impl CodeModeSessionProvider for ProcessOwnedGrpcCodeModeSessionProvider {
                     host_program: self.host_program.clone(),
                     host_environment: self.host_environment.clone(),
                     host_sandbox: self.host_sandbox.clone(),
+                    process_launcher: self.process_launcher.clone(),
+                    spawn_lock: tokio::sync::Semaphore::new(1),
                     current: self.current.clone(),
                     closed: self.closed.clone(),
                 });
@@ -259,6 +264,8 @@ struct HostTransport {
     host_program: PathBuf,
     host_environment: Option<Arc<HashMap<String, String>>>,
     host_sandbox: Option<Arc<CodeModeHostSandbox>>,
+    process_launcher: Option<Arc<dyn codex_utils_pty::ProcessLauncher>>,
+    spawn_lock: tokio::sync::Semaphore,
     current: Arc<Mutex<Option<HostChannel>>>,
     closed: Arc<AtomicBool>,
 }
@@ -270,7 +277,8 @@ struct HostChannel {
 
 impl HostTransport {
     async fn send(&self, request: http::Request<Body>) -> Result<http::Response<Body>, Status> {
-        self.channel(request.uri().path())?
+        self.channel(request.uri().path())
+            .await?
             .oneshot(request)
             .await
             .map_err(|error| {
@@ -284,9 +292,17 @@ impl HostTransport {
             })
     }
 
-    fn channel(&self, rpc_path: &str) -> Result<Channel, Status> {
-        Ok({
-            let mut current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
+    async fn channel(&self, rpc_path: &str) -> Result<Channel, Status> {
+        // Never hold the synchronous lifecycle mutex while awaiting admission.
+        // One async spawn owner prevents concurrent OpenSession from duplicating
+        // a host; close can still revoke admission while the callback is pending.
+        let _spawn = self
+            .spawn_lock
+            .acquire()
+            .await
+            .map_err(|_| Status::unavailable("host admission closed"))?;
+        {
+            let current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
             if self.closed.load(Ordering::Acquire) {
                 return Err(Status::unavailable("private code-mode host is closed"));
             }
@@ -294,45 +310,56 @@ impl HostTransport {
                 .as_ref()
                 .filter(|host| host.alive.load(Ordering::Acquire))
             {
-                host.channel.clone()
-            } else {
-                if rpc_path != "/codex.code_mode.v1.CodeModeHost/OpenSession" {
-                    return Err(Status::unavailable("code-mode host is not running"));
-                }
-                let connection = HostConnection::spawn(
-                    &self.host_program,
-                    self.host_environment.as_deref(),
-                    self.host_sandbox.as_deref(),
-                )
-                .map_err(|error| Status::unavailable(error.to_string()))?;
-                let alive = connection.alive.clone();
-                let connection = Arc::new(Mutex::new(Some(connection)));
-                // Preserve execution liveness detection independently of metrics cadence.
-                let channel = Endpoint::from_static("http://code-mode-host")
-                    .http2_keep_alive_interval(Duration::from_secs(/*secs*/ 30))
-                    .keep_alive_timeout(Duration::from_secs(/*secs*/ 10))
-                    .keep_alive_while_idle(/*enabled*/ true)
-                    .connect_with_connector_lazy(service_fn(move |_| {
-                        let connection = connection
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .take();
-                        async move {
-                            connection.map(TokioIo::new).ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::NotConnected,
-                                    "code-mode host connection ended",
-                                )
-                            })
-                        }
-                    }));
-                *current = Some(HostChannel {
-                    channel: channel.clone(),
-                    alive,
-                });
-                channel
+                return Ok(host.channel.clone());
             }
-        })
+        }
+        if rpc_path != "/codex.code_mode.v1.CodeModeHost/OpenSession" {
+            return Err(Status::unavailable("code-mode host is not running"));
+        }
+        let connection = HostConnection::spawn(
+            &self.host_program,
+            self.host_environment.as_deref(),
+            self.host_sandbox.as_deref(),
+            self.process_launcher.as_deref(),
+        )
+        .await
+        .map_err(|error| Status::unavailable(error.to_string()))?;
+        let alive = connection.alive.clone();
+        let connection = Arc::new(Mutex::new(Some(connection)));
+        let connect_slot = connection.clone();
+        let channel = Endpoint::from_static("http://code-mode-host")
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .keep_alive_timeout(Duration::from_secs(10))
+            .keep_alive_while_idle(true)
+            .connect_with_connector_lazy(service_fn(move |_| {
+                let connection = connect_slot
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                async move {
+                    connection.map(TokioIo::new).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "code-mode host connection ended",
+                        )
+                    })
+                }
+            }));
+        let mut current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.closed.load(Ordering::Acquire) {
+            connection
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            return Err(Status::unavailable(
+                "private code-mode host closed during admission",
+            ));
+        }
+        *current = Some(HostChannel {
+            channel: channel.clone(),
+            alive,
+        });
+        Ok(channel)
     }
 }
 
@@ -340,7 +367,7 @@ fn sandboxed_host_command(
     host_program: &Path,
     environment: Option<&HashMap<String, String>>,
     sandbox: &CodeModeHostSandbox,
-) -> io::Result<Command> {
+) -> io::Result<(Command, Option<String>)> {
     use codex_protocol::config_types::WindowsSandboxLevel;
     use codex_protocol::models::PermissionProfile;
     use codex_sandboxing::SandboxCommand;
@@ -397,26 +424,49 @@ fn sandboxed_host_command(
         .env_clear()
         .envs(&request.env);
     #[cfg(unix)]
-    if let Some(arg0) = request.arg0 {
+    if let Some(arg0) = &request.arg0 {
         use std::os::unix::process::CommandExt;
         command.as_std_mut().arg0(arg0);
     }
-    Ok(command)
+    Ok((command, request.arg0))
+}
+
+enum HostChild {
+    Ordinary(Child),
+    Owned(codex_utils_pty::Child),
+}
+
+#[cfg(test)]
+impl HostChild {
+    async fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        match self {
+            Self::Ordinary(child) => child.wait().await,
+            Self::Owned(child) => child.wait().await,
+        }
+    }
 }
 
 struct HostConnection {
     io: tokio::io::Join<ChildStdout, ChildStdin>,
-    child: Option<Child>,
+    child: Option<HostChild>,
     alive: Arc<AtomicBool>,
 }
 
 impl HostConnection {
-    fn spawn(
+    async fn spawn(
         host_program: &Path,
         host_environment: Option<&HashMap<String, String>>,
         host_sandbox: Option<&CodeModeHostSandbox>,
+        process_launcher: Option<&dyn codex_utils_pty::ProcessLauncher>,
     ) -> io::Result<Self> {
-        let mut command = if let Some(sandbox) = host_sandbox {
+        if process_launcher.is_some()
+            && (host_sandbox.is_none() || host_environment.is_none() || !cfg!(target_os = "linux"))
+        {
+            return Err(io::Error::other(
+                "resource-owned code mode requires explicit sandboxed Linux host selection",
+            ));
+        }
+        let (mut command, arg0) = if let Some(sandbox) = host_sandbox {
             sandboxed_host_command(host_program, host_environment, sandbox)?
         } else {
             let mut command = Command::from(background_command(host_program));
@@ -424,7 +474,7 @@ impl HostConnection {
             if let Some(environment) = host_environment {
                 command.env_clear().envs(environment);
             }
-            command
+            (command, None)
         };
         #[cfg(unix)]
         command.process_group(/*pgroup*/ 0);
@@ -443,16 +493,44 @@ impl HostConnection {
             .stderr(Stdio::piped())
             .kill_on_drop(/*kill_on_drop*/ true);
         scrub_non_inheritable_env_vars(command.as_std_mut());
-        let mut child = command.spawn()?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| io::Error::other("code-mode host has no stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| io::Error::other("code-mode host has no stdout"))?;
-        if let Some(stderr) = child.stderr.take() {
+        let (stdin, stdout, stderr, child) = if let Some(launcher) = process_launcher {
+            let settings = command.as_std();
+            let mut owned = codex_utils_pty::Command::new(settings.get_program());
+            owned
+                .args(settings.get_args())
+                .envs(
+                    settings
+                        .get_envs()
+                        .filter_map(|(key, value)| value.map(|value| (key, value))),
+                )
+                .process_mode(codex_utils_pty::ProcessMode::NewSession)
+                .descriptor_policy(codex_utils_pty::DescriptorPolicy::Explicit);
+            if let Some(cwd) = settings.get_current_dir() {
+                owned.current_dir(cwd);
+            }
+            #[cfg(unix)]
+            if let Some(arg0) = arg0 {
+                owned.arg0(arg0);
+            }
+            let mut child = launcher.spawn(owned).await?;
+            (
+                child.stdin.take(),
+                child.stdout.take(),
+                child.stderr.take(),
+                HostChild::Owned(child),
+            )
+        } else {
+            let mut child = command.spawn()?;
+            (
+                child.stdin.take(),
+                child.stdout.take(),
+                child.stderr.take(),
+                HostChild::Ordinary(child),
+            )
+        };
+        let stdin = stdin.ok_or_else(|| io::Error::other("code-mode host has no stdin"))?;
+        let stdout = stdout.ok_or_else(|| io::Error::other("code-mode host has no stdout"))?;
+        if let Some(stderr) = stderr {
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
@@ -499,12 +577,18 @@ impl AsyncWrite for HostConnection {
 impl Drop for HostConnection {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::Release);
-        if let Some(mut child) = self.child.take() {
-            let _ = child.start_kill();
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                runtime.spawn(async move {
-                    let _ = child.wait().await;
-                });
+        if let Some(child) = self.child.take() {
+            match child {
+                HostChild::Ordinary(mut child) => {
+                    let _ = child.start_kill();
+                    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                        runtime.spawn(async move {
+                            let _ = child.wait().await;
+                        });
+                    }
+                }
+                // The shared child owns immediate kill and cancellation-safe reaping.
+                HostChild::Owned(child) => drop(child),
             }
         }
     }

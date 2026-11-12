@@ -18,12 +18,12 @@ use std::sync::atomic::Ordering;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
-use crate::child_command::ChildDropPolicy;
-
 /// Setup that needs a fresh, single-threaded image before target exec.
 pub(crate) enum Setup {
     /// Detach from the terminal and terminate when the parent dies.
     Pipe,
+    /// Mandatory admission also requires descriptor cleanup before target exec.
+    AdmittedPipe,
     /// Establish a controlling terminal and reset interactive signal state.
     Pty,
 }
@@ -93,7 +93,7 @@ where
     F: FnOnce(u32) -> Fut,
     Fut: std::future::Future<Output = io::Result<()>>,
 {
-    spawn_inner(target, Setup::Pipe, Some(admit))
+    spawn_inner(target, Setup::AdmittedPipe, Some(admit))
         .await?
         .ok_or_else(|| io::Error::other("required process admission helper unavailable"))
 }
@@ -137,6 +137,7 @@ where
             .arg(std::process::id().to_string())
             .arg(match setup {
                 Setup::Pipe => "pipe",
+                Setup::AdmittedPipe => "admitted-pipe",
                 Setup::Pty => "pty",
             })
             .arg(
@@ -151,7 +152,7 @@ where
             .arg(settings.get_program())
             .arg(target.arg0.as_deref().unwrap_or(settings.get_program()))
             .args(settings.get_args())
-            .drop_policy(ChildDropPolicy::ReapOnly)
+            .drop_policy(target.drop_policy)
             .stdin(match &target.stdin {
                 crate::ChildStdin::Piped => crate::ChildStdin::Piped,
                 crate::ChildStdin::Null => crate::ChildStdin::Null,

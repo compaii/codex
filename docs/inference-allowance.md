@@ -593,3 +593,32 @@ ends work and refuses a later launch. These require explicit local resource
 qualification and make no provider call. Ordinary CI remains independent of a
 user session bus. Wiring all funded executors/Code Mode hosts to the same owner
 and denying sandbox escape remain required before full-profile selection.
+
+The trusted, nonserialized `CodeModeHostOptions.process_launcher` can carry that
+same owner into the private gRPC host. A selected launcher requires explicit
+environment and restrictive offline Linux sandbox options; it never falls back
+to ordinary host creation. Code Mode preserves the prepared sandbox argv/cwd/
+environment/argv0, and uses the shared helper's mandatory descriptor cleanup
+before exec. The launch policy receives no cells or model-selected settings.
+
+Host admission is asynchronous without holding the synchronous lifecycle lock.
+One async owner serializes creation; close remains able to revoke a pending
+admission and dispose of its completed connection before publication. Existing
+generations still cannot spawn during execute, metrics or transport reconnect.
+Ordinary host launches retain their existing path. The resource group's explicit
+close borrows the owner, so an execution can end the whole group while a private
+session still retains its launch-policy reference.
+
+This composes the actual private-host launch route; the ordinary bounded-turn
+adapter still supplies no resource owner until the complete turn/executor binding
+is selected. A private Code Mode host is not the raw-command executor. No gRPC
+payload, host resource default, provider account or receiving configuration is
+changed by adding this Rust-only option.
+
+Admitted helpers retain the target's drop policy. The native regression holds
+stdin open independently of the child handle: dropping a kill-on-drop target
+must terminate it without relying on EOF. The previous helper forced reap-only
+even for that target and the regression reproduced a live child after drop.
+Ordinary pipe/PTY callers explicitly selecting reap-only retain that policy.
+Closing a shared resource owner also marks it closed before awaiting cleanup,
+so later launch references cannot admit fresh work during manager shutdown.

@@ -2783,6 +2783,7 @@ name = "codex-code-mode-protocol"
 version = "0.167.0"
 dependencies = [
  "codex-protocol",
+ "codex-utils-pty",
  "glob",
  "pretty_assertions",
  "prost",
