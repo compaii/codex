@@ -730,6 +730,18 @@ fn create_filesystem_args(
         }
         read_only_subpaths.sort_by_key(|path| path_depth(path));
         for subpath in read_only_subpaths {
+            // A complete deny mask hides this carveout too. Mounting or
+            // validating a helper alias inside that tree is unnecessary; its
+            // writable ancestor does not make a hidden alias actor-mutable.
+            // Keep ordinary checks when a narrower writable root reopens it.
+            if unreadable_roots.iter().any(|denied| {
+                subpath.starts_with(denied)
+                    && !allowed_write_paths
+                        .iter()
+                        .any(|write| write.starts_with(denied))
+            }) {
+                continue;
+            }
             if let Some(symlink) =
                 first_writable_symlink_component_in_path(&subpath, &allowed_write_paths)
             {

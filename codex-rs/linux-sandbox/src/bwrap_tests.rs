@@ -1289,6 +1289,38 @@ fn system_aliases_require_explicit_name_and_a_read_only_shared_target() {
 }
 
 #[test]
+fn denied_directory_hides_read_only_helper_alias_under_writable_parent() {
+    let temp = TempDir::new().expect("temp dir");
+    let private = temp.path().join("private");
+    std::fs::create_dir_all(&private).expect("private directory");
+    let helper = private.join("helper");
+    std::os::unix::fs::symlink("/usr/bin/true", &helper).expect("helper alias");
+    let entry = |path: &Path, access| {
+        FileSystemSandboxEntry::new(
+            AbsolutePathBuf::from_absolute_path(path)
+                .expect("absolute path")
+                .into(),
+            access,
+        )
+    };
+    let policy = FileSystemSandboxPolicy::restricted(vec![
+        entry(temp.path(), FileSystemAccessMode::Write),
+        entry(&private, FileSystemAccessMode::Deny),
+        entry(&helper, FileSystemAccessMode::Read),
+    ]);
+    let args = create_filesystem_args(&policy, temp.path(), BwrapOptions::default())
+        .expect("hidden helper does not need read-only carveout");
+    let private = path_to_string(&private);
+    assert!(
+        args.args
+            .windows(4)
+            .any(|v| v == ["--perms", "000", "--tmpfs", private.as_str()])
+    );
+    let helper = path_to_string(&helper);
+    assert!(!args.args.iter().any(|arg| arg == &helper));
+}
+
+#[test]
 fn directory_mask_covers_nested_denials_without_intervening_rebind() {
     for nested_in_writable_root in [false, true] {
         let temp = TempDir::new().expect("temp dir");
