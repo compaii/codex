@@ -292,11 +292,18 @@ async fn create_owner(
         .tempdir()
         .map_err(|e| e.to_string())?;
     let home_uri = PathUri::from_host_native_path(home.path()).map_err(|e| e.to_string())?;
+    // The executor creates trusted arg0 helpers beneath CODEX_HOME. Keep that
+    // control state under the native home's immutable denial, even when the
+    // actor may write its separate HOME or the surrounding temporary directory.
+    let control_home = tempfile::Builder::new()
+        .prefix("codex-exec-control-")
+        .tempdir_in(config.codex_home.as_path())
+        .map_err(|error| error.to_string())?;
     let mut environment = crate::exec_env::create_env(&policy, None);
     environment.insert("HOME".into(), home.path().to_string_lossy().into_owned());
     environment.insert(
         "CODEX_HOME".into(),
-        home.path().to_string_lossy().into_owned(),
+        control_home.path().to_string_lossy().into_owned(),
     );
     let mut command_policy = (*policy).clone();
     command_policy.r#set = environment.clone();
@@ -369,7 +376,11 @@ async fn create_owner(
         if let Err(error) = &home_result {
             tracing::warn!("owned turn private home cleanup unconfirmed: {error}");
         }
-        cleanup.send_replace(Some(result.and(home_result)));
+        let control_result = control_home.close().map_err(|error| error.to_string());
+        if let Err(error) = &control_result {
+            tracing::warn!("owned executor control cleanup unconfirmed: {error}");
+        }
+        cleanup.send_replace(Some(result.and(home_result).and(control_result)));
     });
     Ok(owned)
 }

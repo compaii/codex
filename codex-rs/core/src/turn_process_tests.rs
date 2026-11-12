@@ -25,6 +25,8 @@ fn bounded_turn_shares_actual_executors_and_closes_retained_steps() -> anyhow::R
         let native_home = tempfile::tempdir()?;
         let credential = native_home.path().join("fake-provider-credential");
         std::fs::write(&credential, "test-only-provider-secret")?;
+        let native_alias = native_home.path().join("codex-linux-sandbox");
+        std::os::unix::fs::symlink(std::env::current_exe()?, &native_alias)?;
         let recorder = CodeModeHostRecorder::new()?;
         let program = recorder.program();
         let workspace = program.parent().context("recorder workspace")?;
@@ -37,8 +39,7 @@ fn bounded_turn_shares_actual_executors_and_closes_retained_steps() -> anyhow::R
                     config.cwd =
                         AbsolutePathBuf::from_absolute_path(workspace).expect("absolute workspace");
                     config.codex_self_exe = Some(package.path().join("codex"));
-                    config.codex_linux_sandbox_exe =
-                        Some(std::env::current_exe().expect("sandbox helper"));
+                    config.codex_linux_sandbox_exe = Some(native_alias.clone());
                     config
                         .permissions
                         .set_permission_profile(PermissionProfile::Disabled)
@@ -46,7 +47,31 @@ fn bounded_turn_shares_actual_executors_and_closes_retained_steps() -> anyhow::R
                 },
             )
             .await;
-        let mut filesystem = FileSystemSandboxPolicy::read_only();
+        let mut filesystem = FileSystemSandboxPolicy::restricted(
+            ["/usr", "/bin", "/lib", "/lib64", "/etc", "/proc"]
+                .into_iter()
+                .map(|path| {
+                    Ok(FileSystemSandboxEntry::new(
+                        AbsolutePathBuf::from_absolute_path(path)?.into(),
+                        FileSystemAccessMode::Read,
+                    ))
+                })
+                .collect::<std::io::Result<Vec<_>>>()?,
+        );
+        for executable in [
+            std::env::current_exe()?,
+            std::fs::canonicalize(std::env::var("CODEX_TEST_EXEC_SERVER_BIN")?)?,
+            codex_utils_cargo_bin::cargo_bin("codex-code-mode-host")?,
+        ] {
+            filesystem.entries.push(FileSystemSandboxEntry::new(
+                AbsolutePathBuf::from_absolute_path(executable)?.into(),
+                FileSystemAccessMode::Read,
+            ));
+        }
+        filesystem.entries.push(FileSystemSandboxEntry::new(
+            AbsolutePathBuf::from_absolute_path("/tmp")?.into(),
+            FileSystemAccessMode::Write,
+        ));
         filesystem.entries.push(FileSystemSandboxEntry::new(
             AbsolutePathBuf::from_absolute_path(workspace)?.into(),
             FileSystemAccessMode::Write,
@@ -111,10 +136,32 @@ fn bounded_turn_shares_actual_executors_and_closes_retained_steps() -> anyhow::R
             .context("private home")?
             .to_abs_path()?;
         assert!(home.as_path().exists());
+        let environment = turn
+            .command_environment_policy()
+            .context("owned environment")?;
+        let control_home = std::path::PathBuf::from(
+            environment
+                .r#set
+                .get("CODEX_HOME")
+                .context("executor control home")?,
+        );
+        assert!(control_home.starts_with(native_home.path()));
+        assert!(control_home.exists());
         let uid = unsafe { libc::geteuid() };
         let script = format!(
             r#"import os, socket, time
-assert os.environ['HOME'] == os.environ['CODEX_HOME']
+assert os.environ['HOME'] != os.environ['CODEX_HOME']
+with open(os.path.join(os.environ['HOME'], 'actor-cache'), 'x') as cache: cache.write('owned')
+try: os.listdir(os.environ['CODEX_HOME'])
+except OSError: pass
+else: raise AssertionError('executor control home readable')
+native_home = os.path.dirname(os.environ['FAKE_PROVIDER'])
+try: os.unlink(os.path.join(native_home, 'codex-linux-sandbox'))
+except OSError: pass
+else: raise AssertionError('trusted helper alias replaced')
+try: os.rename(native_home, native_home + '-moved')
+except OSError: pass
+else: raise AssertionError('trusted helper directory renamed')
 for path in [os.environ['FAKE_PROVIDER'], '/sys/fs/cgroup/cgroup.procs']:
     try: open(path).read()
     except OSError: pass
@@ -266,6 +313,7 @@ time.sleep(120)
                 .context("cleanup result")?;
         result.map_err(anyhow::Error::msg)?;
         assert!(!home.as_path().exists());
+        assert!(!control_home.exists());
         assert!(!cgroup.exists());
         assert!(backend.start(parameters("after-finish")).await.is_err());
         assert_eq!(std::fs::read_to_string(workspace.join("effect"))?, "once\n");

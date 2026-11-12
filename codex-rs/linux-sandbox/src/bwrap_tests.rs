@@ -1230,6 +1230,141 @@ fn split_policy_reenables_writable_files_after_unreadable_parent() {
 }
 
 #[test]
+fn system_aliases_require_explicit_name_and_a_read_only_shared_target() {
+    let temp = TempDir::new().expect("temp dir");
+    for name in LINUX_PLATFORM_DEFAULT_READ_ROOTS {
+        let logical = Path::new(name);
+        let Ok(physical) = logical.canonicalize() else {
+            continue;
+        };
+        if physical == logical {
+            continue;
+        }
+        let make = |path: &Path, access| {
+            FileSystemSandboxEntry::new(
+                AbsolutePathBuf::from_absolute_path(path)
+                    .expect("absolute path")
+                    .into(),
+                access,
+            )
+        };
+        let mut policy =
+            FileSystemSandboxPolicy::restricted(vec![make(&physical, FileSystemAccessMode::Read)]);
+        let name_text = path_to_string(logical);
+        let target_text = path_to_string(&physical);
+        let has_alias = |args: &BwrapArgs| {
+            args.args
+                .windows(3)
+                .any(|v| v == ["--symlink", target_text.as_str(), name_text.as_str()])
+        };
+        let args = create_filesystem_args(&policy, temp.path(), BwrapOptions::default())
+            .expect("canonical args");
+        assert!(!has_alias(&args));
+        policy
+            .entries
+            .push(make(logical, FileSystemAccessMode::Read));
+        let args = create_filesystem_args(&policy, temp.path(), BwrapOptions::default())
+            .expect("alias args");
+        assert!(has_alias(&args));
+        let existing_child = std::fs::read_dir(&physical)
+            .expect("system target directory")
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.is_file())
+            .expect("existing target descendant");
+        let mut writable = policy.clone();
+        writable
+            .entries
+            .push(make(&existing_child, FileSystemAccessMode::Write));
+        let args = create_filesystem_args(&writable, temp.path(), BwrapOptions::default())
+            .expect("writable descendant args");
+        assert!(!has_alias(&args));
+        policy
+            .entries
+            .push(make(&physical, FileSystemAccessMode::Deny));
+        let args = create_filesystem_args(&policy, temp.path(), BwrapOptions::default())
+            .expect("denied args");
+        assert!(!has_alias(&args));
+    }
+}
+
+#[test]
+fn denied_directory_hides_read_only_helper_alias_under_writable_parent() {
+    let temp = TempDir::new().expect("temp dir");
+    let private = temp.path().join("private");
+    std::fs::create_dir_all(&private).expect("private directory");
+    let helper = private.join("helper");
+    std::os::unix::fs::symlink("/usr/bin/true", &helper).expect("helper alias");
+    let entry = |path: &Path, access| {
+        FileSystemSandboxEntry::new(
+            AbsolutePathBuf::from_absolute_path(path)
+                .expect("absolute path")
+                .into(),
+            access,
+        )
+    };
+    let policy = FileSystemSandboxPolicy::restricted(vec![
+        entry(temp.path(), FileSystemAccessMode::Write),
+        entry(&private, FileSystemAccessMode::Deny),
+        entry(&helper, FileSystemAccessMode::Read),
+    ]);
+    let args = create_filesystem_args(&policy, temp.path(), BwrapOptions::default())
+        .expect("hidden helper does not need read-only carveout");
+    let private = path_to_string(&private);
+    assert!(
+        args.args
+            .windows(4)
+            .any(|v| v == ["--perms", "000", "--tmpfs", private.as_str()])
+    );
+    let helper = path_to_string(&helper);
+    assert!(!args.args.iter().any(|arg| arg == &helper));
+}
+
+#[test]
+fn directory_mask_covers_nested_denials_without_intervening_rebind() {
+    for nested_in_writable_root in [false, true] {
+        let temp = TempDir::new().expect("temp dir");
+        let work = if nested_in_writable_root {
+            temp.path().to_path_buf()
+        } else {
+            temp.path().join("work")
+        };
+        let blocked = temp.path().join("private");
+        let nested = blocked.join("arg0/alias");
+        std::fs::create_dir_all(&work).expect("work dir");
+        std::fs::create_dir_all(&nested).expect("nested private dir");
+        let entry = |path: &Path, access| {
+            FileSystemSandboxEntry::new(
+                AbsolutePathBuf::from_absolute_path(path)
+                    .expect("absolute path")
+                    .into(),
+                access,
+            )
+        };
+        let policy = FileSystemSandboxPolicy::restricted(vec![
+            entry(&work, FileSystemAccessMode::Write),
+            entry(&blocked, FileSystemAccessMode::Deny),
+            entry(&nested, FileSystemAccessMode::Deny),
+        ]);
+        let args = create_filesystem_args(&policy, temp.path(), BwrapOptions::default())
+            .expect("filesystem args");
+        let blocked = path_to_string(&blocked);
+        let nested = path_to_string(&nested);
+        assert!(
+            args.args
+                .windows(4)
+                .any(|v| v == ["--perms", "000", "--tmpfs", blocked.as_str()])
+        );
+        assert!(
+            !args
+                .args
+                .windows(2)
+                .any(|v| v == ["--tmpfs", nested.as_str()])
+        );
+    }
+}
+
+#[test]
 fn split_policy_reenables_nested_writable_roots_after_unreadable_parent() {
     let temp_dir = TempDir::new().expect("temp dir");
     let writable_root = temp_dir.path().join("workspace");
