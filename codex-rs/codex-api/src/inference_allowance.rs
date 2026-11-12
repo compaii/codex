@@ -25,11 +25,12 @@ pub enum InferenceAllowanceError {
     Reservation,
 }
 
+pub use codex_protocol::provider_attempt::ProviderAttempt;
+pub use codex_protocol::provider_attempt::ProviderAttemptGate;
 use codex_protocol::provider_attempt::ProviderAttemptGateSelection as SelectedProviderAttemptGate;
-pub use codex_protocol::provider_attempt::{
-    ProviderAttempt, ProviderAttemptGate, ProviderAttemptObservation, ProviderAttemptReservation,
-    ProviderAttemptUsage,
-};
+pub use codex_protocol::provider_attempt::ProviderAttemptObservation;
+pub use codex_protocol::provider_attempt::ProviderAttemptReservation;
+pub use codex_protocol::provider_attempt::ProviderAttemptUsage;
 
 /// Witness returned by the same boundary that authorizes the physical send.
 #[derive(Debug, Clone, PartialEq, Eq)]
