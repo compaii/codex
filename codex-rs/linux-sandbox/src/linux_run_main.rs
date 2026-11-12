@@ -109,8 +109,8 @@ pub struct LinuxSandboxCommand {
     #[arg(long = "verify-fd-mount", hide = true)]
     pub verify_fd_mounts: Vec<String>,
 
-    /// Host-selected filesystem helper role. The command is separately authenticated
-    /// against this executable or its exact packaged executor sibling.
+    /// Host-selected runtime bootstrap (historical flag name). The command must
+    /// be the exact filesystem-helper or Code Mode host package invocation.
     #[arg(long = "trusted-file-system-helper", hide = true)]
     pub trusted_file_system_helper: bool,
 

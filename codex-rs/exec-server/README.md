@@ -21,8 +21,9 @@ Canonical packages place it in `bin/` beside the entrypoint, with platform
 sandbox resources in `codex-resources/`.
 
 For Linux bubblewrap execution, the launcher pins its running executable and,
-only for the host-selected filesystem-helper role, the exact helper invocation
-from that executable or its non-symlink package sibling. Individual read-only
+only for a host-selected runtime role, the exact filesystem-helper or stdio-gRPC
+Code Mode host invocation from its validated package executable. The filesystem
+helper may be the running binary; Code Mode must be its non-symlink host sibling. Individual read-only
 descriptor mounts under the sealed namespace-local `/dev/codex-runtime` keep
 bootstrap working when the native home is denied. They expose no package directory
 and do not rewrite raw actor programs or widen their filesystem permissions.

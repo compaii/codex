@@ -274,9 +274,20 @@ async fn resource_owned_grpc_host_keeps_sandbox_and_stops_with_group() -> Result
     recorder.enable_inheritable_descriptor_probe().await?;
     let program = recorder.program();
     let root = program.parent().context("recorder directory")?;
-    let alias_dir = tempfile::tempdir()?;
+    let test_executable = std::env::current_exe()?;
+    // Keep the staged runner on its build filesystem and preserve the exact
+    // package-sibling bootstrap boundary; no external wrapper exception.
+    let alias_dir = tempfile::Builder::new()
+        .prefix("code-mode-test-package-")
+        .tempdir_in(
+            test_executable
+                .parent()
+                .context("test executable directory")?,
+        )?;
+    let runner = alias_dir.path().join("codex");
+    std::fs::hard_link(&test_executable, &runner)?;
     let alias = alias_dir.path().join("codex-linux-sandbox");
-    std::os::unix::fs::symlink(std::env::current_exe()?, &alias)?;
+    std::os::unix::fs::symlink(&runner, &alias)?;
     let mut policy = FileSystemSandboxPolicy::read_only();
     for (path, mode) in [
         (root.to_path_buf(), FileSystemAccessMode::Write),
@@ -306,7 +317,7 @@ async fn resource_owned_grpc_host_keeps_sandbox_and_stops_with_group() -> Result
         )
         .await?,
     );
-    let guarded_program = root.join("resource guard wrapper");
+    let guarded_program = alias_dir.path().join("codex-code-mode-host");
     codex_utils_cargo_bin::write_executable(
         &guarded_program,
         &format!(

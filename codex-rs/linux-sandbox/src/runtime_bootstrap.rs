@@ -16,25 +16,36 @@ use std::path::Path;
 const RUNTIME_DIR: &str = "/dev/codex-runtime";
 pub(crate) const RUNNER_ALIAS: &str = "/dev/codex-runtime/codex-linux-sandbox";
 const HELPER_ALIAS: &str = "/dev/codex-runtime/codex-exec-server";
+const CODE_MODE_HOST_ALIAS: &str = "/dev/codex-runtime/codex-code-mode-host";
 const FS_HELPER_ARG: &str = "--codex-run-as-fs-helper";
 
 pub(crate) struct RuntimeBootstrap {
     runner: File,
     helper: Option<File>,
+    helper_alias: &'static str,
 }
 
 impl RuntimeBootstrap {
     pub(crate) fn prepare(command: &mut [String], helper_role: bool) -> io::Result<Self> {
         let runner = File::open("/proc/self/exe")?;
+        let helper_alias = if is_code_mode_host(command) {
+            CODE_MODE_HOST_ALIAS
+        } else {
+            HELPER_ALIAS
+        };
         let helper = if helper_role {
             let executable = std::env::current_exe()?;
             let helper = pin_helper(command, &executable, &runner)?;
-            command[0] = HELPER_ALIAS.to_string();
+            command[0] = helper_alias.to_string();
             Some(helper)
         } else {
             None
         };
-        Ok(Self { runner, helper })
+        Ok(Self {
+            runner,
+            helper,
+            helper_alias,
+        })
     }
 
     pub(crate) fn install(self, bwrap: &mut BwrapArgs) -> io::Result<()> {
@@ -56,7 +67,7 @@ impl RuntimeBootstrap {
         let mut mounts = vec!["--tmpfs".to_string(), RUNTIME_DIR.to_string()];
         let mut files = vec![(self.runner, RUNNER_ALIAS)];
         if let Some(helper) = self.helper {
-            files.push((helper, HELPER_ALIAS));
+            files.push((helper, self.helper_alias));
         }
         for (file, destination) in files {
             mounts.extend([
@@ -75,8 +86,13 @@ impl RuntimeBootstrap {
     }
 }
 
+fn is_code_mode_host(command: &[String]) -> bool {
+    command.len() == 3 && command[1] == "--listen" && command[2] == "grpc+stdio://"
+}
+
 fn pin_helper(command: &[String], executable: &Path, runner: &File) -> io::Result<File> {
-    if command.len() != 2 || command[1] != FS_HELPER_ARG {
+    let code_mode = is_code_mode_host(command);
+    if !code_mode && (command.len() != 2 || command[1] != FS_HELPER_ARG) {
         return Err(invalid("invalid trusted filesystem helper invocation"));
     }
     let requested = fs::canonicalize(&command[0])?;
@@ -84,11 +100,16 @@ fn pin_helper(command: &[String], executable: &Path, runner: &File) -> io::Resul
     let sibling = executable
         .parent()
         .ok_or_else(|| invalid("runtime executable has no package directory"))?
-        .join("codex-exec-server");
+        .join(if code_mode {
+            "codex-code-mode-host"
+        } else {
+            "codex-exec-server"
+        });
     // A hidden CLI flag is not authority to pin an arbitrary actor executable.
-    // Only this running binary or its literal, non-symlinked package sibling is
-    // eligible. Runtime paths come from trusted executor provisioning.
-    let file = if requested == executable {
+    // The filesystem helper may be this running binary; Code Mode must be its
+    // literal non-symlinked host sibling. Never pin a directory or actor program.
+    // Runtime paths come from trusted executor provisioning.
+    let file = if !code_mode && requested == executable {
         runner.try_clone()?
     } else if requested == sibling && !fs::symlink_metadata(&sibling)?.is_symlink() {
         OpenOptions::new()

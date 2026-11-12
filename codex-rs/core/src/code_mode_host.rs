@@ -445,7 +445,7 @@ fn sandboxed_host_command(
         ));
     }
     let cwd = PathUri::from_abs_path(&AbsolutePathBuf::from_absolute_path(&sandbox.cwd)?);
-    let request = SandboxManager::new()
+    let request = SandboxManager::for_code_mode_host()
         .transform(SandboxTransformRequest {
             command: SandboxCommand {
                 program: host_program.as_os_str().to_owned(),
