@@ -2113,6 +2113,15 @@
     "GoalsToml": {
       "additionalProperties": false,
       "properties": {
+        "continuation_idle_seconds": {
+          "additionalProperties": {
+            "format": "uint16",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "description": "Optional idle checkpoint before automatic continuation, keyed by canonical thread ID. Values are seconds (0..=300); no goal definition, budget or direct-input change.",
+          "type": "object"
+        },
         "max_goal_token_budget": {
           "description": "Maximum token budget allowed for a goal and default budget for new goals.",
           "format": "uint64",

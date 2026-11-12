@@ -203,12 +203,19 @@ async fn run_control_socket_acceptor(
                             *rejection.status_mut() = StatusCode::FORBIDDEN;
                             return Err(rejection);
                         }
+                        let capability =
+                            HeaderValue::from_str(&format!("v1:{}", std::process::id())).map_err(
+                                |_| {
+                                    let mut rejection =
+                                        Response::new(Some("maintenance unavailable".to_string()));
+                                    *rejection.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                                    rejection
+                                },
+                            )?;
                         maintenance_request = true;
-                        response.headers_mut().insert(
-                            crate::DAEMON_MAINTENANCE_CAPABILITY_HEADER,
-                            HeaderValue::from_str(&format!("v1:{}", std::process::id()))
-                                .expect("process id header"),
-                        );
+                        response
+                            .headers_mut()
+                            .insert(crate::DAEMON_MAINTENANCE_CAPABILITY_HEADER, capability);
                     }
                     if request.uri().path() == "/daemon/shutdown" {
                         if !matches!(daemon_shutdown_access, DaemonShutdownAccess::Managed) {

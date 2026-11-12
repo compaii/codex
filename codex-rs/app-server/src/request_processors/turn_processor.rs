@@ -790,20 +790,24 @@ impl TurnRequestProcessor {
             )
             .await?;
 
-        let reservation = provider_reservation_cycle_id.map(|cycle_id| {
-            Arc::new(crate::provider_reservation::OwnerProviderReservation {
-                outgoing: self.outgoing.clone(),
-                owner: request_id.connection_id,
-                thread_id,
-                cycle_id,
-                usage_observations: provider_usage_observations,
-                max_output_tokens: provider_max_output_tokens,
-                deadline_unix_ms: inference_allowance
-                    .as_ref()
-                    .expect("bounded reservation start")
-                    .deadline_unix_ms,
-            }) as Arc<dyn codex_api::ProviderAttemptGate>
-        });
+        let reservation = if let Some(cycle_id) = provider_reservation_cycle_id {
+            let allowance = inference_allowance.as_ref().ok_or_else(|| {
+                invalid_request("provider reservation requires bounded inference".to_string())
+            })?;
+            Some(
+                Arc::new(crate::provider_reservation::OwnerProviderReservation {
+                    outgoing: self.outgoing.clone(),
+                    owner: request_id.connection_id,
+                    thread_id,
+                    cycle_id,
+                    usage_observations: provider_usage_observations,
+                    max_output_tokens: provider_max_output_tokens,
+                    deadline_unix_ms: allowance.deadline_unix_ms,
+                }) as Arc<dyn codex_api::ProviderAttemptGate>,
+            )
+        } else {
+            None
+        };
         let request = TurnInputRequest::new(input)
             .with_thread_settings(thread_settings)
             .on_start(TurnStartOptions {

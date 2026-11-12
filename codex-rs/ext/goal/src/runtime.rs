@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -13,6 +14,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AdditionalContextEntry;
 use codex_protocol::protocol::ThreadGoal;
+use codex_protocol::turn_input::TurnInputSubmission;
 
 use crate::accounting::BudgetLimitedGoalDisposition;
 use crate::accounting::GoalAccountingState;
@@ -54,6 +56,12 @@ pub(crate) enum ActiveGoalStopReason {
     EmptyResponse,
 }
 
+#[derive(Default)]
+struct IdleCheckpoint {
+    generation: u64,
+    waiting: Option<tokio::task::AbortHandle>,
+}
+
 struct GoalRuntimeInner {
     thread_id: ThreadId,
     state_dbs: Arc<codex_state::StateRuntime>,
@@ -67,6 +75,7 @@ struct GoalRuntimeInner {
     tools_available_for_thread: bool,
     tools_visible_for_thread: bool,
     goal_state_lock: Arc<Semaphore>,
+    idle_checkpoint: Mutex<IdleCheckpoint>,
 }
 
 pub(crate) struct AccountedGoalProgress {
@@ -121,6 +130,7 @@ impl GoalRuntimeHandle {
                 tools_available_for_thread: config.tools_available_for_thread,
                 tools_visible_for_thread: config.tools_visible_for_thread,
                 goal_state_lock: Arc::new(Semaphore::new(/*permits*/ 1)),
+                idle_checkpoint: Mutex::new(IdleCheckpoint::default()),
             }),
         }
     }
@@ -339,8 +349,8 @@ impl GoalRuntimeHandle {
             .get_thread(self.thread_id())
             .await
             .map_err(|e| e.to_string())?;
-        if let Some(current) = self.inner.accounting_state.current_turn_id() {
-            if let Some(turn_id) = thread
+        if let Some(current) = self.inner.accounting_state.current_turn_id()
+            && let Some(turn_id) = thread
                 .inject_context_for_running_turn(
                     &current,
                     vec![objective_updated_steering_item(&protocol_goal_from_state(
@@ -349,9 +359,8 @@ impl GoalRuntimeHandle {
                     context.clone(),
                 )
                 .await
-            {
-                return Ok(GoalActivationDisposition::Steered { turn_id });
-            }
+        {
+            return Ok(GoalActivationDisposition::Steered { turn_id });
         }
 
         if self
@@ -580,7 +589,94 @@ impl GoalRuntimeHandle {
     }
 
     pub(crate) async fn continue_if_idle(&self) -> Result<(), String> {
-        self.continue_if_idle_matching(None).await
+        self.continue_if_idle_matching(None, None).await
+    }
+
+    /// Cancel before any new native turn, including bounded attention, or teardown.
+    pub(crate) fn cancel_idle_checkpoint(&self) {
+        let mut checkpoint = self
+            .inner
+            .idle_checkpoint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        checkpoint.generation = checkpoint.generation.wrapping_add(1);
+        if let Some(task) = checkpoint.waiting.take() {
+            task.abort();
+        }
+    }
+
+    /// Retain one bounded checkpoint without holding terminal flush or native admission.
+    pub async fn continue_after_idle_gap(&self, gap: std::time::Duration) -> Result<(), String> {
+        self.cancel_idle_checkpoint();
+        if gap.is_zero() {
+            return self.continue_if_idle().await;
+        }
+        if !self.tools_available() {
+            return Ok(());
+        }
+        let generation = self
+            .inner
+            .idle_checkpoint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generation;
+        let snapshot = self
+            .inner
+            .state_dbs
+            .thread_goals()
+            .snapshot_thread_goal(self.thread_id())
+            .await
+            .map_err(|e| e.to_string())?;
+        if !snapshot
+            .goal
+            .as_ref()
+            .is_some_and(|g| g.status == codex_state::ThreadGoalStatus::Active)
+        {
+            return Ok(());
+        }
+        let Some(manager) = self.inner.thread_manager.upgrade() else {
+            return Ok(());
+        };
+        let Ok(thread) = manager.get_thread(self.inner.thread_id).await else {
+            return Ok(());
+        };
+        let Some(checkpoint_turn) = thread.idle_checkpoint_turn_id().await else {
+            return Ok(());
+        };
+        let weak = Arc::downgrade(&self.inner);
+        let mut slot = self
+            .inner
+            .idle_checkpoint
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.generation != generation {
+            return Ok(());
+        }
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(gap.min(std::time::Duration::from_secs(300))).await;
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            {
+                let mut checkpoint = inner
+                    .idle_checkpoint
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if checkpoint.generation != generation {
+                    return;
+                }
+                checkpoint.waiting.take();
+            }
+            let runtime = Self { inner };
+            if let Err(error) = runtime
+                .continue_if_idle_matching(Some(&snapshot.revision), Some(checkpoint_turn))
+                .await
+            {
+                tracing::warn!(%error,"failed to revalidate checkpoint goal continuation");
+            }
+        });
+        slot.waiting = Some(task.abort_handle());
+        Ok(())
     }
 
     // The boxed boundary keeps resumption out of the async continuation's type.
@@ -588,13 +684,17 @@ impl GoalRuntimeHandle {
     fn resume_after_maintenance(
         runtime: Weak<GoalRuntimeInner>,
         revision: String,
+        expected_previous_turn_id: Option<String>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         Box::pin(async move {
             let Some(inner) = runtime.upgrade() else {
                 return;
             };
             let runtime = Self { inner };
-            if let Err(error) = runtime.continue_if_idle_matching(Some(&revision)).await {
+            if let Err(error) = runtime
+                .continue_if_idle_matching(Some(&revision), expected_previous_turn_id)
+                .await
+            {
                 tracing::warn!(%error, "failed to revalidate withheld goal continuation");
             }
         })
@@ -603,6 +703,7 @@ impl GoalRuntimeHandle {
     async fn continue_if_idle_matching(
         &self,
         expected_revision: Option<&str>,
+        expected_previous_turn_id: Option<String>,
     ) -> Result<(), String> {
         if !self.tools_available() {
             self.inner.accounting_state.clear_active_goal();
@@ -652,8 +753,11 @@ impl GoalRuntimeHandle {
         }
         let runtime = Arc::downgrade(&self.inner);
         let revision = snapshot.revision;
+        let checkpoint = expected_previous_turn_id.clone();
         let Some(_admission) = thread.admit_goal_continuation(Box::new(move || {
-            tokio::spawn(Self::resume_after_maintenance(runtime, revision));
+            tokio::spawn(Self::resume_after_maintenance(
+                runtime, revision, checkpoint,
+            ));
         })) else {
             return Ok(());
         };
@@ -667,25 +771,41 @@ impl GoalRuntimeHandle {
             thread.config().await.update_plan_enabled,
         );
 
-        match thread
-            .start_turn_if_idle(
-                TurnInputRequest::new(TurnInput::ResponseItem(item)).on_start(TurnStartOptions {
-                    turn_trigger: Some("goal".to_string()),
-                    ..start_options
-                }),
-            )
-            .await
-        {
-            Ok(StartIfIdleSubmission::Started { turn_id, .. }) => {
+        let request =
+            TurnInputRequest::new(TurnInput::ResponseItem(item)).on_start(TurnStartOptions {
+                turn_trigger: Some("goal".to_string()),
+                ..start_options
+            });
+        let submission = if let Some(previous) = expected_previous_turn_id {
+            thread.start_turn_if_idle_after(request, previous).await
+        } else {
+            thread.start_turn_if_idle(request).await.map(|v| match v {
+                StartIfIdleSubmission::Started {
+                    turn_id,
+                    root_turn_id,
+                } => TurnInputSubmission::Started {
+                    turn_id,
+                    root_turn_id,
+                },
+                StartIfIdleSubmission::NotSubmitted { reason } => {
+                    TurnInputSubmission::NotSubmitted { reason }
+                }
+            })
+        };
+        match submission {
+            Ok(TurnInputSubmission::Started { turn_id, .. }) => {
                 // Turn-stop evaluation takes the same permit, so even a fast response
                 // cannot finish before this host-admitted continuation is identified.
                 self.inner.accounting_state.mark_goal_continuation(turn_id);
             }
-            Ok(StartIfIdleSubmission::NotSubmitted { reason }) => {
+            Ok(TurnInputSubmission::NotSubmitted { reason }) => {
                 tracing::debug!(
                     ?reason,
                     "skipping goal continuation because automatic idle work was rejected"
                 );
+            }
+            Ok(TurnInputSubmission::Steered { .. }) => {
+                unreachable!("idle goal admission cannot steer")
             }
             Err(error) => {
                 tracing::debug!(

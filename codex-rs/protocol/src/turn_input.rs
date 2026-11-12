@@ -198,6 +198,9 @@ pub enum TurnInputMode {
     StartOrSteer,
     /// Start only when the thread is idle.
     StartIfIdle,
+    /// Start a fresh internal automatic turn only after this exact idle checkpoint.
+    /// Unlike recovery, it inherits no execution allowance or continuation chain.
+    StartIfIdleAfter { expected_previous_turn_id: String },
     /// Start an internal continuation when idle.
     /// Reject if another task has started since the expected previous turn.
     ContinueIfIdle { expected_previous_turn_id: String },

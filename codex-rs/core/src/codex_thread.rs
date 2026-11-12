@@ -528,6 +528,26 @@ impl CodexThread {
         }
     }
 
+    /// Capture the physical checkpoint for a fresh automatic goal turn.
+    pub async fn idle_checkpoint_turn_id(&self) -> Option<String> {
+        self.session.idle_checkpoint_turn_id().await
+    }
+
+    /// Fresh automatic input, atomically fenced against intervening native work.
+    pub async fn start_turn_if_idle_after(
+        &self,
+        request: impl Into<WithTurnExtensionData<TurnInputRequest>>,
+        expected_previous_turn_id: String,
+    ) -> CodexResult<TurnInputSubmission> {
+        self.submit_turn_input_with_mode(
+            request,
+            TurnInputMode::StartIfIdleAfter {
+                expected_previous_turn_id,
+            },
+        )
+        .await
+    }
+
     /// Starts a new internal continuation turn when idle, including in Plan mode.
     /// Rejects if a newer task has started, even if it has already finished.
     /// The input must be a response item; it is never treated as user authorization.

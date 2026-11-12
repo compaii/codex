@@ -96,3 +96,47 @@ native-repository Actions cannot be dispatched. Checkout remains fixed to
 `compaii/codex`; callers must pin both the workflow and source to reviewed commit
 SHAs. No deployment or secrets are inherited. Artifacts retain the checked-out
 source ID separately from the caller's workflow revision.
+
+
+## Per-thread automatic continuation checkpoint
+
+An owner can configure a bounded idle gap for selected canonical native thread
+IDs. Omitted threads retain immediate automatic goal continuation. Example IDs
+below are placeholders, not routing or activation authority:
+
+```toml
+[goals.continuation_idle_seconds]
+"019d1000-0000-7000-8000-000000000001" = 45
+```
+
+At most 128 entries are accepted, with 0 through 300 seconds each. For an
+unsubscribed runtime that must keep continuing, select a gap shorter than its
+existing `thread_unload_delay_secs`: the default retention is 60 seconds, so the
+example uses 45. Unloading is teardown and cancels the callback. Do not extend
+unrelated retention settings to manufacture an idle test. The gap leaves
+an active goal and its full objective, identity, token budget and cumulative
+accounting unchanged. Explicit activation and human input retain immediate
+admission. The ordinary queue runs before goal continuation. This is a checkpoint
+inside the existing native goal lifecycle, not a second periodic scheduler or
+an execution budget for application work.
+
+The idle hook schedules at most one weak-runtime callback and returns immediately;
+terminal rollout flush and pending human work do not wait for the gap. A new turn,
+including bounded attention, cancels the waiting callback. Teardown cancels it.
+The callback revalidates the actual goal definition revision, which ordinary
+accounting alone does not change, and an exact physical native checkpoint. Fresh
+internal automatic admission atomically rejects a newer started turn even if it
+already completed. It uses ordinary automatic-input and Plan restrictions; it is
+not recovery of the predecessor and inherits no reserved inference allocation.
+If maintenance withholds admission, its resumption callback retains that same
+physical checkpoint; defer cannot revive an older callback after human work.
+Bounded recovery still requires fresh reserved admission. No user original is
+manufactured and an active ordinary turn is never steered.
+
+The current setting is selected at each idle checkpoint. Changing a goal's
+status/definition invalidates the waiting revision. Removing the configuration
+and restarting through the supported native maintenance route restores immediate
+continuation; existing goal pause/clear controls still stop automatic admission.
+A setting or successful mock test does not prove receiving installation, useful
+application intake/action/reply, or current operational readiness. Qualify the
+actual configured thread and application allowance on each receiver separately.

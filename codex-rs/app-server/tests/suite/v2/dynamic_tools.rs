@@ -1060,7 +1060,7 @@ async fn exercise_idle_only_turn(bounded: bool, host_restrictions: bool) -> Resu
     let history_image = if bounded {
         use base64::Engine;
         let mut png = base64::engine::general_purpose::STANDARD
-            .decode(TINY_PNG_DATA_URL.split_once(',').unwrap().1)?;
+            .decode(TINY_PNG_DATA_URL.split_once(',').expect("PNG data URL").1)?;
         png.resize(1024 * 1024, 0);
         Some(format!(
             "data:image/png;base64,{}",
@@ -1257,7 +1257,7 @@ async fn exercise_idle_only_turn(bounded: bool, host_restrictions: bool) -> Resu
             .context("bounded tools missing")?;
         assert_eq!(tools.len(), 1, "host ceiling applies before sampling");
         assert_eq!(tools[0]["name"], "demo_tool");
-        assert!(bodies[0]["tools"].as_array().unwrap().len() > tools.len());
+        assert!(bodies[0]["tools"].as_array().expect("provider tools").len() > tools.len());
     }
     if bounded {
         assert!(
@@ -1317,7 +1317,7 @@ async fn exercise_idle_only_turn(bounded: bool, host_restrictions: bool) -> Resu
         assert!(
             ordinary_bodies[3]["input"]
                 .as_array()
-                .unwrap()
+                .expect("ordinary provider input")
                 .iter()
                 .filter_map(|item| item["content"].as_array())
                 .flatten()

@@ -14223,3 +14223,41 @@ fn sqlite_home_env_conflict_reports_an_override() -> std::io::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn goal_idle_checkpoints_are_scoped_bounded_and_optional() {
+    let thread = "019d1000-0000-7000-8000-000000000001";
+    for seconds in [0, 90, 300] {
+        let cfg = toml::from_str::<ConfigToml>(&format!(
+            "[goals.continuation_idle_seconds]\n\"{thread}\" = {seconds}\n"
+        ))
+        .expect("valid checkpoint config");
+        let loaded = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            tempdir().expect("tempdir").abs(),
+        )
+        .await
+        .expect("load bounded checkpoint");
+        assert_eq!(
+            loaded.goal_continuation_idle_seconds.get(thread),
+            Some(&seconds)
+        );
+        assert_eq!(loaded.goal_continuation_idle_seconds.len(), 1);
+    }
+    for (id, seconds) in [(thread, 301), ("not-a-native-thread", 90)] {
+        let cfg = toml::from_str::<ConfigToml>(&format!(
+            "[goals.continuation_idle_seconds]\n\"{id}\" = {seconds}\n"
+        ))
+        .expect("deserialize config");
+        assert!(
+            Config::load_from_base_config_with_overrides(
+                cfg,
+                ConfigOverrides::default(),
+                tempdir().expect("tempdir").abs()
+            )
+            .await
+            .is_err()
+        );
+    }
+}

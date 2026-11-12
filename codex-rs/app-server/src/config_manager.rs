@@ -623,7 +623,7 @@ impl ConfigManager {
                 ] {
                     let explicit_retained_route = explicit_retained_provider.as_deref()
                         == Some(provider)
-                        && current_providers.get(provider).is_some()
+                        && current_providers.contains_key(provider)
                         && config.model_providers.get(provider) == current_providers.get(provider);
                     if provider != current_provider && !explicit_retained_route {
                         return Err(std::io::Error::new(
