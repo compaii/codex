@@ -166,10 +166,26 @@ impl LinuxProcessResourceGroup {
             owner.cgroup = PathBuf::from("/sys/fs/cgroup").join(group.trim_start_matches('/'));
             owner.verify_kernel()
         };
-        tokio::time::timeout(MANAGER_TIMEOUT, ready)
+        let readiness = tokio::time::timeout(MANAGER_TIMEOUT, ready)
             .await
-            .map_err(io::Error::other)??;
+            .map_err(io::Error::other)
+            .and_then(|result| result);
+        if let Err(error) = readiness {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "owned resource unit {} startup unconfirmed: {error}; stdin closed, no retry",
+                    owner.unit
+                ),
+            ));
+        }
         Ok(owner)
+    }
+
+    /// Correlation for the caller's existing execution journal and scoped
+    /// inspection. These identifiers confer no permission to control a unit.
+    pub fn identity(&self) -> (&str, &str) {
+        (&self.unit, &self.invocation)
     }
 
     async fn properties(&self) -> io::Result<HashMap<String, String>> {
