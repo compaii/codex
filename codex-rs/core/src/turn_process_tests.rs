@@ -87,11 +87,17 @@ fn bounded_turn_executor_journey(
 #include <unistd.h>
 int main(int argc, char **argv) {{
     if (argc == 2 && strcmp(argv[1], "--help") == 0) {{
-        puts("--perms");
+        puts("--perms --as-pid-1");
         return 0;
     }}
+    int verified = 0;
+    for (int i = 1; i < argc; i++) {{
+        if (!strcmp(argv[i], "--argv0") || !strcmp(argv[i], "--ro-bind-fd")) return 112;
+        if (!strcmp(argv[i], "--verify-fd-mount")) verified = 1;
+    }}
     int marker = open({marker:?}, O_WRONLY | O_CREAT | O_APPEND, 0600);
-    if (marker < 0 || write(marker, "used\n", 5) != 5) return 110;
+    const char *record = verified ? "verified\n" : "preflight\n";
+    if (marker < 0 || write(marker, record, strlen(record)) != strlen(record)) return 110;
     close(marker);
     argv[0] = {actual_bwrap:?};
     execv(argv[0], argv);
@@ -102,9 +108,9 @@ int main(int argc, char **argv) {{
                     actual_bwrap = actual_bwrap.to_string_lossy(),
                 ),
             )?;
-            // The trusted launcher pins bwrap by descriptor. A shebang wrapper
-            // cannot survive its close-on-exec launcher FD; use a tiny native
-            // fixture without changing production descriptor ownership.
+            // Match a native system bwrap, including its mandatory capability
+            // probe. The wrapper rejects modern flags and records the actual
+            // inherited-FD verification route, so fallback cannot pass silently.
             let compile = std::process::Command::new("/usr/bin/cc")
                 .args([
                     source.as_os_str(),
@@ -432,7 +438,7 @@ time.sleep(120)
             assert!(
                 std::fs::read_to_string(workspace.join("legacy-bwrap-used"))
                     .context("legacy bubblewrap wrapper must have been selected")?
-                    .contains("used")
+                    .contains("verified")
             );
         }
         let (ordinary, _) = session
