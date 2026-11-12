@@ -295,6 +295,12 @@ impl SandboxManager {
         }
     }
 
+    /// Uses the same sealed runtime bootstrap for the host-selected Code Mode
+    /// package sibling. The helper validates its exact stdio-gRPC invocation.
+    pub fn for_code_mode_host() -> Self {
+        Self::for_file_system_helpers()
+    }
+
     /// Applies a trusted executor startup policy, never a command or repository setting.
     pub fn with_linux_sandbox_pid_namespace(mut self, mode: LinuxSandboxPidNamespace) -> Self {
         self.linux_sandbox_pid_namespace = mode;
