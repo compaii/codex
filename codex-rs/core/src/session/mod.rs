@@ -576,6 +576,10 @@ const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
 const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
 
 impl Session {
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "idle state and its physical predecessor must be captured atomically, in native admission lock order"
+    )]
     pub(crate) async fn idle_checkpoint_turn_id(&self) -> Option<String> {
         let active = self.active_turn.lock().await;
         if active.is_some() {

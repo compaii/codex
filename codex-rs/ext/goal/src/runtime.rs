@@ -349,8 +349,8 @@ impl GoalRuntimeHandle {
             .get_thread(self.thread_id())
             .await
             .map_err(|e| e.to_string())?;
-        if let Some(current) = self.inner.accounting_state.current_turn_id() {
-            if let Some(turn_id) = thread
+        if let Some(current) = self.inner.accounting_state.current_turn_id()
+            && let Some(turn_id) = thread
                 .inject_context_for_running_turn(
                     &current,
                     vec![objective_updated_steering_item(&protocol_goal_from_state(
@@ -359,9 +359,8 @@ impl GoalRuntimeHandle {
                     context.clone(),
                 )
                 .await
-            {
-                return Ok(GoalActivationDisposition::Steered { turn_id });
-            }
+        {
+            return Ok(GoalActivationDisposition::Steered { turn_id });
         }
 
         if self
@@ -599,7 +598,7 @@ impl GoalRuntimeHandle {
             .inner
             .idle_checkpoint
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         checkpoint.generation = checkpoint.generation.wrapping_add(1);
         if let Some(task) = checkpoint.waiting.take() {
             task.abort();
@@ -619,7 +618,7 @@ impl GoalRuntimeHandle {
             .inner
             .idle_checkpoint
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .generation;
         let snapshot = self
             .inner
@@ -649,7 +648,7 @@ impl GoalRuntimeHandle {
             .inner
             .idle_checkpoint
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if slot.generation != generation {
             return Ok(());
         }
@@ -662,7 +661,7 @@ impl GoalRuntimeHandle {
                 let mut checkpoint = inner
                     .idle_checkpoint
                     .lock()
-                    .unwrap_or_else(|p| p.into_inner());
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if checkpoint.generation != generation {
                     return;
                 }

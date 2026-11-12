@@ -839,7 +839,7 @@ async fn resolved_resume_journey(history_mode: &str) -> Result<()> {
             "config":{"web_search":"disabled","model_reasoning_effort":"medium"},"historyMode":history_mode
         }})).await;
         let started: ThreadStartResponse = read_response_from(&mut outgoing, first_id, 2).await;
-        assert_eq!(serde_json::to_value(&started.thread.history_mode)?, json!(history_mode));
+        assert_eq!(serde_json::to_value(started.thread.history_mode)?, json!(history_mode));
         let id = codex_protocol::ThreadId::from_string(&started.thread.id)?;
         send_request(&processor, first_id, &first, json!({"id":3,"method":"turn/start","params":{
             "threadId":started.thread.id,"input":[{"type":"text","text":"materialize once","text_elements":[]}]
@@ -907,7 +907,7 @@ async fn resolved_resume_journey(history_mode: &str) -> Result<()> {
             "config":{"web_search":"live","model_reasoning_effort":"medium"}
         }})).await;
         let resumed: codex_app_server_protocol::ThreadResumeResponse = read_response_from(&mut outgoing, third_id, 7).await;
-        assert_eq!(serde_json::to_value(&resumed.thread.history_mode)?, json!(history_mode));
+        assert_eq!(serde_json::to_value(resumed.thread.history_mode)?, json!(history_mode));
         let changed = processor.thread_processor.thread_manager.get_thread(id).await?;
         assert!(!Arc::ptr_eq(&original, &changed));
         assert_eq!(resumed.thread.turns.len(), 1, "rebuild retains the original materialized turn");
