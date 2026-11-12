@@ -832,15 +832,23 @@ grant. Values must be positive within the existing own-work maxima of 1 GiB,
 
 The admitted turn captures one private local execution snapshot. Its actual
 stdio executor comes from `codex-exec-server` beside the trusted native executable;
-V8 uses the same process owner. Both receive an explicit environment and a private
-empty HOME/CODEX_HOME; actor permissions further deny host cgroup/manager access
+V8 uses the same process owner. Both receive an explicit environment, a private
+actor HOME and a separate executor CODEX_HOME beneath the protected native home;
+actor permissions further deny host cgroup/manager access
 and the native Codex home. A later tool environment resolution cannot substitute
 the ordinary executor. Start failure is retained for this turn without retrying
 allocation or falling back; completion, cancellation and the same deadline close
 the aggregate despite retained step/client references. Temporary-home cleanup and
 actual group closure have one retained local result.
 
-Select this only after qualifying the complete package, local paths, allowed tools
-and receiving accounting. It does not establish a monetary ceiling, qualify a
+The receiving launcher must support bubblewrap's `--argv0`: helper re-entry uses
+its protected alias without exposing that path to actor writes. Older launchers
+whose fallback executes the hidden helper pathname are not qualified for this
+profile. Explicit logical runtime roots such as `/bin` and `/lib64` must remain
+readable through permission intersection; their shared read-only target preserves
+descendant denials in both views.
+
+Select this only after qualifying the complete package, launcher, local paths,
+allowed tools and receiving accounting. It does not establish a monetary ceiling, qualify a
 remote SSH front as a resource boundary or make configured state proof of live
 execution. Unsupported hosts/readers reject the selection rather than remove it.

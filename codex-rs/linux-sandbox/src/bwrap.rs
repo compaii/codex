@@ -554,6 +554,36 @@ fn create_filesystem_args(
                 "/dev".to_string(),
             ];
         } else {
+            // Preserve explicitly authorized system names after intersection
+            // canonicalizes their grant targets. Only a wholly read-only target
+            // is eligible; this adds no implicit platform-default permissions.
+            for alias in LINUX_PLATFORM_DEFAULT_READ_ROOTS {
+                let alias = Path::new(alias);
+                if readable_roots.iter().any(|root| alias.starts_with(root))
+                    || !file_system_sandbox_policy.can_read_local_path_with_cwd(alias, cwd)
+                {
+                    continue;
+                }
+                let Ok(target) = alias.canonicalize() else {
+                    continue;
+                };
+                if readable_roots.iter().any(|root| target.starts_with(root))
+                    && !unreadable_roots
+                        .iter()
+                        .any(|denied| target.starts_with(denied))
+                    && !writable_roots.iter().any(|root| {
+                        target.starts_with(root.root.as_path())
+                            || root.root.as_path().starts_with(&target)
+                    })
+                {
+                    // A symlink keeps descendant deny masks in one mounted
+                    // tree. Never use it to expose writable data through an
+                    // alias whose explicit authorization is read-only.
+                    args.push("--symlink".to_string());
+                    args.push(path_to_string(&target));
+                    args.push(path_to_string(alias));
+                }
+            }
             for root in readable_roots {
                 if !root.exists() {
                     continue;
@@ -619,9 +649,11 @@ fn create_filesystem_args(
         .collect();
     unreadable_ancestors_of_writable_roots.sort_by_key(|path| path_depth(path));
 
-    for unreadable_root in &unreadable_ancestors_of_writable_roots {
-        append_unreadable_root_args(&mut bwrap_args, unreadable_root, &allowed_write_paths)?;
-    }
+    append_unreadable_roots_args(
+        &mut bwrap_args,
+        &unreadable_ancestors_of_writable_roots,
+        &allowed_write_paths,
+    )?;
 
     for writable_root in &sorted_writable_roots {
         let root = writable_root.root.as_path();
@@ -752,9 +784,11 @@ fn create_filesystem_args(
                 remap_paths_for_symlink_target(nested_unreadable_roots, root, target);
         }
         nested_unreadable_roots.sort_by_key(|path| path_depth(path));
-        for unreadable_root in nested_unreadable_roots {
-            append_unreadable_root_args(&mut bwrap_args, &unreadable_root, &allowed_write_paths)?;
-        }
+        append_unreadable_roots_args(
+            &mut bwrap_args,
+            &nested_unreadable_roots,
+            &allowed_write_paths,
+        )?;
     }
 
     let mut rootless_unreadable_roots: Vec<PathBuf> = unreadable_roots
@@ -768,9 +802,11 @@ fn create_filesystem_args(
         .cloned()
         .collect();
     rootless_unreadable_roots.sort_by_key(|path| path_depth(path));
-    for unreadable_root in rootless_unreadable_roots {
-        append_unreadable_root_args(&mut bwrap_args, &unreadable_root, &allowed_write_paths)?;
-    }
+    append_unreadable_roots_args(
+        &mut bwrap_args,
+        &rootless_unreadable_roots,
+        &allowed_write_paths,
+    )?;
 
     if options.mask_wslg_distro
         && !unreadable_roots.iter().any(|denied| {
@@ -1341,11 +1377,36 @@ fn append_existing_empty_directory_args(
         ));
 }
 
+/// Applies a depth-sorted batch without intervening writable rebinds. Only a
+/// complete 000 directory mask covers descendants; 111 traversal scaffolding
+/// for explicitly reopened writable children is not a complete mask.
+fn append_unreadable_roots_args(
+    args: &mut BwrapArgs,
+    roots: &[PathBuf],
+    writable: &[PathBuf],
+) -> Result<()> {
+    let mut fully_masked = HashSet::new();
+    for root in roots {
+        if root
+            .ancestors()
+            .skip(1)
+            .any(|parent| fully_masked.contains(parent))
+        {
+            continue;
+        }
+        if append_unreadable_root_args(args, root, writable)? {
+            fully_masked.insert(root.clone());
+        }
+    }
+    Ok(())
+}
+
+/// Returns whether a whole existing directory was hidden by an emitted mask.
 fn append_unreadable_root_args(
     bwrap_args: &mut BwrapArgs,
     unreadable_root: &Path,
     allowed_write_paths: &[PathBuf],
-) -> Result<()> {
+) -> Result<bool> {
     if let Some(symlink) =
         first_writable_symlink_component_in_path(unreadable_root, allowed_write_paths)
     {
@@ -1369,7 +1430,7 @@ fn append_unreadable_root_args(
         {
             append_missing_empty_file_bind_data_args(bwrap_args, &first_missing_component)?;
         }
-        return Ok(());
+        return Ok(false);
     }
 
     append_existing_unreadable_path_args(bwrap_args, unreadable_root, allowed_write_paths)
@@ -1379,13 +1440,14 @@ fn append_existing_unreadable_path_args(
     bwrap_args: &mut BwrapArgs,
     unreadable_root: &Path,
     allowed_write_paths: &[PathBuf],
-) -> Result<()> {
+) -> Result<bool> {
     if unreadable_root.is_dir() {
         let mut writable_descendants: Vec<&Path> = allowed_write_paths
             .iter()
             .map(PathBuf::as_path)
             .filter(|path| *path != unreadable_root && path.starts_with(unreadable_root))
             .collect();
+        let fully_masked = writable_descendants.is_empty();
         bwrap_args.args.push("--perms".to_string());
         // Execute-only perms let the process traverse into explicitly
         // re-opened writable descendants while still hiding the denied
@@ -1411,12 +1473,13 @@ fn append_existing_unreadable_path_args(
         }
         bwrap_args.args.push("--remount-ro".to_string());
         bwrap_args.args.push(path_to_string(unreadable_root));
-        return Ok(());
+        return Ok(fully_masked);
     }
 
     bwrap_args.args.push("--perms".to_string());
     bwrap_args.args.push("000".to_string());
-    append_empty_file_bind_data_args(bwrap_args, unreadable_root)
+    append_empty_file_bind_data_args(bwrap_args, unreadable_root)?;
+    Ok(false)
 }
 
 /// Returns true when `path` is under any allowed writable root.

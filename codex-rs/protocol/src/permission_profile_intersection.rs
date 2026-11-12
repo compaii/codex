@@ -107,8 +107,9 @@ pub fn intersect_effective_permission_profiles(
         ));
     }
 
-    normalize_policy(&mut authority_policy)?;
-    normalize_policy(&mut requested_policy)?;
+    let original_policies = [authority_policy.clone(), requested_policy.clone()];
+    let mut read_aliases = normalize_policy(&mut authority_policy)?;
+    read_aliases.extend(normalize_policy(&mut requested_policy)?);
     let tmpdir = FileSystemPath::Special {
         value: FileSystemSpecialPath::Tmpdir,
     };
@@ -266,15 +267,48 @@ pub fn intersect_effective_permission_profiles(
     if let Some(temp) = common_temp {
         intersection.entries.push(temp);
     }
+    if !read_aliases.is_empty() {
+        let original_denies = original_policies
+            .iter()
+            .map(|policy| ReadDenyMatcher::try_new_for_local_paths(policy, cwd))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PermissionIntersectionError::UnsupportedPath)?;
+        for (logical, physical) in read_aliases {
+            // Keep a trusted top-level read alias only when both original
+            // policies authorize its name and the intersection permits its data.
+            if original_policies
+                .iter()
+                .zip(&original_denies)
+                .all(|(policy, denies)| {
+                    effective_access(policy, denies.as_ref(), logical.as_path(), cwd).can_read()
+                })
+                && effective_access(
+                    &intersection,
+                    intersection_denies.as_ref(),
+                    physical.as_path(),
+                    cwd,
+                )
+                .can_read()
+            {
+                let alias = FileSystemSandboxEntry::new(logical.into(), FileSystemAccessMode::Read);
+                if !intersection.entries.contains(&alias) {
+                    intersection.entries.push(alias);
+                }
+            }
+        }
+    }
     Ok(PermissionProfile::from_runtime_permissions(
         &intersection,
         network,
     ))
 }
 
+type ReadAlias = (AbsolutePathBuf, AbsolutePathBuf);
+
 fn normalize_policy(
     policy: &mut FileSystemSandboxPolicy,
-) -> Result<(), PermissionIntersectionError> {
+) -> Result<Vec<ReadAlias>, PermissionIntersectionError> {
+    let mut read_aliases = Vec::new();
     if policy.include_platform_defaults() {
         return Err(PermissionIntersectionError::PlatformDefaults);
     }
@@ -312,6 +346,9 @@ fn normalize_policy(
                         path.as_path().display()
                     )));
                 }
+                if entry.access == FileSystemAccessMode::Read && path != physical {
+                    read_aliases.push((path, physical.clone()));
+                }
                 entry.path = physical.into();
             }
             FileSystemPath::GlobPattern { pattern }
@@ -347,7 +384,7 @@ fn normalize_policy(
             }
         }
     }
-    Ok(())
+    Ok(read_aliases)
 }
 
 fn entry_path(

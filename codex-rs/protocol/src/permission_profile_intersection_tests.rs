@@ -384,3 +384,28 @@ fn macos_system_path_aliases_share_the_same_physical_permissions() {
     .file_system_sandbox_policy();
     assert!(policy.can_write_local_path_with_cwd(canonical.as_path(), canonical.as_path()));
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn intersection_preserves_explicit_system_read_aliases_without_adding_names() {
+    let temp = TempDir::new().expect("workspace");
+    let cwd = canonical(&temp);
+    for name in ["/bin", "/lib", "/lib64"] {
+        let logical = Path::new(name);
+        let physical = logical.canonicalize().expect("system path");
+        if logical == physical {
+            continue;
+        }
+        let authority = rooted(&cwd, Write, []);
+        let selected = managed(vec![entry(logical, Read), entry(cwd.as_path(), Write)]);
+        let result = intersection(&authority, &selected, &cwd).file_system_sandbox_policy();
+        assert!(result.can_read_local_path_with_cwd(logical, cwd.as_path()));
+        let canonical_only = managed(vec![entry(&physical, Read), entry(cwd.as_path(), Write)]);
+        let result = intersection(&authority, &canonical_only, &cwd).file_system_sandbox_policy();
+        assert!(!result.can_read_local_path_with_cwd(logical, cwd.as_path()));
+        let denied = rooted(&cwd, Write, [entry(&physical, Deny)]);
+        let result = intersection(&denied, &selected, &cwd).file_system_sandbox_policy();
+        assert!(!result.can_read_local_path_with_cwd(logical, cwd.as_path()));
+        assert!(!result.can_read_local_path_with_cwd(&physical, cwd.as_path()));
+    }
+}
