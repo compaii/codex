@@ -38,7 +38,7 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           sudo apt-get update
-          sudo apt-get install -y lld pkg-config libssl-dev cmake clang protobuf-compiler libcap-dev
+          sudo apt-get install -y lld pkg-config libssl-dev cmake clang protobuf-compiler libcap-dev bubblewrap
           df -h .
       - uses: actions/cache/restore@668228422ae6a00e4ad889ee87cd7109ec5666a7
         id: native-cache
@@ -125,7 +125,10 @@ jobs:
           RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all multi_agent_v2_tools_emit_collaborator_analytics -- --nocapture
       - name: Bounded turn admission, lifecycle and unrelated goal isolation
         run: |
-          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-core --lib -- bounded_ agent_message_wake_reservation_preserves_existing_boundaries delegated_mailbox_selection_rechecks_lineage_without_consuming_new_input turn_inference::tests::refuses
+          cargo build --locked --profile dev-small -j 2 -p codex-code-mode-host --bin codex-code-mode-host
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-core --lib -- bounded_ start_only_code_mode_limits_do_not_change_thread_extension_data agent_message_wake_reservation_preserves_existing_boundaries delegated_mailbox_selection_rechecks_lineage_without_consuming_new_input turn_inference::tests::refuses
+          RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-app-server --test all bounded_host_restrictions_narrow_tools_and_preserve_ordinary_followup -- --nocapture
+          cargo test --locked --profile dev-small -j 2 -p codex-utils-pty --lib linux_fds
           RUST_MIN_STACK=8388608 cargo test --locked --profile dev-small -j 2 -p codex-guardian-v2 --lib -- bounded_attention_invalidates_cached_scores_without_classification contributor_accounts_for_parent_checkpoint
       - name: Shared inference allowance and no-replay transport regressions
         run: |
