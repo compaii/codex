@@ -229,7 +229,7 @@ impl TurnEnvironment {
         ceiling: &PermissionProfile,
         command_environment: Option<&ShellEnvironmentPolicy>,
     ) -> CodexResult<()> {
-        if self.environment.is_remote() {
+        if self.environment.is_remote() && !self.environment.is_owned_local() {
             return Err(CodexErr::InvalidRequest(
                 "host permission ceiling requires a qualified local executor".into(),
             ));
@@ -377,6 +377,7 @@ impl std::fmt::Debug for TurnEnvironment {
 /// Request options for one turn, separate from persistent thread settings.
 #[derive(Default)]
 pub(crate) struct NewTurnContextOptions {
+    pub(crate) process_limits: Option<codex_protocol::turn_input::TurnProcessLimits>,
     pub(crate) code_mode_limits: Option<codex_protocol::turn_input::TurnCodeModeLimits>,
     pub(crate) command_environment_policy: Option<ShellEnvironmentPolicy>,
     pub(crate) permission_ceiling: Option<PermissionProfile>,
@@ -477,6 +478,9 @@ enum TurnContextBuildMode {
 
 impl TurnContext {
     pub(crate) fn command_environment_policy(&self) -> Option<Arc<ShellEnvironmentPolicy>> {
+        if let Some(policy) = crate::turn_process::command_policy(self) {
+            return Some(policy);
+        }
         self.extension_data
             .get::<TurnCommandEnvironmentPolicy>()
             .map(|policy| Arc::clone(&policy.0))
@@ -1405,6 +1409,9 @@ impl Session {
         build_mode: TurnContextBuildMode,
         git_enrichment_policy: GitEnrichmentPolicy,
     ) -> CodexResult<Arc<TurnContext>> {
+        // Actor repository commands must run through the private executor;
+        // do not launch the thread's ambient git enrichment outside its owner.
+        let owns_processes = options.process_limits.is_some();
         let turn_environments = match options.permission_ceiling.as_ref() {
             Some(ceiling) => turn_environments
                 .restrict_permissions(ceiling, options.command_environment_policy.as_ref())?,
@@ -1543,6 +1550,11 @@ impl Session {
                     expose_additional_permissions: false,
                 }));
         }
+        if let Some(limits) = options.process_limits {
+            turn_context
+                .extension_data
+                .insert(crate::turn_process::ProcessResources::new(limits));
+        }
         if let Some(limits) = options.code_mode_limits {
             turn_context
                 .extension_data
@@ -1573,6 +1585,7 @@ impl Session {
         }
         let turn_context = Arc::new(turn_context);
         if git_enrichment_policy == GitEnrichmentPolicy::Fresh
+            && !owns_processes
             && turn_context
                 .initial_environments
                 .single_local_environment_cwd()

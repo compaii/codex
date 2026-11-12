@@ -893,7 +893,9 @@ impl ToolRegistry {
             let result = match &mut invocation.environments {
                 crate::tools::context::ToolEnvironments::Arguments(environments) => {
                     environments.iter_mut().try_for_each(|(_, environment)| {
-                        Arc::make_mut(environment).restrict_permissions(
+                        let environment = Arc::make_mut(environment);
+                        crate::turn_process::enforce_environment(&invocation.turn, environment)?;
+                        environment.restrict_permissions(
                             &ceiling,
                             invocation.turn.command_environment_policy().as_deref(),
                         )

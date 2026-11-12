@@ -692,6 +692,7 @@ fn optional_environment_value(name: &str) -> Option<String> {
 /// paths used by filesystem helpers.
 #[derive(Clone)]
 pub struct Environment {
+    owned_local: bool,
     skills: ScopedSkillsConfig,
     remote_client: Option<LazyRemoteExecServerClient>,
     ready_info: Arc<ArcSwapOption<EnvironmentReadyInfo>>,
@@ -710,6 +711,7 @@ impl Environment {
     /// Builds a test-only local environment without configured sandbox helper paths.
     pub fn default_for_tests() -> Self {
         Self {
+            owned_local: false,
             remote_client: None,
             skills: ScopedSkillsConfig::default(),
             ready_info: Arc::new(ArcSwapOption::empty()),
@@ -791,6 +793,7 @@ impl Environment {
         http_client_factory: HttpClientFactory,
     ) -> Self {
         Self {
+            owned_local: false,
             remote_client: None,
             skills: ScopedSkillsConfig::default(),
             ready_info: Arc::new(ArcSwapOption::empty()),
@@ -825,7 +828,7 @@ impl Environment {
                 "owned stdio requires qualified Linux and explicit absolute command/cwd".into(),
             ));
         }
-        Ok(Self::remote_with_transport(
+        let mut environment = Self::remote_with_transport(
             ExecServerTransportParams::StdioCommand {
                 command,
                 initialize_timeout:
@@ -835,7 +838,9 @@ impl Environment {
             Some(local_runtime_paths),
             http_client_factory,
             ScopedSkillsConfig::default(),
-        ))
+        );
+        environment.owned_local = true;
+        Ok(environment)
     }
 
     pub(crate) fn remote_with_transport(
@@ -858,6 +863,7 @@ impl Environment {
             Arc::new(RemoteFileSystem::new(client.clone()));
 
         Self {
+            owned_local: false,
             remote_client: Some(client.clone()),
             skills,
             ready_info: Arc::new(ArcSwapOption::empty()),
@@ -873,6 +879,11 @@ impl Environment {
     /// Skill names required whenever this registration is selected by a turn.
     pub fn required_skills(&self) -> &[String] {
         &self.skills.required
+    }
+
+    /// Trusted local owned process behind the existing stdio protocol.
+    pub fn is_owned_local(&self) -> bool {
+        self.owned_local
     }
 
     pub fn is_remote(&self) -> bool {

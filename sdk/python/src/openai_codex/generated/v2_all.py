@@ -6799,6 +6799,16 @@ class TurnPlanStepStatus(Enum):
     completed = "completed"
 
 
+class TurnProcessLimits(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+    )
+    cpu_percent: Annotated[int, Field(alias="cpuPercent", ge=0)]
+    memory_bytes: Annotated[int, Field(alias="memoryBytes", ge=0)]
+    tasks: Annotated[int, Field(ge=0)]
+
+
 class TurnStatus(Enum):
     completed = "completed"
     interrupted = "interrupted"
@@ -7280,6 +7290,7 @@ class BoundedTurnHostRestrictions(BaseModel):
         ),
     ]
     permissions: str
+    process_limits: Annotated[TurnProcessLimits | None, Field(alias="processLimits")] = None
     tools: list[ToolName]
 
 

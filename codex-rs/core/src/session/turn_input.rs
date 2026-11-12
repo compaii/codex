@@ -111,6 +111,21 @@ impl PreparedTurnInputSettings {
         thread_settings: impl Into<WithTurnExtensionData<ThreadSettingsOverrides>>,
         start_options: TurnStartOptions,
     ) -> CodexResult<Self> {
+        if let Some(limits) = &start_options.process_limits
+            && (!cfg!(target_os = "linux")
+                || !(1..=1024 * 1024 * 1024).contains(&limits.memory_bytes)
+                || !(1..=100).contains(&limits.cpu_percent)
+                || !(1..=128).contains(&limits.tasks)
+                || start_options.inference_allowance.is_none()
+                || start_options.code_mode_limits.is_none()
+                || start_options.tool_ceiling.is_none()
+                || start_options.permission_ceiling.is_none()
+                || start_options.command_environment_policy.is_none())
+        {
+            return Err(CodexErr::InvalidRequest(
+                "process limits require qualified Linux, positive bounded limits and a complete reserved host selection".into(),
+            ));
+        }
         if let Some(limits) = &start_options.code_mode_limits
             && (limits.max_heap_size_bytes == 0
                 || usize::try_from(limits.max_heap_size_bytes).is_err()
@@ -214,6 +229,7 @@ impl PreparedTurnInputSettings {
         kind: TurnStartKind,
     ) -> CodexResult<Option<Arc<TurnContext>>> {
         let TurnStartOptions {
+            process_limits,
             code_mode_limits,
             command_environment_policy,
             permission_ceiling,
@@ -238,6 +254,7 @@ impl PreparedTurnInputSettings {
         updates.service_tier_for_turn = service_tier;
 
         let options = NewTurnContextOptions {
+            process_limits,
             code_mode_limits,
             command_environment_policy,
             permission_ceiling,
@@ -367,7 +384,8 @@ pub(super) async fn handle(
         .values()
         .try_for_each(AdditionalContextEntry::validate)
         .map_err(|message| CodexErr::InvalidRequest(message.to_owned()))?;
-    if (request.request.start.code_mode_limits.is_some()
+    if (request.request.start.process_limits.is_some()
+        || request.request.start.code_mode_limits.is_some()
         || request.request.start.tool_ceiling.is_some()
         || request.request.start.permission_ceiling.is_some()
         || request.request.start.command_environment_policy.is_some())

@@ -134,7 +134,9 @@ impl CodeModeService {
             let environment = step
                 .environments
                 .turn_environments()
-                .find(|environment| !environment.environment.is_remote())
+                .find(|environment| {
+                    !environment.environment.is_remote() || environment.environment.is_owned_local()
+                })
                 .ok_or_else(|| {
                     "process-isolated code mode has no qualified local environment".to_string()
                 })?;
@@ -156,10 +158,15 @@ impl CodeModeService {
         } else {
             None
         };
+        let owned = crate::turn_process::host_selection(turn)?;
+        let (host_environment, process_launcher) = match owned {
+            Some((environment, launcher)) => (Some(environment), Some(launcher)),
+            None => (host_environment, None),
+        };
         let host_options = codex_code_mode::CodeModeHostOptions {
             environment: host_environment,
             sandbox,
-            process_launcher: None,
+            process_launcher,
         };
         state.session.get_or_try_init(|| async {
             let inner = tokio::select! {
