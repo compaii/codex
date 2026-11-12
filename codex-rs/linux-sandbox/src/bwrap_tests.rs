@@ -1268,7 +1268,7 @@ fn system_aliases_require_explicit_name_and_a_read_only_shared_target() {
         assert!(has_alias(&args));
         let existing_child = std::fs::read_dir(&physical)
             .expect("system target directory")
-            .filter_map(|entry| entry.ok())
+            .filter_map(std::result::Result::ok)
             .map(|entry| entry.path())
             .find(|path| path.is_file())
             .expect("existing target descendant");
