@@ -18,16 +18,25 @@ use std::time::Duration;
 #[test]
 #[ignore = "requires the standalone executor/V8 binaries and an explicitly selected own user manager"]
 fn bounded_turn_shares_actual_executors_and_closes_retained_steps() -> anyhow::Result<()> {
-    bounded_turn_executor_journey(false)
+    bounded_turn_executor_journey(false, false)
 }
 
 #[test]
 #[ignore = "requires the standalone executor/V8 binaries and an explicitly selected own user manager"]
 fn bounded_turn_bootstraps_packaged_executor_under_denied_native_home() -> anyhow::Result<()> {
-    bounded_turn_executor_journey(true)
+    bounded_turn_executor_journey(true, false)
 }
 
-fn bounded_turn_executor_journey(runtime_under_private_home: bool) -> anyhow::Result<()> {
+#[test]
+#[ignore = "requires the standalone executor/V8 binaries, system bwrap and an explicitly selected own user manager"]
+fn bounded_turn_bootstraps_denied_runtime_with_legacy_bwrap_mounts() -> anyhow::Result<()> {
+    bounded_turn_executor_journey(true, true)
+}
+
+fn bounded_turn_executor_journey(
+    runtime_under_private_home: bool,
+    legacy_bwrap: bool,
+) -> anyhow::Result<()> {
     core_test_support::test_codex::run_test_with_large_stack("owned-turn", move || async move {
         let binary = std::fs::canonicalize(std::env::var("CODEX_TEST_EXEC_SERVER_BIN")?)?;
         let native_home = tempfile::tempdir()?;
@@ -61,6 +70,24 @@ fn bounded_turn_executor_journey(runtime_under_private_home: bool) -> anyhow::Re
         let recorder = CodeModeHostRecorder::new()?;
         let program = recorder.program();
         let workspace = program.parent().context("recorder workspace")?;
+        let path = if legacy_bwrap {
+            use std::os::unix::fs::PermissionsExt;
+            let wrapper = workspace.join("bwrap");
+            let marker = workspace.join("legacy-bwrap-used");
+            let actual_bwrap = std::fs::canonicalize("/usr/bin/bwrap")?;
+            std::fs::write(
+                &wrapper,
+                format!(
+                    "#!/usr/bin/python3\nimport os,sys\nif '--help' in sys.argv:\n print('--perms')\nelse:\n open({marker:?}, 'a').write('used\\n')\n os.execv({actual_bwrap:?}, [{actual_bwrap:?}] + sys.argv[1:])\n",
+                    marker = marker.to_string_lossy(),
+                    actual_bwrap = actual_bwrap.to_string_lossy(),
+                ),
+            )?;
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
+            format!("{}:/usr/bin:/bin", workspace.display())
+        } else {
+            "/usr/bin:/bin".to_string()
+        };
         let (session, _, _events) =
             crate::session::tests::make_session_and_context_with_auth_config_home_and_rx(
                 codex_login::CodexAuth::from_api_key("Test API Key"),
@@ -132,7 +159,7 @@ fn bounded_turn_executor_journey(runtime_under_private_home: bool) -> anyhow::Re
                     command_environment_policy: Some(ShellEnvironmentPolicy {
                         inherit: ShellEnvironmentPolicyInherit::None,
                         r#set: HashMap::from([
-                            ("PATH".into(), "/usr/bin:/bin".into()),
+                            ("PATH".into(), path.clone()),
                             (
                                 "CODEX_TEST_CODE_MODE_RECORDER".into(),
                                 workspace.to_string_lossy().into_owned(),
@@ -364,6 +391,9 @@ time.sleep(120)
         assert!(!cgroup.exists());
         assert!(backend.start(parameters("after-finish")).await.is_err());
         assert_eq!(std::fs::read_to_string(workspace.join("effect"))?, "once\n");
+        if legacy_bwrap {
+            assert!(std::fs::read_to_string(workspace.join("legacy-bwrap-used"))?.contains("used"));
+        }
         let (ordinary, _) = session
             .new_turn_with_sub_id(
                 "ordinary-after-process-owner".into(),
