@@ -59,6 +59,15 @@ override was provided:
 - Windows targets: `codex-command-runner` and `codex-windows-sandbox-setup`,
   unless the corresponding prebuilt helper flags are provided
 
+When reusing an existing host build in `codex-rs/target/dev-small`, pass all
+three prebuilt executable overrides and the qualified platform resources. This
+makes assembly a copy/validation operation. The builder's `--target` also selects
+Cargo's target-qualified output namespace when any source build is needed; a
+host build made without Cargo's `--target` lives in a different namespace. Merely
+choosing the same profile does not reuse those host outputs. Build missing host
+binaries from `codex-rs` in one bounded Cargo invocation, then assemble from those
+exact artifacts instead of creating another dependency working set.
+
 The default cargo profile is `dev-small` because local iteration should favor
 fast, small builds. Release jobs should pass `--cargo-profile release` and an
 explicit target. Release jobs that already built and signed/notarized the
