@@ -18,24 +18,38 @@ use std::time::Duration;
 #[test]
 #[ignore = "requires the standalone executor/V8 binaries and an explicitly selected own user manager"]
 fn bounded_turn_shares_actual_executors_and_closes_retained_steps() -> anyhow::Result<()> {
-    bounded_turn_executor_journey(false, false)
+    bounded_turn_executor_journey(false, false, false)
 }
 
 #[test]
 #[ignore = "requires the standalone executor/V8 binaries and an explicitly selected own user manager"]
 fn bounded_turn_bootstraps_packaged_executor_under_denied_native_home() -> anyhow::Result<()> {
-    bounded_turn_executor_journey(true, false)
+    bounded_turn_executor_journey(true, false, false)
 }
 
 #[test]
 #[ignore = "requires the standalone executor/V8 binaries, system bwrap, cc and an explicitly selected own user manager"]
 fn bounded_turn_bootstraps_denied_runtime_with_legacy_bwrap_mounts() -> anyhow::Result<()> {
-    bounded_turn_executor_journey(true, true)
+    bounded_turn_executor_journey(true, true, false)
+}
+
+#[test]
+#[ignore = "requires an operator-owned bounded filesystem, executor/V8 binaries and own user manager"]
+fn bounded_turn_reuses_verified_storage_for_raw_v8_and_private_temporary_files()
+-> anyhow::Result<()> {
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter("codex_core::code_mode_host=debug")
+        .with_test_writer()
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)?;
+    bounded_turn_executor_journey(false, false, true)
 }
 
 fn bounded_turn_executor_journey(
     runtime_under_private_home: bool,
     legacy_bwrap: bool,
+    bounded_storage: bool,
 ) -> anyhow::Result<()> {
     core_test_support::test_codex::run_test_with_large_stack("owned-turn", move || async move {
         let binary = std::fs::canonicalize(std::env::var("CODEX_TEST_EXEC_SERVER_BIN")?)?;
@@ -46,15 +60,22 @@ fn bounded_turn_executor_journey(
             tempfile::tempdir()?
         };
         let runner = std::env::current_exe()?;
+        let host_binary = codex_utils_cargo_bin::cargo_bin("codex-code-mode-host")?;
         anyhow::ensure!(
-            std::fs::metadata(&runner)?.len() + std::fs::metadata(&binary)?.len()
+            std::fs::metadata(&runner)?.len()
+                + std::fs::metadata(&binary)?.len()
+                + std::fs::metadata(&host_binary)?.len()
                 <= 768 * 1024 * 1024,
             "test runtime package exceeds temporary copy bound"
         );
         // Both layouts use one real package, not symlinks to unrelated binaries.
         // Same-filesystem hard links cost no executable copy. EXDEV copies live
         // only for this fixture and are bounded together above.
-        for (source, name) in [(&binary, "codex-exec-server"), (&runner, "codex")] {
+        for (source, name) in [
+            (&binary, "codex-exec-server"),
+            (&runner, "codex"),
+            (&host_binary, "codex-code-mode-host"),
+        ] {
             let destination = package.path().join(name);
             if let Err(error) = std::fs::hard_link(source, &destination) {
                 if error.raw_os_error() != Some(libc::EXDEV) {
@@ -67,9 +88,35 @@ fn bounded_turn_executor_journey(
         std::fs::write(&credential, "test-only-provider-secret")?;
         let native_alias = native_home.path().join("codex-linux-sandbox");
         std::os::unix::fs::symlink(package.path().join("codex"), &native_alias)?;
-        let recorder = CodeModeHostRecorder::new()?;
-        let program = recorder.program();
-        let workspace = program.parent().context("recorder workspace")?;
+        let storage_root = bounded_storage
+            .then(|| {
+                std::env::var_os("CODEX_TEST_STORAGE_ROOT")
+                    .map(std::path::PathBuf::from)
+                    .context("explicit bounded storage root")
+            })
+            .transpose()?;
+        let recorder = (!bounded_storage)
+            .then(CodeModeHostRecorder::new)
+            .transpose()?;
+        let program = package.path().join("codex-code-mode-host");
+        if let Some(recorder) = &recorder {
+            // Keep the credential/IPC probe, but install its executable at the
+            // trusted literal package sibling required by the native bootstrap.
+            // Unlink first: the existing host is a hard link to the build cache.
+            std::fs::remove_file(&program)?;
+            std::fs::copy(recorder.program(), &program)?;
+        }
+        let recorder_workspace = recorder.as_ref().map(|recorder| {
+            recorder
+                .program()
+                .parent()
+                .expect("recorder workspace")
+                .to_path_buf()
+        });
+        let workspace = storage_root
+            .as_deref()
+            .or(recorder_workspace.as_deref())
+            .expect("selected test workspace");
         let path = if legacy_bwrap {
             // Pre-sandbox executable discovery correctly rejects actor-writable
             // PATH entries. Keep this host-owned test wrapper in the denied
@@ -164,10 +211,12 @@ int main(int argc, char **argv) {{
                 FileSystemAccessMode::Read,
             ));
         }
-        filesystem.entries.push(FileSystemSandboxEntry::new(
-            AbsolutePathBuf::from_absolute_path("/tmp")?.into(),
-            FileSystemAccessMode::Write,
-        ));
+        if !bounded_storage {
+            filesystem.entries.push(FileSystemSandboxEntry::new(
+                AbsolutePathBuf::from_absolute_path("/tmp")?.into(),
+                FileSystemAccessMode::Write,
+            ));
+        }
         filesystem.entries.push(FileSystemSandboxEntry::new(
             AbsolutePathBuf::from_absolute_path(workspace)?.into(),
             FileSystemAccessMode::Write,
@@ -185,6 +234,13 @@ int main(int argc, char **argv) {{
                         memory_bytes: 512 * 1024 * 1024,
                         cpu_percent: 50,
                         tasks: 128,
+                        writable_storage: storage_root.as_ref().map(|root| {
+                            codex_protocol::turn_input::TurnWritableStorageLimits {
+                                root: AbsolutePathBuf::from_absolute_path(root)
+                                    .expect("absolute storage root"),
+                                max_bytes: 32 * 1024 * 1024,
+                            }
+                        }),
                     }),
                     code_mode_limits: Some(TurnCodeModeLimits {
                         max_heap_size_bytes: 32 * 1024 * 1024,
@@ -232,6 +288,9 @@ int main(int argc, char **argv) {{
             .context("private home")?
             .to_abs_path()?;
         assert!(home.as_path().exists());
+        if let Some(root) = &storage_root {
+            assert!(home.as_path().starts_with(root));
+        }
         let environment = turn
             .command_environment_policy()
             .context("owned environment")?;
@@ -381,11 +440,70 @@ time.sleep(120)
             .clone()
             .context("owner result")?
             .map_err(anyhow::Error::msg)?;
-        let membership = std::fs::read_to_string(format!("/proc/{}/cgroup", recorder.pid()?))?;
-        anyhow::ensure!(
-            membership.trim().ends_with(owner.group.identity().0),
-            "V8 used a different aggregate"
-        );
+        if let Some(recorder) = &recorder {
+            let membership = std::fs::read_to_string(format!("/proc/{}/cgroup", recorder.pid()?))?;
+            anyhow::ensure!(
+                membership.trim().ends_with(owner.group.identity().0),
+                "V8 used a different aggregate"
+            );
+        }
+        if bounded_storage {
+            let mut quota = parameters("storage-limit");
+            quota.argv = vec![
+                "/usr/bin/python3".into(),
+                "-c".into(),
+                r#"
+import os, errno
+assert os.environ['TMPDIR'] == os.environ['HOME']
+assert os.environ['HOME'].startswith(os.getcwd() + '/')
+try: open('/tmp/unbounded-write', 'wb')
+except OSError: pass
+else: raise AssertionError('unbounded temporary write allowed')
+count = 0
+try:
+    for name in ('storage-first', 'storage-second'):
+        with open(name, 'wb', buffering=0) as f:
+            for _ in range(20): count += f.write(b'x' * (1024 * 1024))
+            os.fsync(f.fileno())
+except OSError as error:
+    assert error.errno == errno.ENOSPC, error
+else: raise AssertionError('aggregate filesystem ceiling bypassed')
+assert 20 * 1024 * 1024 <= count < 40 * 1024 * 1024
+print('aggregate-storage-ceiling', flush=True)
+"#
+                .into(),
+            ];
+            let process = backend.start(quota).await?;
+            let mut quota_events = process.process.subscribe_events();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                let mut text = Vec::new();
+                let mut successful_exit = false;
+                loop {
+                    match quota_events.recv().await? {
+                        ExecProcessEvent::Output(output) => {
+                            text.extend_from_slice(&output.chunk.0);
+                            anyhow::ensure!(
+                                text.len() <= 4096,
+                                "storage fixture output exceeded bound"
+                            );
+                        }
+                        ExecProcessEvent::Exited { exit_code, .. } => {
+                            anyhow::ensure!(exit_code == 0, "storage fixture failed: {text:?}");
+                            successful_exit = true;
+                        }
+                        ExecProcessEvent::Closed { .. } => break,
+                        event => anyhow::bail!("storage fixture transport failed: {event:?}"),
+                    }
+                }
+                anyhow::ensure!(
+                    successful_exit
+                        && String::from_utf8_lossy(&text).contains("aggregate-storage-ceiling"),
+                    "storage fixture did not finish with its actual result"
+                );
+                anyhow::Ok(())
+            })
+            .await??;
+        }
         let shown = tokio::process::Command::new("/usr/bin/systemctl")
             .args([
                 "--user",
@@ -405,6 +523,12 @@ time.sleep(120)
         let mut commands = Vec::new();
         for pid in std::fs::read_to_string(cgroup.join("cgroup.procs"))?.split_whitespace() {
             commands.push(std::fs::read_to_string(format!("/proc/{pid}/comm"))?);
+        }
+        if bounded_storage {
+            anyhow::ensure!(
+                commands.iter().any(|s| s.contains("codex-code-mode")),
+                "V8 outside the storage-bound process owner"
+            );
         }
         anyhow::ensure!(
             commands.iter().any(|s| s.contains("codex-exec-serv"))

@@ -830,6 +830,19 @@ idle-only admission are required; this is neither a model tool nor a new resourc
 grant. Values must be positive within the existing own-work maxima of 1 GiB,
 100% of one CPU and 128 tasks. Omission preserves earlier bounded/ordinary routes.
 
+An optional `processLimits.writableStorage` selects an existing operator-provisioned
+filesystem with `root` and `maxBytes` (positive, at most 16GiB). This is a physical
+allocated-space ceiling, not a free-space check or permission grant. Core requires
+an unambiguous dedicated mount, protected root-owned ancestors, capacity no larger
+than the selection and no nested mounts. Every effective writable grant must be
+that stable mount root; narrower mutable directory/symlink anchors and writes to
+other filesystems refuse. Read-only paths outside it remain governed by the
+existing permissions. The private actor HOME and TMPDIR are created inside the
+same filesystem. Raw/V8 dispatch revalidates its identity and ceiling. The operator
+owns allocation, retained work and eventual retirement; Core never mounts, formats,
+resizes or deletes the persistent workspace. Omission preserves the earlier route
+without claiming a storage ceiling. This does not select billing/account authority.
+
 The admitted turn captures one private local execution snapshot. Its actual
 stdio executor comes from `codex-exec-server` beside the trusted native executable;
 V8 uses the same process owner. Both receive an explicit environment, a private
@@ -841,10 +854,10 @@ allocation or falling back; completion, cancellation and the same deadline close
 the aggregate despite retained step/client references. Temporary-home cleanup and
 actual group closure have one retained local result.
 
-The receiving launcher must support bubblewrap's `--argv0`: helper re-entry uses
-its protected alias without exposing that path to actor writes. Older launchers
-whose fallback executes the hidden helper pathname are not qualified for this
-profile. Explicit logical runtime roots such as `/bin` and `/lib64` must remain
+The receiving launcher must support bubblewrap's `--argv0` or the qualified
+inherited-FD mount verification fallback. Helper re-entry uses its protected alias
+without exposing that path to actor writes; executing the hidden helper pathname
+is not a fallback for this profile. Explicit logical runtime roots such as `/bin` and `/lib64` must remain
 readable through permission intersection; their shared read-only target preserves
 descendant denials in both views.
 

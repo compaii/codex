@@ -8,6 +8,7 @@ use crate::protocol::NonSteerableTurnKind;
 use crate::protocol::ThreadSettingsOverrides;
 use crate::protocol::W3cTraceContext;
 use crate::user_input::UserInput;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
@@ -244,6 +245,18 @@ pub struct TurnProcessLimits {
     pub memory_bytes: u64,
     pub cpu_percent: u32,
     pub tasks: u32,
+    /// Optional pre-provisioned bounded filesystem; this selection grants no access.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub writable_storage: Option<TurnWritableStorageLimits>,
+}
+
+/// An operator-owned filesystem, not a directory size estimate or mount command.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TurnWritableStorageLimits {
+    pub root: AbsolutePathBuf,
+    pub max_bytes: u64,
 }
 
 /// Options for the new-turn branch of a submission.

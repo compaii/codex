@@ -14,6 +14,8 @@ mod violation;
 mod windows;
 #[cfg(windows)]
 mod windows_mxc;
+#[cfg(target_os = "linux")]
+mod writable_storage;
 
 #[cfg(target_os = "linux")]
 pub use bwrap::find_executable_in_search_paths;
@@ -61,6 +63,12 @@ pub use windows::resolve_windows_elevated_filesystem_overrides;
 pub use windows::resolve_windows_restricted_token_filesystem_overrides;
 pub use windows::unsupported_windows_restricted_token_sandbox_reason;
 pub use windows::windows_sandbox_uses_elevated_backend;
+#[cfg(target_os = "linux")]
+pub use writable_storage::ValidatedWritableStorage;
+#[cfg(target_os = "linux")]
+pub use writable_storage::decode_mountinfo_path;
+#[cfg(target_os = "linux")]
+pub use writable_storage::validate_writable_storage;
 
 use codex_protocol::error::CodexErr;
 

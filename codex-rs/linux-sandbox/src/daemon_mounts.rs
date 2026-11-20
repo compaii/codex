@@ -10,7 +10,6 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -228,27 +227,7 @@ fn check_mounts(
 }
 
 fn mount_path(encoded: &[u8]) -> io::Result<PathBuf> {
-    let mut decoded = Vec::new();
-    let mut bytes = encoded.iter().copied();
-    while let Some(byte) = bytes.next() {
-        decoded.push(if byte == b'\\' {
-            let digits: Vec<_> = bytes.by_ref().take(3).collect();
-            match digits.as_slice() {
-                b"040" => b' ',
-                b"011" => b'\t',
-                b"012" => b'\n',
-                b"134" => b'\\',
-                _ => return Err(io::Error::other("invalid mountinfo path escape")),
-            }
-        } else {
-            byte
-        });
-    }
-    let path = PathBuf::from(std::ffi::OsString::from_vec(decoded));
-    if !path.is_absolute() {
-        return Err(io::Error::other("mountinfo path is not absolute"));
-    }
-    Ok(path)
+    codex_sandboxing::decode_mountinfo_path(encoded)
 }
 
 #[cfg(test)]
