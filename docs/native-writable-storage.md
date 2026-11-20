@@ -12,10 +12,15 @@ refuses inaccessible parents instead of opening them. Root-only images/records
 are separate from the actor-owned workspace. Each named image is 32MiB–16GiB,
 reserved with `fallocate`; `nodiscard` retains that reservation during formatting.
 
+For regular administrative use, install the qualified script in the existing
+root-owned software location and retain its source/hash in the receiving binding.
+Invoke that protected copy with Python's isolated mode; an actor-writable checkout
+is not the installed operator. `OPERATOR_SCRIPT` below denotes that binding.
+
 One command prepares or restores that exact selection:
 
 ```sh
-sudo python3 -B scripts/native_writable_storage.py prepare \
+sudo python3 -I -B OPERATOR_SCRIPT prepare \
   --base /srv/operator-workspaces --name reports --uid ACTOR_UID \
   --bytes 33554432 --reserve-bytes HOST_RESERVE_BYTES
 ```
@@ -41,10 +46,10 @@ an enabled unit alone does not prove that a host reboot succeeded.
 Inspect or stop the same selection with the same arguments:
 
 ```sh
-sudo python3 -B scripts/native_writable_storage.py status \
+sudo python3 -I -B OPERATOR_SCRIPT status \
   --base /srv/operator-workspaces --name reports --uid ACTOR_UID \
   --bytes 33554432 --reserve-bytes HOST_RESERVE_BYTES
-sudo python3 -B scripts/native_writable_storage.py deactivate \
+sudo python3 -I -B OPERATOR_SCRIPT deactivate \
   --base /srv/operator-workspaces --name reports --uid ACTOR_UID \
   --bytes 33554432 --reserve-bytes HOST_RESERVE_BYTES
 ```
