@@ -180,8 +180,17 @@ async fn run(
     let id = started.cell_id.clone();
     let response = tokio::time::timeout(Duration::from_secs(5), async {
         let mut response = started.initial_response().await?;
+        let mut output = Vec::new();
         while matches!(response, RuntimeResponse::Yielded { .. }) && !source.contains("setTimeout")
         {
+            // A yielded reply drains its output. Preserve that output while
+            // waiting for completion instead of asserting only the final chunk.
+            if let RuntimeResponse::Yielded { content_items, .. } = &mut response {
+                output.append(content_items);
+                if output.len() > 64 {
+                    return Err("fixture yielded output exceeds64items".to_owned());
+                }
+            }
             response = service
                 .wait(
                     codex_code_mode::WaitRequest {
@@ -195,6 +204,16 @@ async fn run(
                 .await?
                 .into();
         }
+        let content_items = match &mut response {
+            RuntimeResponse::Yielded { content_items, .. }
+            | RuntimeResponse::Terminated { content_items, .. }
+            | RuntimeResponse::Result { content_items, .. } => content_items,
+        };
+        output.append(content_items);
+        if output.len() > 64 {
+            return Err("fixture output exceeds64items".to_owned());
+        }
+        *content_items = output;
         Ok::<_, String>(response)
     })
     .await?
@@ -241,8 +260,12 @@ fn bounded_code_mode_native_sessions_isolate_heap_names_state_and_lifetime() -> 
             &CodeModeConfig::default(),
             Default::default(),
         );
-        let (_, response) =
-            run(&service, &human, "store('human',42); text(load('human'));").await?;
+        let (_, response) = run(
+            &service,
+            &human,
+            "store('human',42); text(load('human')); yield_control();",
+        )
+        .await?;
         assert_eq!(result_text(&response), "42");
         let ambient_key = ["HOME", "USER", "LANG"]
             .into_iter()
