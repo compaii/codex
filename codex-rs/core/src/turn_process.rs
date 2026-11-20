@@ -52,6 +52,7 @@ struct Owner {
     host_environment: HashMap<String, String>,
     command_policy: Arc<codex_protocol::config_types::ShellEnvironmentPolicy>,
     cleanup: tokio::sync::watch::Receiver<Option<std::result::Result<(), String>>>,
+    storage: Option<codex_sandboxing::ValidatedWritableStorage>,
 }
 
 /// Freeze one restricted snapshot before tool discovery or sampling. Initialization
@@ -150,6 +151,9 @@ pub(crate) fn host_selection(
         if owner.cleanup.borrow().is_some() {
             return Err("owned process resources have closed".into());
         }
+        if let Some(storage) = &owner.storage {
+            storage.revalidate().map_err(|error| error.to_string())?;
+        }
         Ok(Some((owner.host_environment.clone(), owner.group.clone())))
     }
 }
@@ -187,6 +191,11 @@ pub(crate) fn enforce_environment(
             .and_then(|receiver| receiver.borrow().clone())
             .ok_or_else(|| CodexErr::InvalidRequest("owned executor is not ready".into()))?
             .map_err(CodexErr::InvalidRequest)?;
+        if let Some(storage) = &owner.storage {
+            storage
+                .revalidate()
+                .map_err(|error| CodexErr::InvalidRequest(error.to_string()))?;
+        }
         let selected = owner
             .environments
             .turn_environments()
@@ -277,6 +286,30 @@ async fn create_owner(
         .to_abs_path()
         .map_err(|e| e.to_string())?
         .to_path_buf();
+    let storage = limits
+        .writable_storage
+        .as_ref()
+        .map(|storage| {
+            codex_sandboxing::validate_writable_storage(storage.root.as_path(), storage.max_bytes)
+        })
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    if let Some(storage) = &storage {
+        for selected in snapshot.turn_environments() {
+            let selected_cwd = selected
+                .cwd()
+                .to_abs_path()
+                .map_err(|error| error.to_string())?;
+            let filesystem = selected.permission_profile().file_system_sandbox_policy();
+            for writable in filesystem
+                .get_writable_roots_with_cwd_preserving_mutable_paths(selected_cwd.as_path())
+            {
+                storage
+                    .check_writable_root(writable.root.as_path())
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+    }
     // The complete native package owns this sibling. Never PATH-search, use a
     // human-configured remote executor, or substitute an unowned command.
     let binary = config
@@ -287,10 +320,13 @@ async fn create_owner(
         .join("codex-exec-server");
     let binary =
         std::fs::canonicalize(binary).map_err(|e| format!("owned executor unavailable: {e}"))?;
-    let home = tempfile::Builder::new()
-        .prefix("codex-owned-exec-")
-        .tempdir()
-        .map_err(|e| e.to_string())?;
+    let mut home_builder = tempfile::Builder::new();
+    home_builder.prefix("codex-owned-exec-");
+    let home = match &storage {
+        Some(storage) => home_builder.tempdir_in(&storage.root),
+        None => home_builder.tempdir(),
+    }
+    .map_err(|error| error.to_string())?;
     let home_uri = PathUri::from_host_native_path(home.path()).map_err(|e| e.to_string())?;
     // The executor creates trusted arg0 helpers beneath CODEX_HOME. Keep that
     // control state under the native home's immutable denial, even when the
@@ -301,6 +337,9 @@ async fn create_owner(
         .map_err(|error| error.to_string())?;
     let mut environment = crate::exec_env::create_env(&policy, None);
     environment.insert("HOME".into(), home.path().to_string_lossy().into_owned());
+    if storage.is_some() {
+        environment.insert("TMPDIR".into(), home.path().to_string_lossy().into_owned());
+    }
     environment.insert(
         "CODEX_HOME".into(),
         control_home.path().to_string_lossy().into_owned(),
@@ -358,6 +397,7 @@ async fn create_owner(
         host_environment: environment,
         command_policy,
         cleanup: cleanup_result,
+        storage,
     });
     // This finite cleanup survives observers and retained step/session references.
     // The kernel deadline also bounds loss of the interpreting runtime.

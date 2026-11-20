@@ -14,7 +14,9 @@ use core_test_support::code_mode_host::CodeModeHostRecorder;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
-async fn sandbox_session() -> (
+async fn sandbox_session(
+    runtime: Option<std::path::PathBuf>,
+) -> (
     Arc<Session>,
     Arc<TurnContext>,
     async_channel::Receiver<codex_protocol::protocol::Event>,
@@ -23,7 +25,8 @@ async fn sandbox_session() -> (
         codex_login::CodexAuth::from_api_key("Test API Key"),
         vec![],
         |config| {
-            let executable = std::env::current_exe().expect("test executable");
+            let executable =
+                runtime.unwrap_or_else(|| std::env::current_exe().expect("test executable"));
             config.codex_self_exe = Some(executable.clone());
             config.codex_linux_sandbox_exe = Some(executable);
             config
@@ -37,7 +40,7 @@ async fn sandbox_session() -> (
 
 #[tokio::test]
 async fn start_only_code_mode_limits_do_not_change_thread_extension_data() -> anyhow::Result<()> {
-    let (session, _, _events) = sandbox_session().await;
+    let (session, _, _events) = sandbox_session(None).await;
     let (bounded, _) = session
         .new_turn_with_sub_id(
             "transient-code-mode".into(),
@@ -177,8 +180,17 @@ async fn run(
     let id = started.cell_id.clone();
     let response = tokio::time::timeout(Duration::from_secs(5), async {
         let mut response = started.initial_response().await?;
+        let mut output = Vec::new();
         while matches!(response, RuntimeResponse::Yielded { .. }) && !source.contains("setTimeout")
         {
+            // A yielded reply drains its output. Preserve that output while
+            // waiting for completion instead of asserting only the final chunk.
+            if let RuntimeResponse::Yielded { content_items, .. } = &mut response {
+                output.append(content_items);
+                if output.len() > 64 {
+                    return Err("fixture yielded output exceeds64items".to_owned());
+                }
+            }
             response = service
                 .wait(
                     codex_code_mode::WaitRequest {
@@ -192,6 +204,16 @@ async fn run(
                 .await?
                 .into();
         }
+        let content_items = match &mut response {
+            RuntimeResponse::Yielded { content_items, .. }
+            | RuntimeResponse::Terminated { content_items, .. }
+            | RuntimeResponse::Result { content_items, .. } => content_items,
+        };
+        output.append(content_items);
+        if output.len() > 64 {
+            return Err("fixture output exceeds64items".to_owned());
+        }
+        *content_items = output;
         Ok::<_, String>(response)
     })
     .await?
@@ -226,19 +248,24 @@ fn bounded_code_mode_native_sessions_isolate_heap_names_state_and_lifetime() -> 
         recorder.enable_inheritable_descriptor_probe().await?;
         let recorder_program = recorder.program();
         let recording_directory = recorder_program.parent().expect("recording directory");
-        let (session, human, _events) = sandbox_session().await;
+        let package = recorder.native_runtime_package()?;
+        let (session, human, _events) = sandbox_session(Some(package.path().join("codex"))).await;
         let service = CodeModeService::new(
             session.thread_id,
             Arc::new(
                 crate::code_mode_host::ProcessOwnedGrpcCodeModeSessionProvider::with_host_program(
-                    recorder.program(),
+                    package.path().join("codex-code-mode-host"),
                 ),
             ),
             &CodeModeConfig::default(),
             Default::default(),
         );
-        let (_, response) =
-            run(&service, &human, "store('human',42); text(load('human'));").await?;
+        let (_, response) = run(
+            &service,
+            &human,
+            "store('human',42); text(load('human')); yield_control();",
+        )
+        .await?;
         assert_eq!(result_text(&response), "42");
         let ambient_key = ["HOME", "USER", "LANG"]
             .into_iter()
@@ -457,7 +484,7 @@ async fn bounded_code_mode_refuses_unqualified_provider_without_default_session_
             Box::pin(async { Err("legacy create must not be called".into()) })
         }
     }
-    let (session, _, _events) = sandbox_session().await;
+    let (session, _, _events) = sandbox_session(None).await;
     let called = Arc::new(AtomicBool::new(false));
     let service = CodeModeService::new(
         session.thread_id,

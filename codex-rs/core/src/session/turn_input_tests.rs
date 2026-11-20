@@ -1740,6 +1740,7 @@ async fn code_mode_limits_require_the_complete_bounded_host_selection() {
                 memory_bytes: 512 * 1024 * 1024,
                 cpu_percent: 50,
                 tasks: 128,
+                writable_storage: None,
             },
         ),
         code_mode_limits: Some(TurnCodeModeLimits {
@@ -1759,7 +1760,7 @@ async fn code_mode_limits_require_the_complete_bounded_host_selection() {
         }),
         ..Default::default()
     };
-    for mutation in 0..if cfg!(target_os = "linux") { 10 } else { 6 } {
+    for mutation in 0..if cfg!(target_os = "linux") { 12 } else { 6 } {
         let mut invalid = valid.clone();
         match mutation {
             0 => {
@@ -1777,6 +1778,17 @@ async fn code_mode_limits_require_the_complete_bounded_host_selection() {
             6 => invalid.process_limits.as_mut().unwrap().memory_bytes = 0,
             7 => invalid.process_limits.as_mut().unwrap().cpu_percent = 101,
             8 => invalid.process_limits.as_mut().unwrap().tasks = 129,
+            10 | 11 => {
+                invalid.process_limits.as_mut().unwrap().writable_storage =
+                    Some(codex_protocol::turn_input::TurnWritableStorageLimits {
+                        root: AbsolutePathBuf::from_absolute_path("/").unwrap(),
+                        max_bytes: if mutation == 10 {
+                            0
+                        } else {
+                            16 * 1024 * 1024 * 1024 + 1
+                        },
+                    })
+            }
             _ => invalid.code_mode_limits = None,
         }
         assert!(

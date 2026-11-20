@@ -25178,6 +25178,17 @@
           "format": "uint32",
           "minimum": 0.0,
           "type": "integer"
+        },
+        "writableStorage": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TurnWritableStorageLimits"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional pre-provisioned bounded filesystem; this selection grants no access."
         }
       },
       "required": [
@@ -25509,6 +25520,25 @@
       "required": [
         "name",
         "output"
+      ],
+      "type": "object"
+    },
+    "TurnWritableStorageLimits": {
+      "additionalProperties": false,
+      "description": "An operator-owned filesystem, not a directory size estimate or mount command.",
+      "properties": {
+        "maxBytes": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "root": {
+          "$ref": "#/definitions/AbsolutePathBuf"
+        }
+      },
+      "required": [
+        "maxBytes",
+        "root"
       ],
       "type": "object"
     },

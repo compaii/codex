@@ -622,3 +622,36 @@ even for that target and the regression reproduced a live child after drop.
 Ordinary pipe/PTY callers explicitly selecting reap-only retain that policy.
 Closing a shared resource owner also marks it closed before awaiting cleanup,
 so later launch references cannot admit fresh work during manager shutdown.
+
+### Operator-provisioned writable storage
+
+`hostRestrictions.processLimits.writableStorage` is an optional closed selection
+of an existing absolute `root` and positive `maxBytes` (at most 16GiB), not storage
+allocation authority. The existing own-work operator provisions a bounded
+filesystem first; a size estimate of an ordinary directory cannot satisfy it.
+No remount, loop device, quota command, automatic expansion or new daemon is
+initiated by Core.
+
+Before process allocation, Core checks the kernel's total filesystem capacity,
+its dedicated mount and protected root-owned ancestors. It rejects ambiguous or
+nested mounts. The already narrowed permission snapshot must expose writes only
+through that exact stable root; it cannot contain another writable filesystem or
+an attacker-mutable descendant/symlink anchor. Existing read-only carveouts and
+deny rules remain. Both private HOME and TMPDIR live inside the same budget, while
+the executor's trusted fixed control state stays under the denied native home.
+Raw execution and private V8 retain their shared owner and revalidate the selected
+storage identity before dispatch. This prevents an unavailable or replaced budget
+from silently reverting to ordinary temporary storage.
+
+The operator retains workspace outputs and owns their existing project retention;
+ending a turn removes only its private temporary HOME, not persistent work. A
+bounded workspace can be shared by that explicitly selected work profile; its
+ceiling is the whole filesystem, not a claim of exclusive capacity per process.
+Older selections without this field keep their behavior and remain unqualified
+for an aggregate writable-storage ceiling. Actual provider monetary settlement,
+account selection and other full-profile acceptance remain separate.
+
+The opt-in native storage journey uses an operator-owned 32MiB filesystem and the
+actual private raw/V8 executors. It checks private HOME/TMPDIR placement, denial
+of ordinary `/tmp`, aggregate ENOSPC across two files, useful V8 output, shared
+process ownership and deadline cleanup. No model or paid provider is involved.

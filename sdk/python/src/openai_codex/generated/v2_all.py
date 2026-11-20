@@ -6799,16 +6799,6 @@ class TurnPlanStepStatus(Enum):
     completed = "completed"
 
 
-class TurnProcessLimits(BaseModel):
-    model_config = ConfigDict(
-        extra="forbid",
-        populate_by_name=True,
-    )
-    cpu_percent: Annotated[int, Field(alias="cpuPercent", ge=0)]
-    memory_bytes: Annotated[int, Field(alias="memoryBytes", ge=0)]
-    tasks: Annotated[int, Field(ge=0)]
-
-
 class TurnStatus(Enum):
     completed = "completed"
     interrupted = "interrupted"
@@ -6821,6 +6811,15 @@ class TurnSteerResponse(BaseModel):
         populate_by_name=True,
     )
     turn_id: Annotated[str, Field(alias="turnId")]
+
+
+class TurnWritableStorageLimits(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+    )
+    max_bytes: Annotated[int, Field(alias="maxBytes", ge=0)]
+    root: AbsolutePathBuf
 
 
 class TextUserInput(BaseModel):
@@ -7275,23 +7274,6 @@ class AppsReadResponse(BaseModel):
     )
     apps: list[ConnectorMetadata]
     missing_app_ids: Annotated[list[str], Field(alias="missingAppIds")]
-
-
-class BoundedTurnHostRestrictions(BaseModel):
-    model_config = ConfigDict(
-        extra="forbid",
-        populate_by_name=True,
-    )
-    code_mode_limits: Annotated[TurnCodeModeLimits, Field(alias="codeModeLimits")]
-    environment: Annotated[
-        dict[str, str],
-        Field(
-            description="Explicit environment only: the server disables inheritance and profiles."
-        ),
-    ]
-    permissions: str
-    process_limits: Annotated[TurnProcessLimits | None, Field(alias="processLimits")] = None
-    tools: list[ToolName]
 
 
 class BrowserUseConfig(BaseModel):
@@ -11263,6 +11245,23 @@ class TurnPlanUpdatedNotification(BaseModel):
     turn_id: Annotated[str, Field(alias="turnId")]
 
 
+class TurnProcessLimits(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+    )
+    cpu_percent: Annotated[int, Field(alias="cpuPercent", ge=0)]
+    memory_bytes: Annotated[int, Field(alias="memoryBytes", ge=0)]
+    tasks: Annotated[int, Field(ge=0)]
+    writable_storage: Annotated[
+        TurnWritableStorageLimits | None,
+        Field(
+            alias="writableStorage",
+            description="Optional pre-provisioned bounded filesystem; this selection grants no access.",
+        ),
+    ] = None
+
+
 class TurnSteerParams(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -11389,6 +11388,23 @@ class AppsListResponse(BaseModel):
             description="Opaque cursor to pass to the next call to continue after the last item. If None, there are no more items to return.",
         ),
     ] = None
+
+
+class BoundedTurnHostRestrictions(BaseModel):
+    model_config = ConfigDict(
+        extra="forbid",
+        populate_by_name=True,
+    )
+    code_mode_limits: Annotated[TurnCodeModeLimits, Field(alias="codeModeLimits")]
+    environment: Annotated[
+        dict[str, str],
+        Field(
+            description="Explicit environment only: the server disables inheritance and profiles."
+        ),
+    ]
+    permissions: str
+    process_limits: Annotated[TurnProcessLimits | None, Field(alias="processLimits")] = None
+    tools: list[ToolName]
 
 
 class ThreadStartRequest(BaseModel):

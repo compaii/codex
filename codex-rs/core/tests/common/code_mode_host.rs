@@ -125,6 +125,29 @@ exec {quoted_host} "$@"
         })
     }
 
+    /// Keep the real probe at the literal package sibling required by sealed
+    /// runtime bootstrap. This changes fixture layout, never helper authority.
+    #[cfg(target_os = "linux")]
+    pub fn native_runtime_package(&self) -> Result<TempDir> {
+        let package = tempfile::Builder::new()
+            .prefix("native-package-")
+            .tempdir_in(self._directory.path())?;
+        let runner = std::env::current_exe()?;
+        anyhow::ensure!(
+            fs::metadata(&runner)?.len() + fs::metadata(&self.program)?.len() <= 768 * 1024 * 1024,
+            "fixture runtime package exceeds temporary copy bound"
+        );
+        let executable = package.path().join("codex");
+        if let Err(error) = fs::hard_link(&runner, &executable) {
+            if error.raw_os_error() != Some(libc::EXDEV) {
+                return Err(error.into());
+            }
+            fs::copy(runner, executable)?;
+        }
+        fs::copy(&self.program, package.path().join("codex-code-mode-host"))?;
+        Ok(package)
+    }
+
     /// Establish that the controlled file and socket are actually inheritable
     /// before the sandbox probe. No ambient descriptor or credential is read.
     #[cfg(target_os = "linux")]

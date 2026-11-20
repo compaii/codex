@@ -116,6 +116,9 @@ impl PreparedTurnInputSettings {
                 || !(1..=1024 * 1024 * 1024).contains(&limits.memory_bytes)
                 || !(1..=100).contains(&limits.cpu_percent)
                 || !(1..=128).contains(&limits.tasks)
+                || limits.writable_storage.as_ref().is_some_and(|storage| {
+                    storage.max_bytes == 0 || storage.max_bytes > 16 * 1024 * 1024 * 1024
+                })
                 || start_options.inference_allowance.is_none()
                 || start_options.code_mode_limits.is_none()
                 || start_options.tool_ceiling.is_none()
