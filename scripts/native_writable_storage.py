@@ -188,7 +188,8 @@ def operate(args):
                     os.posix_fallocate(stream.fileno(), 0, args.bytes)
                     os.fsync(stream.fileno())
             fs_uuid = run(['blkid', '-p', '-s', 'UUID', '-o', 'value', str(image)], optional=True)
-            if fs_uuid.returncode == 2 and record['phase'] == 'prepared':
+            if (fs_uuid.returncode == 2 and record['phase'] == 'prepared'
+                    and not unit_file.exists()):
                 format_fresh_image(image, record['filesystem_uuid'])
             elif fs_uuid.returncode != 0 or fs_uuid.stdout.strip() != record['filesystem_uuid']:
                 raise ValueError('existing filesystem identity differs; no formatting')

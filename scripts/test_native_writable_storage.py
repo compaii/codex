@@ -113,6 +113,34 @@ class OperatorChecks(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'different mounted'):
                 storage.mounted_image(self.base / 'work', self.base / 'own.ext4')
 
+    def test_registered_workspace_with_missing_signature_is_never_reformatted(self):
+        path = self.record()
+        record = json.loads(path.read_text())
+        record['phase'] = 'prepared'  # Interrupted publication cannot authorize erasure.
+        storage.write_record(path, record)
+        image = self.base / 'images/own-work.ext4'
+        fd = os.open(image, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'r+b') as stream:
+            os.posix_fallocate(stream.fileno(), 0, storage.MIN_BYTES)
+            stream.write(b'retained bytes')
+        units = self.base / 'units'
+        units.mkdir()
+        unit = units / 'own.mount'
+        unit.write_text(storage.definition(image, self.base / 'work/own-work'))
+        unit.chmod(0o644)
+        def selected_path(value):
+            return units if value == '/etc/systemd/system' else Path(value)
+        responses = [subprocess.CompletedProcess([], 0, 'own.mount\n'),
+                     subprocess.CompletedProcess([], 2, '')]
+        with patch.object(storage, 'Path', side_effect=selected_path), \
+                patch.object(storage, 'run', side_effect=responses), \
+                patch.object(storage, 'format_fresh_image') as formatter:
+            with self.assertRaisesRegex(ValueError, 'no formatting'):
+                storage.operate(self.args('prepare'))
+        formatter.assert_not_called()
+        with image.open('rb') as stream:
+            self.assertEqual(stream.read(14), b'retained bytes')
+
 
 if __name__ == '__main__':
     unittest.main()
