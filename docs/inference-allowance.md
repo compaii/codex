@@ -241,12 +241,13 @@ that same bounded start. Its immutable gate applies `max_output_tokens` before
 HTTP/WS compression, byte validation and sends, including retries and remote
 compaction v2's inherited Responses stream. Raw HTTP callers keep a tighter
 explicit ceiling; malformed ceilings refuse before a physical attempt. Typed
-request serialization preserves raw tool payloads. WebSocket byte admission adds
-the inserted-field delta to the complete logical request size, even when its
-wire packet carries only a continuation. Old bounded readers reject the new
-option; ordinary callers without it retain their prior behavior. An actual
-provider must still be qualified to honor the requested ceiling: a synthetically
-observed field does not prove real endpoint billing enforcement.
+request serialization preserves raw tool payloads. With the owner output ceiling
+selected, WebSocket sends the complete input instead of referring to a prior
+provider response and skips prompt-bearing prewarm. Byte admission includes the
+inserted output ceiling. Ordinary callers without that ceiling retain their
+continuations. Old bounded readers reject the explicit option. Real provider
+qualification must still establish how the route handles media, opaque input and
+the requested output ceiling, and how that usage is billed.
 
 The exact `cycleId`/`attemptId`/`recorded` reply acknowledges retained observation
 only. It grants no provider call and settles no money. Signing/verifying exact
