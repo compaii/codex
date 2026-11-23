@@ -21,6 +21,8 @@ pub enum InferenceAllowanceError {
     Attempts,
     #[error("complete model request exceeds native inference byte allowance")]
     InputBytes,
+    #[error("owner-bounded Responses request contains unqualified provider input")]
+    UnqualifiedProviderInput,
     #[error("native provider attempt reservation unavailable")]
     Reservation,
 }
@@ -262,6 +264,55 @@ impl InferenceAllowance {
 
     pub fn max_request_bytes(&self) -> usize {
         self.max_request_bytes
+    }
+
+    /// An owner-selected output ceiling activates the qualified Responses route.
+    /// Its byte bound applies to materialized text and tool representations.
+    /// Provider-resolved media and opaque state require separate qualification.
+    pub(crate) fn validate_owner_responses_input(
+        &self,
+        wire: &[u8],
+    ) -> Result<(), InferenceAllowanceError> {
+        use serde_json::Value;
+
+        fn requires_provider_resolution(value: &Value) -> bool {
+            match value {
+                Value::Array(items) => items.iter().any(requires_provider_resolution),
+                Value::Object(item) => {
+                    matches!(
+                        item.get("type").and_then(Value::as_str),
+                        Some(
+                            "input_image"
+                                | "input_audio"
+                                | "input_file"
+                                | "item_reference"
+                                | "encrypted_content"
+                        )
+                    ) || ["encrypted_content", "encrypted_function_args"]
+                        .iter()
+                        .any(|key| item.get(*key).is_some_and(|v| !v.is_null()))
+                        || ["content", "output"]
+                            .iter()
+                            .any(|key| item.get(*key).is_some_and(requires_provider_resolution))
+                }
+                _ => false,
+            }
+        }
+
+        if self.max_output_tokens().is_none() {
+            return Ok(());
+        }
+        self.validate_request(wire.len())?;
+        let value: Value = serde_json::from_slice(wire)
+            .map_err(|_| InferenceAllowanceError::UnqualifiedProviderInput)?;
+        if ["previous_response_id", "conversation"]
+            .iter()
+            .any(|key| value.get(*key).is_some_and(|v| !v.is_null()))
+            || value.get("input").is_some_and(requires_provider_resolution)
+        {
+            return Err(InferenceAllowanceError::UnqualifiedProviderInput);
+        }
+        Ok(())
     }
 
     /// Validate the complete logical request BEFORE compression or incremental

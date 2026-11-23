@@ -375,6 +375,11 @@ impl ResponsesWebsocketConnection {
                 .map_err(|error| ApiError::InvalidRequest {
                     message: error.to_string(),
                 })?;
+            allowance
+                .validate_owner_responses_input(request_text.as_bytes())
+                .map_err(|error| ApiError::InvalidRequest {
+                    message: error.to_string(),
+                })?;
         }
         let inference_allowance = allowance.map(|(allowance, _)| allowance);
 

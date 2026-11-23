@@ -158,6 +158,13 @@ impl<T: HttpTransport> ResponsesClient<T> {
         compression: Compression,
         turn_state: Option<Arc<OnceLock<String>>>,
     ) -> Result<ResponseStream, ApiError> {
+        if let Some(allowance) = self.session.inference_allowance() {
+            allowance
+                .validate_owner_responses_input(body.as_bytes())
+                .map_err(|error| ApiError::InvalidRequest {
+                    message: error.to_string(),
+                })?;
+        }
         let request_compression = match compression {
             Compression::None => RequestCompression::None,
             Compression::Zstd => RequestCompression::Zstd,

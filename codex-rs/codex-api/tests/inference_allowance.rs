@@ -993,12 +993,34 @@ async fn owner_output_bound_preserves_tighter_http_cap_and_rejects_invalid_befor
                 .is_err()
         );
     }
+    for fixture in [
+        json!({"model":"loopback","previous_response_id":"loopback-prior"}),
+        json!({"model":"loopback","input":[
+            {"role":"user","type":"message","content":[{"type":"input_file","file_id":"fixture"}]}
+        ]}),
+        json!({"model":"loopback","input":[
+            {"type":"function_call_output","call_id":"fixture","output":[
+                {"type":"input_image","file_id":"fixture"}
+            ]}
+        ]}),
+        json!({"model":"loopback","input":[{"type":"reasoning","encrypted_content":"fixture"}]}),
+    ] {
+        assert!(matches!(
+            client
+                .stream(fixture, HeaderMap::new(), Compression::None, None)
+                .await,
+            Err(ApiError::InvalidRequest { message })
+                if message.contains("unqualified provider input")
+        ));
+    }
     assert_eq!(allowance.attempted().unwrap(), 0);
     assert!(server.received_requests().await.unwrap().is_empty());
     assert!(
         client
             .stream(
-                json!({"model":"loopback","max_output_tokens":3}),
+                json!({"model":"loopback","max_output_tokens":3,"input":[
+                    {"type":"function_call_output","call_id":"fixture","output":"unchanged text"}
+                ]}),
                 HeaderMap::new(),
                 Compression::None,
                 None
@@ -1038,6 +1060,18 @@ async fn websocket_output_bound_counts_new_field_in_complete_request_and_real_wr
             .unwrap()
             .with_provider_attempt_gate(gate),
     );
+    let ResponsesWsRequest::ResponseCreate(base) = request();
+    let reference = ResponsesWsRequest::ResponseCreate(ResponseCreateWsRequest {
+        previous_response_id: Some("loopback-prior".into()),
+        ..base
+    });
+    assert!(matches!(
+        connection
+            .stream_request_with_allowance(reference, false, None, 400, allowance.clone())
+            .await,
+        Err(ApiError::InvalidRequest { message })
+            if message.contains("unqualified provider input")
+    ));
     assert!(
         connection
             .stream_request_with_allowance(request(), false, None, 512, allowance.clone())
