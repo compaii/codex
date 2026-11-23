@@ -381,6 +381,7 @@ struct WebsocketSession {
 // Continuation diagnostics use bounded labels, never request contents or identifiers.
 #[derive(Debug, PartialEq, Eq)]
 enum NonIncrementalReason {
+    OwnerBoundedOutput,
     NoPreviousRequest,
     NoPreviousResponse,
     NoPreviousResponseId,
@@ -399,6 +400,7 @@ enum NonIncrementalReason {
 impl NonIncrementalReason {
     fn as_str(&self) -> &'static str {
         match self {
+            Self::OwnerBoundedOutput => "owner_bounded_output",
             Self::NoPreviousRequest => "no_previous_request",
             Self::NoPreviousResponse => "no_previous_response",
             Self::NoPreviousResponseId => "no_previous_response_id",
@@ -412,7 +414,8 @@ impl NonIncrementalReason {
         match self {
             Self::InputShortened { previous } => (previous, "none"),
             Self::InputMismatch { previous, current } => (previous, current),
-            Self::NoPreviousRequest
+            Self::OwnerBoundedOutput
+            | Self::NoPreviousRequest
             | Self::NoPreviousResponse
             | Self::NoPreviousResponseId
             | Self::RequestPropertyChanged { .. } => ("none", "none"),
@@ -1567,6 +1570,13 @@ impl ModelClientSession {
         self
     }
 
+    fn owner_bounds_output(&self) -> bool {
+        self.inference_allowance
+            .as_ref()
+            .and_then(|allowance| allowance.max_output_tokens())
+            .is_some()
+    }
+
     pub(crate) fn inference_tools_changed(&self, tools: &Arc<[ToolSpec]>) -> bool {
         let previous = self
             .client
@@ -1693,6 +1703,11 @@ impl ModelClientSession {
         &mut self,
         request: &ResponsesApiRequest,
     ) -> std::result::Result<WebsocketContinuation, NonIncrementalReason> {
+        // The funded owner must bound the request we actually send. A previous
+        // response ID lets the provider recover context outside this request.
+        if self.owner_bounds_output() {
+            return Err(NonIncrementalReason::OwnerBoundedOutput);
+        }
         let last_response = self
             .get_last_response()
             .ok_or(NonIncrementalReason::NoPreviousResponse)?;
@@ -2528,7 +2543,8 @@ impl ModelClientSession {
         service_tier: Option<String>,
         responses_metadata: &CodexResponsesMetadata,
     ) -> Result<()> {
-        if !self.client.responses_websocket_enabled() {
+        // Prompt-bearing prewarm cannot be reused by an owner-bounded request.
+        if self.owner_bounds_output() || !self.client.responses_websocket_enabled() {
             return Ok(());
         }
         if self.is_websocket_prewarmed().await {

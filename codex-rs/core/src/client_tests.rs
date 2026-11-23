@@ -1056,6 +1056,79 @@ fn websocket_continuation_reports_unavailable_response_state() {
 }
 
 #[tokio::test]
+async fn owner_bounded_websocket_does_not_reference_provider_context() {
+    struct Gate;
+
+    impl codex_protocol::provider_attempt::ProviderAttemptGate for Gate {
+        fn reserve(
+            &self,
+            _attempt: codex_protocol::provider_attempt::ProviderAttempt,
+        ) -> codex_protocol::provider_attempt::ProviderAttemptReservation<'_> {
+            Box::pin(async { true })
+        }
+
+        fn max_output_tokens(&self) -> Option<u32> {
+            Some(64)
+        }
+    }
+
+    let client = test_model_client(SessionSource::Cli);
+    let request = client
+        .build_responses_request(
+            &Prompt::default(),
+            &test_model_info(),
+            /*effort*/ None,
+            codex_protocol::config_types::ReasoningSummary::None,
+            /*service_tier*/ None,
+            &test_responses_metadata_for_client(
+                &client,
+                /*turn_id*/ None,
+                format!("{}:0", client.state.thread_id),
+                /*parent_thread_id*/ None,
+                TestCodexResponsesRequestKind::Turn,
+            ),
+            /*include_internal*/ true,
+        )
+        .expect("build continuation request");
+    for owner_bounded in [false, true] {
+        let allowance = super::InferenceAllowance::new(
+            2,
+            4096,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        let allowance = if owner_bounded {
+            allowance.with_provider_attempt_gate(std::sync::Arc::new(Gate))
+        } else {
+            allowance
+        };
+        let mut session = client
+            .new_session()
+            .with_inference_allowance(std::sync::Arc::new(allowance));
+        session.websocket_session.last_request = Some(request.clone());
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        sender
+            .send(super::LastResponse {
+                response_id: "previous-response".to_string(),
+                items_added: Vec::new(),
+            })
+            .unwrap();
+        session.websocket_session.last_response_rx = Some(receiver);
+
+        assert_eq!(
+            session
+                .prepare_websocket_request(&request)
+                .map(|continuation| continuation.response_id),
+            if owner_bounded {
+                Err(NonIncrementalReason::OwnerBoundedOutput)
+            } else {
+                Ok("previous-response".to_string())
+            },
+        );
+    }
+}
+
+#[tokio::test]
 async fn responses_http_preserves_raw_tool_metadata_for_openai_custom_endpoint()
 -> anyhow::Result<()> {
     let server = MockServer::start().await;
