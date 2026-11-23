@@ -244,10 +244,14 @@ explicit ceiling; malformed ceilings refuse before a physical attempt. Typed
 request serialization preserves raw tool payloads. With the owner output ceiling
 selected, WebSocket sends the complete input instead of referring to a prior
 provider response and skips prompt-bearing prewarm. Byte admission includes the
-inserted output ceiling. Ordinary callers without that ceiling retain their
-continuations. Old bounded readers reject the explicit option. Real provider
-qualification must still establish how the route handles media, opaque input and
-the requested output ceiling, and how that usage is billed.
+inserted output ceiling. Before reserving a physical HTTP or WebSocket Responses
+attempt, the endpoint refuses stored response/conversation references, media
+and opaque input or tool results outside the selected materialized-text bound.
+Text and text tool results retain their wire bytes. Ordinary callers without
+that ceiling retain their continuations and input types. Old bounded readers
+reject the explicit option. Real provider qualification must still establish the
+route's full exposure, including any future media/opaque-input allowance, and
+actual billing for the requested output ceiling.
 
 The exact `cycleId`/`attemptId`/`recorded` reply acknowledges retained observation
 only. It grants no provider call and settles no money. Signing/verifying exact
